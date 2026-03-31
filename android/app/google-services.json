@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "164325680744",
+    "project_id": "videorecorderapp-305b8",
+    "storage_bucket": "videorecorderapp-305b8.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:164325680744:android:4f0c0284c3a3db8e4f7ddd",
+        "android_client_info": {
+          "package_name": "com.example.video_recorder_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAU5jiCE8sCIMjm0ywBFnHupvOIAkCbMLM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
