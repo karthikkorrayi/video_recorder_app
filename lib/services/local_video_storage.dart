@@ -2,81 +2,66 @@ import 'dart:io';
 import 'package:intl/intl.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-/// Saves videos to a public folder visible in the device Files app:
-///   /storage/emulated/0/Movies/KineSync/
-///     recordings/
-///       YYYY-MM-DD/
-///         <username>/
-///           <userId>_YYYYMMDD_HHmmss.mp4          ← single block
-///           <userId>_YYYYMMDD_HHmmss_block01of03.mp4  ← multi-block
+/// Saves videos to Android's media folder — visible in dev/file manager:
+///   /storage/emulated/0/Android/media/com.example.video_recorder_app/OTN/
+///     recordings/YYYY-MM-DD/<username>/<userId>_YYYYMMDD_HHmmss.mp4
 ///
-/// Attendance logs:
-///   /storage/emulated/0/Movies/KineSync/attendance/<username>_attendance.txt
+/// This path is writable without MANAGE_EXTERNAL_STORAGE on Android 10+.
+/// Visible in Files app under: Internal Storage > Android > media > com.example... > OTN
 class LocalVideoStorage {
   static final LocalVideoStorage _i = LocalVideoStorage._();
   factory LocalVideoStorage() => _i;
   LocalVideoStorage._();
 
-  static const _appFolder = 'KineSync';
+  static const _pkg = 'com.example.video_recorder_app';
+  static const _appFolder = 'OTN';
 
   // ─── Permission ───────────────────────────────────────────────────────────
 
-  /// Must be called before writing. Returns true if permission granted.
   static Future<bool> requestStoragePermission() async {
-    // Android 13+ (API 33+): no permission needed for own-created files in public dirs
-    // Android 11–12 (API 30–32): MANAGE_EXTERNAL_STORAGE for full access
-    // Android 10 and below: READ/WRITE_EXTERNAL_STORAGE
-    if (Platform.isAndroid) {
-      final sdkInt = await _getSdkInt();
-      if (sdkInt >= 30) {
-        // Request MANAGE_EXTERNAL_STORAGE for Android 11+
-        final status = await Permission.manageExternalStorage.request();
-        if (status.isGranted) return true;
-        // Fallback: even without it, we can still write to our Movies subfolder
-        // on most devices. Try without.
-        return true;
-      } else {
-        final status = await Permission.storage.request();
-        return status.isGranted;
-      }
+    if (!Platform.isAndroid) return true;
+    // Android/media/<pkg>/ is writable without special perms on Android 10+
+    // For older Android we still request WRITE_EXTERNAL_STORAGE
+    final sdkInt = await _sdkInt();
+    if (sdkInt < 29) {
+      final s = await Permission.storage.request();
+      return s.isGranted;
     }
-    return true;
+    return true; // Android 10+ — no permission needed for Android/media/<pkg>/
   }
 
-  static Future<int> _getSdkInt() async {
+  static Future<int> _sdkInt() async {
     try {
-      final result = await Process.run('getprop', ['ro.build.version.sdk']);
-      return int.tryParse(result.stdout.toString().trim()) ?? 29;
-    } catch (_) {
-      return 29;
-    }
+      final r = await Process.run('getprop', ['ro.build.version.sdk']);
+      return int.tryParse(r.stdout.toString().trim()) ?? 30;
+    } catch (_) { return 30; }
   }
 
   // ─── Directories ──────────────────────────────────────────────────────────
 
-  /// Public base: /storage/emulated/0/Movies/KineSync/recordings/
+  /// Base: /storage/emulated/0/Android/media/<pkg>/OTN/recordings/
   Future<Directory> _baseDir() async {
-    // Primary public external storage
-    const publicPath = '/storage/emulated/0/Movies/$_appFolder/recordings';
-    final dir = Directory(publicPath);
+    // Primary: Android/media path (no special permission needed Android 10+)
+    final primary = '/storage/emulated/0/Android/media/$_pkg/$_appFolder/recordings';
+    final dir = Directory(primary);
     try {
       await dir.create(recursive: true);
       // Quick write test
-      final test = File('${dir.path}/.test');
-      await test.writeAsString('ok');
-      await test.delete();
+      final t = File('${dir.path}/.ok');
+      await t.writeAsString('1');
+      await t.delete();
       return dir;
     } catch (_) {
-      // Fallback to secondary external or internal
-      final fallback = Directory('/storage/emulated/0/$_appFolder/recordings');
-      await fallback.create(recursive: true);
-      return fallback;
+      // Fallback: app-external files dir
+      final fb = Directory('/storage/emulated/0/$_appFolder/recordings');
+      await fb.create(recursive: true);
+      return fb;
     }
   }
 
-  /// Attendance folder: /storage/emulated/0/Movies/KineSync/attendance/
+  /// Attendance: /storage/emulated/0/Android/media/<pkg>/OTN/attendance/
   Future<Directory> _attendanceDir() async {
-    const path = '/storage/emulated/0/Movies/$_appFolder/attendance';
+    final path = '/storage/emulated/0/Android/media/$_pkg/$_appFolder/attendance';
     final dir = Directory(path);
     try {
       await dir.create(recursive: true);
@@ -86,6 +71,12 @@ class LocalVideoStorage {
       await fb.create(recursive: true);
       return fb;
     }
+  }
+
+  Future<File> attendanceFile(String userEmail) async {
+    final dir = await _attendanceDir();
+    final name = _safe(userEmail.split('@').first);
+    return File('${dir.path}/${name}_attendance.txt');
   }
 
   /// Session folder: recordings/YYYY-MM-DD/<username>/
@@ -114,15 +105,7 @@ class LocalVideoStorage {
     return '${id}_${dt}_block${nn}of${mm}.mp4';
   }
 
-  // ─── Attendance file ──────────────────────────────────────────────────────
-
-  Future<File> attendanceFile(String userEmail) async {
-    final dir = await _attendanceDir();
-    final name = _safe(userEmail.split('@').first);
-    return File('${dir.path}/${name}_attendance.txt');
-  }
-
-  // ─── Listing (user-specific) ──────────────────────────────────────────────
+  // ─── Listing ──────────────────────────────────────────────────────────────
 
   Future<List<LocalSession>> listSessionsForUser(String userEmail) async {
     final base = await _baseDir();
@@ -163,15 +146,13 @@ class LocalVideoStorage {
     return sessions;
   }
 
-  Future<int> sessionCount(String userEmail) async =>
-      (await listSessionsForUser(userEmail)).length;
+  Future<int> sessionCount(String u) async =>
+      (await listSessionsForUser(u)).length;
 
-  Future<int> totalDurationSeconds(String userEmail) async {
-    final s = await listSessionsForUser(userEmail);
+  Future<int> totalDurationSeconds(String u) async {
+    final s = await listSessionsForUser(u);
     return s.fold<int>(0, (sum, s) => sum + s.estimatedDurationSeconds);
   }
-
-  // ─── Helpers ──────────────────────────────────────────────────────────────
 
   String _safe(String s) => s.replaceAll(RegExp(r'[^a-zA-Z0-9_\-]'), '_');
 
@@ -198,7 +179,7 @@ class LocalSession {
   final List<File> blocks;
   final int totalBlocks;
   final bool isComplete;
-  int? _cachedDuration;
+  int? _cached;
 
   LocalSession({
     required this.prefix, required this.dateStr, required this.username,
@@ -206,15 +187,15 @@ class LocalSession {
   });
 
   int get estimatedDurationSeconds {
-    if (_cachedDuration != null) return _cachedDuration!;
+    if (_cached != null) return _cached!;
     if (blocks.isNotEmpty) {
-      final sidecar = File(blocks.first.path.replaceAll(RegExp(r'\.mp4$'), '.dur'));
-      if (sidecar.existsSync()) {
-        final v = int.tryParse(sidecar.readAsStringSync().trim());
-        if (v != null) { _cachedDuration = v; return v; }
+      final s = File(blocks.first.path.replaceAll(RegExp(r'\.mp4$'), '.dur'));
+      if (s.existsSync()) {
+        final v = int.tryParse(s.readAsStringSync().trim());
+        if (v != null) { _cached = v; return v; }
       }
     }
-    return blocks.length * 120; // fallback estimate
+    return blocks.length * 120;
   }
 
   String get displayTitle {

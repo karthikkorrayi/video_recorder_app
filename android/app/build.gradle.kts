@@ -27,10 +27,25 @@ android {
         versionName = "1.0"
         multiDexEnabled = true
     }
+    
+    signingConfigs {
+        create("release") {
+            val keystoreProperties = java.util.Properties()
+            keystoreProperties.load(
+                java.io.FileInputStream(rootProject.file("key.properties"))
+            )
+            keyAlias = keystoreProperties["keyAlias"] as String
+            keyPassword = keystoreProperties["keyPassword"] as String
+            storeFile = file(keystoreProperties["storeFile"] as String)
+            storePassword = keystoreProperties["storePassword"] as String
+        }
+    }
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }
