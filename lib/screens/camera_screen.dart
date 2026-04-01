@@ -1,9 +1,20 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'review_screen.dart';
+
+/// Single source of truth for every camera screen state.
+/// Replaces the 5 independent booleans that caused race conditions.
+enum CamState {
+  init,       // camera not ready
+  detecting,  // ML Kit watching for hands
+  countdown,  // 3-2-1 countdown in progress
+  recording,  // MediaRecorder actively writing
+  stopping,   // stopVideoRecording() called, awaiting file
+}
 
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
@@ -14,24 +25,27 @@ class CameraScreen extends StatefulWidget {
 
 class _CameraScreenState extends State<CameraScreen> {
   CameraController? _controller;
-  bool _isRecording = false;
+  CamState _state = CamState.init;
+
   bool _torchOn = false;
-  bool _handsDetected = false;
   int _countdown = 0;
-  Duration _recordingDuration = Duration.zero;
-  DateTime? _recordingStart;
-  bool _cameraReady = false;
-
-  // Hand detection state machine
-  // idle → detecting → countdown → recording → idle
-  bool _streamingActive = false;
+  Duration _elapsed = Duration.zero;
+  DateTime? _recordStart;
   bool _processingFrame = false;
-  bool _countdownRunning = false; // guard so countdown can't fire twice
-
-  // 4-second instruction overlay
   bool _showInstruction = true;
 
   final _poseDetector = PoseDetector(options: PoseDetectorOptions());
+  Timer? _elapsedTimer;
+
+  // ── Convenience getters ───────────────────────────────────────────────────
+  bool get _isRecording  => _state == CamState.recording;
+  bool get _isDetecting  => _state == CamState.detecting;
+  bool get _isCounting   => _state == CamState.countdown;
+  bool get _isStopping   => _state == CamState.stopping;
+  bool get _canStop      => _isRecording;
+  bool get _canManualStart => _isDetecting; // show ▶ only while detecting
+
+  // ─────────────────────────────────────────────────────────────────────────
 
   @override
   void initState() {
@@ -46,79 +60,91 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Future<void> _initCamera() async {
     final cameras = await availableCameras();
+    if (!mounted) return;
+
     _controller = CameraController(
       cameras[0],
       ResolutionPreset.high,
-      enableAudio: false,
+      enableAudio: false,   // no audio ever
+      imageFormatGroup: ImageFormatGroup.nv21,
     );
+
     await _controller!.initialize();
     if (!mounted) return;
-    setState(() => _cameraReady = true);
-    // Show instruction overlay for 4 seconds, then begin hand detection
+
+    setState(() => _state = CamState.detecting);
+    _showInstructionBriefly();
+    _beginHandDetection();
+  }
+
+  void _showInstructionBriefly() {
+    setState(() => _showInstruction = true);
     Future.delayed(const Duration(seconds: 4), () {
       if (mounted) setState(() => _showInstruction = false);
     });
-    Future.delayed(const Duration(seconds: 4), _beginHandDetection);
   }
 
-  /// Starts the image stream for hand detection.
-  /// Safe to call multiple times — guards against double-start.
+  // ── Hand detection ────────────────────────────────────────────────────────
+
   void _beginHandDetection() {
-    if (!mounted || !_cameraReady) return;
-    if (_isRecording || _countdownRunning) return;
-    if (_streamingActive) return; // already running
+    if (!mounted) return;
+    if (_state != CamState.detecting) return;
 
-    setState(() {
-      _handsDetected = false;
-      _countdown = 0;
-    });
-
-    _streamingActive = true;
-    _controller!.startImageStream((image) async {
-      if (_processingFrame || _isRecording || _countdownRunning) return;
-      _processingFrame = true;
-      try {
-        final inputImage = _convertCameraImage(image);
-        if (inputImage == null) return;
-        final poses = await _poseDetector.processImage(inputImage);
-
-        bool bothHands = false;
-        if (poses.isNotEmpty) {
-          final pose = poses.first;
-          final lw = pose.landmarks[PoseLandmarkType.leftWrist];
-          final rw = pose.landmarks[PoseLandmarkType.rightWrist];
-          if (lw != null && rw != null) {
-            bothHands = lw.likelihood > 0.55 && rw.likelihood > 0.55;
-          }
-        }
-
-        if (mounted && !_countdownRunning && !_isRecording) {
-          if (bothHands && !_handsDetected) {
-            setState(() => _handsDetected = true);
-            _startCountdown();
-          } else if (!bothHands && _handsDetected) {
-            setState(() => _handsDetected = false);
-          }
-        }
-      } finally {
-        _processingFrame = false;
-      }
-    });
+    try {
+      _controller!.startImageStream(_onFrame);
+    } catch (e) {
+      print('=== Camera: startImageStream error: $e');
+    }
   }
 
-  /// Stops image stream cleanly. Safe to call even if not streaming.
   Future<void> _stopStream() async {
-    if (!_streamingActive) return;
-    _streamingActive = false;
     try {
-      await _controller?.stopImageStream();
+      if (_controller?.value.isStreamingImages == true) {
+        await _controller!.stopImageStream();
+      }
     } catch (_) {}
   }
 
-  InputImage? _convertCameraImage(CameraImage image) {
+  Future<void> _onFrame(CameraImage image) async {
+    // Only process frames while in detecting state
+    if (_state != CamState.detecting) return;
+    if (_processingFrame) return;
+    _processingFrame = true;
+
+    try {
+      final input = _convertFrame(image);
+      if (input == null) return;
+
+      final poses = await _poseDetector.processImage(input);
+      if (!mounted || _state != CamState.detecting) return;
+
+      bool both = false;
+      if (poses.isNotEmpty) {
+        final lw = poses.first.landmarks[PoseLandmarkType.leftWrist];
+        final rw = poses.first.landmarks[PoseLandmarkType.rightWrist];
+        if (lw != null && rw != null) {
+          both = lw.likelihood > 0.55 && rw.likelihood > 0.55;
+        }
+      }
+
+      if (both) {
+        // Hands detected — begin countdown
+        await _stopStream();
+        if (_state == CamState.detecting && mounted) {
+          _triggerCountdown();
+        }
+      }
+    } catch (e) {
+      print('=== Camera: frame processing error: $e');
+    } finally {
+      _processingFrame = false;
+    }
+  }
+
+  InputImage? _convertFrame(CameraImage image) {
     try {
       final buf = WriteBuffer();
-      for (final plane in image.planes) buf.putUint8List(plane.bytes);
+      for (final p in image.planes) buf.putUint8List(p.bytes);
       return InputImage.fromBytes(
         bytes: buf.done().buffer.asUint8List(),
         metadata: InputImageMetadata(
@@ -128,91 +154,123 @@ class _CameraScreenState extends State<CameraScreen> {
           bytesPerRow: image.planes[0].bytesPerRow,
         ),
       );
-    } catch (_) {
-      return null;
-    }
+    } catch (_) { return null; }
   }
 
-  Future<void> _startCountdown() async {
-    if (_countdownRunning || _isRecording) return;
-    _countdownRunning = true;
-    await _stopStream(); // stop ML frame processing
+  // ── Countdown ─────────────────────────────────────────────────────────────
 
-    for (int i = 3; i >= 1; i--) {
-      if (!mounted) return;
-      setState(() => _countdown = i);
-      await Future.delayed(const Duration(seconds: 1));
-    }
+  Future<void> _triggerCountdown() async {
     if (!mounted) return;
-    setState(() => _countdown = 0);
-    _countdownRunning = false;
+    if (_state != CamState.detecting) return; // guard re-entry
+
+    setState(() { _state = CamState.countdown; _countdown = 3; });
+
+    for (int i = 2; i >= 0; i--) {
+      await Future.delayed(const Duration(seconds: 1));
+      if (!mounted) return;
+      if (_state != CamState.countdown) return; // aborted
+      setState(() => _countdown = i);
+    }
+
+    await Future.delayed(const Duration(milliseconds: 100));
+    if (!mounted || _state != CamState.countdown) return;
     await _startRecording();
   }
 
-  /// Manual start — bypasses hand detection, goes straight to recording.
+  // ── Manual start ──────────────────────────────────────────────────────────
+
   Future<void> _manualStart() async {
-    if (_isRecording || _countdownRunning) return;
+    if (_state != CamState.detecting) return;
     await _stopStream();
-    await _startRecording();
+    if (mounted && _state == CamState.detecting) {
+      setState(() => _state = CamState.countdown);
+      await _startRecording();
+    }
   }
+
+  // ── Recording ─────────────────────────────────────────────────────────────
 
   Future<void> _startRecording() async {
-    if (_isRecording) return;
-    await _controller!.startVideoRecording();
-    _recordingStart = DateTime.now();
-    if (mounted) setState(() => _isRecording = true);
-    _tickTimer();
-  }
-
-  void _tickTimer() {
-    Future.delayed(const Duration(seconds: 1), () {
-      if (!mounted || !_isRecording) return;
-      setState(() => _recordingDuration = DateTime.now().difference(_recordingStart!));
-      _tickTimer();
-    });
-  }
-
-  Future<void> _stopAndReview() async {
-    if (!_isRecording) return;
-    final file = await _controller!.stopVideoRecording();
     if (!mounted) return;
-
-    setState(() {
-      _isRecording = false;
-      _recordingDuration = Duration.zero;
-      _recordingStart = null;
-    });
-
-    // Navigate to review screen
-    final result = await Navigator.push<String>(
-      context,
-      MaterialPageRoute(builder: (_) => ReviewScreen(videoPath: file.path)),
-    );
-
-    // IMPORTANT: restart hand detection after returning, whether recapture or back
-    if (mounted) {
-      setState(() {
-        _handsDetected = false;
-        _countdown = 0;
-        _showInstruction = true;
-      });
-      // Brief instruction re-show then restart detection
-      Future.delayed(const Duration(seconds: 2), () {
-        if (mounted) setState(() => _showInstruction = false);
-      });
-      Future.delayed(const Duration(seconds: 2), () {
-        if (mounted) _beginHandDetection();
-      });
+    try {
+      await _controller!.startVideoRecording();
+      _recordStart = DateTime.now();
+      if (mounted) {
+        setState(() {
+          _state = CamState.recording;
+          _elapsed = Duration.zero;
+          _countdown = 0;
+        });
+        _startElapsedTimer();
+      }
+    } catch (e) {
+      print('=== Camera: startVideoRecording error: $e');
+      if (mounted) {
+        setState(() { _state = CamState.detecting; _countdown = 0; });
+        _beginHandDetection();
+      }
     }
   }
+
+  void _startElapsedTimer() {
+    _elapsedTimer?.cancel();
+    _elapsedTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || !_isRecording) {
+        _elapsedTimer?.cancel();
+        return;
+      }
+      setState(() => _elapsed = DateTime.now().difference(_recordStart!));
+    });
+  }
+
+  Future<void> _stopRecording() async {
+    if (!_canStop) return;
+
+    setState(() => _state = CamState.stopping);
+    _elapsedTimer?.cancel();
+
+    try {
+      final file = await _controller!.stopVideoRecording();
+      if (!mounted) return;
+
+      setState(() {
+        _state = CamState.detecting;
+        _elapsed = Duration.zero;
+        _recordStart = null;
+      });
+
+      // Go to review screen
+      final result = await Navigator.push<String>(
+        context,
+        MaterialPageRoute(builder: (_) => ReviewScreen(videoPath: file.path)),
+      );
+
+      // After returning: always restart hand detection
+      if (mounted) {
+        setState(() => _state = CamState.detecting);
+        _showInstructionBriefly();
+        _beginHandDetection();
+      }
+    } catch (e) {
+      print('=== Camera: stopVideoRecording error: $e');
+      if (mounted) {
+        setState(() { _state = CamState.detecting; _elapsed = Duration.zero; });
+        _beginHandDetection();
+      }
+    }
+  }
+
+  // ── Torch ─────────────────────────────────────────────────────────────────
 
   Future<void> _toggleTorch() async {
     _torchOn = !_torchOn;
-    await _controller?.setFlashMode(_torchOn ? FlashMode.torch : FlashMode.off);
+    try {
+      await _controller?.setFlashMode(_torchOn ? FlashMode.torch : FlashMode.off);
+    } catch (_) {}
     if (mounted) setState(() {});
   }
 
-  String _fmtDuration(Duration d) {
+  String _fmt(Duration d) {
     final m = d.inMinutes.toString().padLeft(2, '0');
     final s = (d.inSeconds % 60).toString().padLeft(2, '0');
     return '$m:$s';
@@ -220,7 +278,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   void dispose() {
-    // Always restore portrait before leaving camera
+    _elapsedTimer?.cancel();
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     WakelockPlus.disable();
     _stopStream();
@@ -229,53 +287,59 @@ class _CameraScreenState extends State<CameraScreen> {
     super.dispose();
   }
 
+  // ── Build ─────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
-    if (!_cameraReady) {
+    if (_state == CamState.init || _controller == null) {
       return const Scaffold(
         backgroundColor: Colors.black,
-        body: Center(child: CircularProgressIndicator(color: Colors.white)),
+        body: Center(child: CircularProgressIndicator(color: Color(0xFFE8620A))),
       );
     }
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(children: [
-        // Full-screen camera preview
         SizedBox.expand(child: CameraPreview(_controller!)),
 
-        // ── Instruction overlay (4 sec on enter, 2 sec on recapture) ──
-        if (_showInstruction && !_isRecording)
+        // ── Countdown ────────────────────────────────────────────────────
+        if (_isCounting && _countdown > 0)
+          Center(child: Text('$_countdown',
+              style: const TextStyle(color: Colors.white, fontSize: 120,
+                  fontWeight: FontWeight.bold,
+                  shadows: [Shadow(color: Colors.black54, blurRadius: 20)]))),
+
+        // ── Stopping spinner ─────────────────────────────────────────────
+        if (_isStopping)
+          Container(color: Colors.black45,
+            child: const Center(child: CircularProgressIndicator(color: Colors.white))),
+
+        // ── Instruction overlay ───────────────────────────────────────────
+        if (_showInstruction && _isDetecting)
           Center(
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
               decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.75),
-                borderRadius: BorderRadius.circular(20),
+                color: Colors.black.withOpacity(0.72),
+                borderRadius: BorderRadius.circular(18),
                 border: Border.all(color: Colors.white24),
               ),
-              child: const Text(
-                'Show both hands to auto-start\nor tap  ▶  to start manually',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.white, fontSize: 15,
-                    fontWeight: FontWeight.w500, height: 1.5),
-              ),
+              child: Column(mainAxisSize: MainAxisSize.min, children: const [
+                Icon(Icons.back_hand_outlined, color: Colors.white70, size: 34),
+                SizedBox(height: 10),
+                Text('Show both hands to auto-start',
+                    style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w500)),
+                SizedBox(height: 4),
+                Text('or tap  ▶  to start manually',
+                    style: TextStyle(color: Colors.white54, fontSize: 12)),
+              ]),
             ),
           ),
 
-        // ── Countdown ──
-        if (_countdown > 0)
-          Center(
-            child: Text('$_countdown',
-                style: const TextStyle(color: Colors.white, fontSize: 120,
-                    fontWeight: FontWeight.bold,
-                    shadows: [Shadow(color: Colors.black54, blurRadius: 20)])),
-          ),
-
-        // ── Recording timer pill ──
+        // ── Recording timer pill ──────────────────────────────────────────
         if (_isRecording)
-          Positioned(
-            top: 16, left: 16,
+          Positioned(top: 16, left: 16,
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
               decoration: BoxDecoration(
@@ -285,43 +349,34 @@ class _CameraScreenState extends State<CameraScreen> {
               child: Row(mainAxisSize: MainAxisSize.min, children: [
                 const Icon(Icons.fiber_manual_record, color: Colors.white, size: 11),
                 const SizedBox(width: 6),
-                Text(_fmtDuration(_recordingDuration),
+                Text(_fmt(_elapsed),
                     style: const TextStyle(color: Colors.white, fontSize: 18,
                         fontWeight: FontWeight.bold, letterSpacing: 1.2)),
               ]),
             ),
           ),
 
-        // ── Hand detection status (when not recording) ──
-        if (!_isRecording && _countdown == 0 && !_showInstruction)
-          Positioned(
-            top: 16, left: 16,
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 300),
+        // ── Hand status badge (detecting, no instruction) ─────────────────
+        if (_isDetecting && !_showInstruction)
+          Positioned(top: 16, left: 16,
+            child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
               decoration: BoxDecoration(
-                color: _handsDetected
-                    ? Colors.green.withOpacity(0.85)
-                    : Colors.black.withOpacity(0.6),
+                color: Colors.black.withOpacity(0.6),
                 borderRadius: BorderRadius.circular(24),
-                border: Border.all(
-                    color: _handsDetected ? Colors.greenAccent : Colors.white24),
+                border: Border.all(color: Colors.white24),
               ),
-              child: Row(mainAxisSize: MainAxisSize.min, children: [
-                Icon(_handsDetected ? Icons.back_hand : Icons.back_hand_outlined,
-                    color: Colors.white, size: 16),
-                const SizedBox(width: 6),
-                Text(
-                  _handsDetected ? 'Hands detected — starting...' : 'Show both hands to record',
-                  style: const TextStyle(color: Colors.white, fontSize: 13),
-                ),
+              child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.back_hand_outlined, color: Colors.white, size: 16),
+                SizedBox(width: 6),
+                Text('Show both hands to record',
+                    style: TextStyle(color: Colors.white, fontSize: 13)),
               ]),
             ),
           ),
 
-        // ── Right-side control panel ──
-        Positioned(
-          right: 12, top: 0, bottom: 0,
+        // ── Right-side control panel ──────────────────────────────────────
+        Positioned(right: 12, top: 0, bottom: 0,
           child: Center(
             child: Container(
               padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
@@ -331,35 +386,25 @@ class _CameraScreenState extends State<CameraScreen> {
                 border: Border.all(color: Colors.white24),
               ),
               child: Column(mainAxisSize: MainAxisSize.min, children: [
-                // Home
                 _Btn(icon: Icons.home_rounded, label: 'Home',
                     onTap: () => Navigator.pop(context)),
                 const SizedBox(height: 8),
-                // Flash
                 _Btn(icon: _torchOn ? Icons.flashlight_on : Icons.flashlight_off,
                     label: 'Flash', active: _torchOn, activeColor: Colors.yellow,
                     onTap: _toggleTorch),
                 const SizedBox(height: 8),
-                // Manual start (only when not recording / countdown)
-                if (!_isRecording && _countdown == 0)
-                  _Btn(
-                    icon: Icons.play_arrow_rounded,
-                    label: 'Start',
-                    active: false,
-                    activeColor: Colors.greenAccent,
-                    size: 56,
-                    onTap: _manualStart,
-                  ),
-                // Stop (only when recording)
-                if (_isRecording)
-                  _Btn(
-                    icon: Icons.stop_rounded,
-                    label: 'Stop',
-                    active: true,
-                    activeColor: Colors.redAccent,
-                    size: 56,
-                    onTap: _stopAndReview,
-                  ),
+                // Show ▶ Start when detecting, ■ Stop when recording
+                if (_canManualStart)
+                  _Btn(icon: Icons.play_arrow_rounded, label: 'Start',
+                      activeColor: const Color(0xFFE8620A), size: 56,
+                      onTap: _manualStart),
+                if (_canStop)
+                  _Btn(icon: Icons.stop_rounded, label: 'Stop',
+                      active: true, activeColor: Colors.redAccent, size: 56,
+                      onTap: _stopRecording),
+                if (_isCounting || _isStopping)
+                  _Btn(icon: Icons.hourglass_top_rounded, label: '...',
+                      active: false, size: 56, onTap: null),
               ]),
             ),
           ),
@@ -378,31 +423,33 @@ class _Btn extends StatelessWidget {
   final double size;
 
   const _Btn({
-    required this.icon,
-    required this.label,
-    this.onTap,
-    this.active = false,
-    this.activeColor = Colors.white,
-    this.size = 48,
+    required this.icon, required this.label,
+    this.onTap, this.active = false,
+    this.activeColor = Colors.white, this.size = 48,
   });
 
   @override
   Widget build(BuildContext context) {
+    final enabled = onTap != null;
+    final color = active ? activeColor : Colors.white;
     return GestureDetector(
       onTap: onTap,
-      child: Column(children: [
-        Container(
-          width: size, height: size,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: active ? activeColor.withOpacity(0.2) : Colors.white.withOpacity(0.15),
-            border: Border.all(color: active ? activeColor : Colors.white54, width: 1.5),
+      child: Opacity(
+        opacity: enabled ? 1.0 : 0.35,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: size, height: size,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: active ? activeColor.withOpacity(0.2) : Colors.white.withOpacity(0.12),
+              border: Border.all(color: color.withOpacity(0.7), width: 1.5),
+            ),
+            child: Icon(icon, color: color, size: size * 0.44),
           ),
-          child: Icon(icon, color: active ? activeColor : Colors.white, size: size * 0.45),
-        ),
-        const SizedBox(height: 3),
-        Text(label, style: const TextStyle(color: Colors.white70, fontSize: 10)),
-      ]),
+          const SizedBox(height: 3),
+          Text(label, style: TextStyle(color: color.withOpacity(0.8), fontSize: 10)),
+        ]),
+      ),
     );
   }
 }

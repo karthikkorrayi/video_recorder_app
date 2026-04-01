@@ -1,3 +1,6 @@
+import java.util.Properties
+import java.io.FileInputStream
+
 plugins {
     id("com.android.application")
     // id("com.google.gms.google-services")
@@ -30,14 +33,17 @@ android {
     
     signingConfigs {
         create("release") {
-            val keystoreProperties = java.util.Properties()
-            keystoreProperties.load(
-                java.io.FileInputStream(rootProject.file("key.properties"))
-            )
-            keyAlias = keystoreProperties["keyAlias"] as String
-            keyPassword = keystoreProperties["keyPassword"] as String
-            storeFile = file(keystoreProperties["storeFile"] as String)
-            storePassword = keystoreProperties["storePassword"] as String
+            val keystoreProperties = Properties()
+            val propertiesFile = rootProject.file("key.properties")
+            
+            if (propertiesFile.exists()) {
+                keystoreProperties.load(FileInputStream(propertiesFile))
+                
+                keyAlias = keystoreProperties["keyAlias"] as String
+                keyPassword = keystoreProperties["keyPassword"] as String
+                storeFile = file(keystoreProperties["storeFile"] as String)
+                storePassword = keystoreProperties["storePassword"] as String
+            }
         }
     }
 
