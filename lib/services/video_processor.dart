@@ -1,56 +1,99 @@
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
-// import 'package:ffmpeg_kit_flutter_new/ffmpeg_probe_kit.dart';
-import 'package:path_provider/path_provider.dart';
 import 'dart:io';
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/return_code.dart';
+import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'local_video_storage.dart';
+import 'attendance_service.dart';
 
 class VideoProcessor {
-  // Step 1: Get video duration in seconds
-  Future<double> getDuration(String inputPath) async {
-    final session = await FFprobeKit.getMediaInformation(inputPath);
-    final info = session.getMediaInformation();
-    return double.parse(info?.getDuration() ?? '0');
-  }
+  static const int _blockSecs = 120; // 2 minutes
 
-  // Step 2: Process video — mute audio, set 9:16 ratio, 30fps, compress
-  Future<String> processVideo(String inputPath) async {
-    final dir = await getTemporaryDirectory();
-    final outputPath = '${dir.path}/processed_video.mp4';
+  final _storage = LocalVideoStorage();
+  final _attendance = AttendanceService();
 
-    // -an = no audio, crop to 9:16, 30fps, CRF 28 = good quality small size
-    final command = '-i "$inputPath" '
-        '-vf "crop=ih*(9/16):ih,fps=30" '
-        '-an '               // <-- removes audio track
-        '-c:v libx264 '
-        '-crf 28 '
-        '-preset fast '
-        '"$outputPath"';
+  /// Process raw video → split → save locally.
+  /// Also writes .dur sidecar with real duration, and updates attendance log.
+  Future<List<String>> processAndSaveLocally({
+    required String rawVideoPath,
+    required DateTime sessionTime,
+    void Function(int current, int total, String message)? onProgress,
+  }) async {
+    final user = FirebaseAuth.instance.currentUser!;
+    final userId = user.uid;
+    final userEmail = user.email ?? userId;
 
-    await FFmpegKit.execute(command);
-    return outputPath;
-  }
+    onProgress?.call(0, 1, 'Analysing video...');
+    final durationSecs = await getDuration(rawVideoPath);
+    final totalBlocks = (durationSecs / _blockSecs).ceil().clamp(1, 999);
+    print('=== Processor: duration=${durationSecs}s  blocks=$totalBlocks');
 
-  // Step 3: Split processed video into exactly 5 equal chunks
-  Future<List<String>> splitIntoFiveChunks(String processedPath) async {
-    final dir = await getTemporaryDirectory();
-    final duration = await getDuration(processedPath);
-    final chunkDuration = duration / 5;
-    final List<String> chunkPaths = [];
+    final dir = await _storage.sessionDir(sessionTime, userEmail);
+    print('=== Processor: output dir = ${dir.path}');
 
-    for (int i = 0; i < 5; i++) {
-      final startTime = i * chunkDuration;
-      final chunkPath = '${dir.path}/chunk_${i + 1}.mp4';
+    final savedPaths = <String>[];
 
-      final command = '-i "$processedPath" '
-          '-ss $startTime '
-          '-t $chunkDuration '
-          '-c copy '          // fast copy, no re-encode
-          '"$chunkPath"';
+    for (int i = 0; i < totalBlocks; i++) {
+      final blockNum = i + 1;
+      final startSec = i * _blockSecs;
+      final fileName = _storage.blockFileName(
+        userId: userId,
+        sessionTime: sessionTime,
+        blockIndex: blockNum,
+        totalBlocks: totalBlocks,
+      );
+      final outputPath = '${dir.path}/$fileName';
 
-      await FFmpegKit.execute(command);
-      chunkPaths.add(chunkPath);
+      onProgress?.call(blockNum, totalBlocks + 1,
+          'Processing block $blockNum of $totalBlocks...');
+
+      // crop 9:16 → scale 1080×1920 → 30fps → no audio → H.264
+      final cmd = '-i "$rawVideoPath" '
+          '-ss $startSec '
+          '-t $_blockSecs '
+          '-vf "crop=ih*(9/16):ih,scale=1080:1920,fps=30" '
+          '-an '
+          '-c:v libx264 '
+          '-crf 26 '
+          '-preset fast '
+          '-movflags +faststart '
+          '"$outputPath"';
+
+      final session = await FFmpegKit.execute(cmd);
+      final rc = await session.getReturnCode();
+      if (!ReturnCode.isSuccess(rc)) {
+        final logs = await session.getAllLogsAsString();
+        throw Exception('FFmpeg block $blockNum failed: $logs');
+      }
+      print('=== Processor: block $blockNum saved → $outputPath');
+      savedPaths.add(outputPath);
     }
 
-    return chunkPaths; // [chunk_1.mp4, chunk_2.mp4, ..., chunk_5.mp4]
+    // Write .dur sidecar with actual duration next to block 1
+    if (savedPaths.isNotEmpty) {
+      final sidecar = savedPaths.first.replaceAll(RegExp(r'\.mp4$'), '.dur');
+      await File(sidecar).writeAsString('$durationSecs');
+      print('=== Processor: sidecar → $sidecar ($durationSecs s)');
+    }
+
+    // Update daily attendance log
+    await _attendance.recordSession(durationSecs);
+
+    onProgress?.call(totalBlocks + 1, totalBlocks + 1, 'Saved!');
+    return savedPaths;
+  }
+
+  Future<int> getDuration(String path) async {
+    try {
+      final session = await FFprobeKit.getMediaInformation(path);
+      final info = session.getMediaInformation();
+      if (info != null) {
+        final d = double.tryParse(info.getDuration() ?? '');
+        if (d != null && d > 0) return d.ceil();
+      }
+    } catch (e) {
+      print('=== Processor: getDuration error: $e');
+    }
+    return 60;
   }
 }
