@@ -1,95 +1,121 @@
 import 'dart:io';
 import 'package:intl/intl.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:path_provider/path_provider.dart';
 
-/// Saves videos to Android's media folder — visible in dev/file manager:
-///   /storage/emulated/0/Android/media/com.example.video_recorder_app/OTN/
-///     recordings/YYYY-MM-DD/<username>/<userId>_YYYYMMDD_HHmmss.mp4
+/// Saves videos to Android/media — visible in Files app, not in Gallery.
 ///
-/// This path is writable without MANAGE_EXTERNAL_STORAGE on Android 10+.
-/// Visible in Files app under: Internal Storage > Android > media > com.example... > OTN
+/// Full path on device:
+///   /storage/emulated/0/Android/media/com.otn.videorecorder/OTN/
+///     recordings/
+///       YYYY-MM-DD/
+///         <username>/
+///           <userId>_YYYYMMDD_HHmmss.mp4
+///           <userId>_YYYYMMDD_HHmmss_block01of03.mp4
+///     attendance/
+///       <username>_attendance.txt
+///
+/// How to find files on phone:
+///   Files app → Internal Storage → Android → media → com.otn.videorecorder → OTN
+///
+/// WHY Android/media instead of Android/data:
+///   - Android/data  is HIDDEN from file managers on Android 11+ (scoped storage)
+///   - Android/media is VISIBLE in file managers on all Android versions
+///   - Neither appears in the Gallery (no DCIM folder = no gallery indexing)
+///   - Both need ZERO special permissions on Android 10+
 class LocalVideoStorage {
   static final LocalVideoStorage _i = LocalVideoStorage._();
   factory LocalVideoStorage() => _i;
   LocalVideoStorage._();
 
-  static const _pkg = 'com.example.video_recorder_app';
+  // ── Package name — must match applicationId in build.gradle.kts ──────────
+  static const _pkg       = 'com.otn.videorecorder';
   static const _appFolder = 'OTN';
 
-  // ─── Permission ───────────────────────────────────────────────────────────
+  // ── Permission ────────────────────────────────────────────────────────────
+  // Android/media/<pkg>/ needs no runtime permission on Android 10+.
+  // Kept for API compatibility only.
+  static Future<bool> requestStoragePermission() async => true;
 
-  static Future<bool> requestStoragePermission() async {
-    if (!Platform.isAndroid) return true;
-    // Android/media/<pkg>/ is writable without special perms on Android 10+
-    // For older Android we still request WRITE_EXTERNAL_STORAGE
-    final sdkInt = await _sdkInt();
-    if (sdkInt < 29) {
-      final s = await Permission.storage.request();
-      return s.isGranted;
-    }
-    return true; // Android 10+ — no permission needed for Android/media/<pkg>/
-  }
+  // ── Core path builder ─────────────────────────────────────────────────────
 
-  static Future<int> _sdkInt() async {
-    try {
-      final r = await Process.run('getprop', ['ro.build.version.sdk']);
-      return int.tryParse(r.stdout.toString().trim()) ?? 30;
-    } catch (_) { return 30; }
-  }
-
-  // ─── Directories ──────────────────────────────────────────────────────────
-
-  /// Base: /storage/emulated/0/Android/media/<pkg>/OTN/recordings/
+  /// Builds the Android/media path and falls back to external files dir
+  /// if somehow the media path isn't writable.
   Future<Directory> _baseDir() async {
-    // Primary: Android/media path (no special permission needed Android 10+)
-    final primary = '/storage/emulated/0/Android/media/$_pkg/$_appFolder/recordings';
-    final dir = Directory(primary);
+    // Primary: Android/media/<pkg>/OTN/recordings
+    // Visible in Files app, no permissions needed on Android 10+
+    final mediaPath =
+        '/storage/emulated/0/Android/media/$_pkg/$_appFolder/recordings';
+
     try {
+      final dir = Directory(mediaPath);
       await dir.create(recursive: true);
-      // Quick write test
-      final t = File('${dir.path}/.ok');
-      await t.writeAsString('1');
-      await t.delete();
-      return dir;
-    } catch (_) {
-      // Fallback: app-external files dir
-      final fb = Directory('/storage/emulated/0/$_appFolder/recordings');
-      await fb.create(recursive: true);
-      return fb;
-    }
-  }
 
-  /// Attendance: /storage/emulated/0/Android/media/<pkg>/OTN/attendance/
-  Future<Directory> _attendanceDir() async {
-    final path = '/storage/emulated/0/Android/media/$_pkg/$_appFolder/attendance';
-    final dir = Directory(path);
-    try {
+      // Quick write test to confirm we can actually write here
+      final test = File('${dir.path}/.wtest');
+      await test.writeAsString('ok');
+      await test.delete();
+
+      return dir;
+    } catch (e) {
+      print('=== Storage: Android/media not writable ($e), using fallback');
+    }
+
+    // Fallback: Android/data via path_provider (hidden but always writable)
+    final ext = await getExternalStorageDirectory();
+    if (ext != null) {
+      final dir = Directory('${ext.path}/$_appFolder/recordings');
       await dir.create(recursive: true);
       return dir;
-    } catch (_) {
-      final fb = Directory('/storage/emulated/0/$_appFolder/attendance');
-      await fb.create(recursive: true);
-      return fb;
     }
-  }
 
-  Future<File> attendanceFile(String userEmail) async {
-    final dir = await _attendanceDir();
-    final name = _safe(userEmail.split('@').first);
-    return File('${dir.path}/${name}_attendance.txt');
-  }
-
-  /// Session folder: recordings/YYYY-MM-DD/<username>/
-  Future<Directory> sessionDir(DateTime t, String userEmail) async {
-    final base = await _baseDir();
-    final date = DateFormat('yyyy-MM-dd').format(t);
-    final user = _safe(userEmail.split('@').first);
-    final dir = Directory('${base.path}/$date/$user');
+    // Last resort: app documents dir (internal, always available)
+    final doc = await getApplicationDocumentsDirectory();
+    final dir = Directory('${doc.path}/$_appFolder/recordings');
     await dir.create(recursive: true);
     return dir;
   }
 
-  // ─── File naming ──────────────────────────────────────────────────────────
+  Future<Directory> _attendanceDir() async {
+    final mediaPath =
+        '/storage/emulated/0/Android/media/$_pkg/$_appFolder/attendance';
+    try {
+      final dir = Directory(mediaPath);
+      await dir.create(recursive: true);
+      return dir;
+    } catch (_) {}
+
+    final ext = await getExternalStorageDirectory();
+    if (ext != null) {
+      final dir = Directory('${ext.path}/$_appFolder/attendance');
+      await dir.create(recursive: true);
+      return dir;
+    }
+
+    final doc = await getApplicationDocumentsDirectory();
+    final dir = Directory('${doc.path}/$_appFolder/attendance');
+    await dir.create(recursive: true);
+    return dir;
+  }
+
+  // ── Public accessors ──────────────────────────────────────────────────────
+
+  Future<File> attendanceFile(String userEmail) async {
+    final dir = await _attendanceDir();
+    return File('${dir.path}/${_safe(userEmail.split('@').first)}_attendance.txt');
+  }
+
+  /// Returns (and creates) per-session folder:
+  ///   recordings/YYYY-MM-DD/<username>/
+  Future<Directory> sessionDir(DateTime t, String userEmail) async {
+    final base = await _baseDir();
+    final date = DateFormat('yyyy-MM-dd').format(t);
+    final user = _safe(userEmail.split('@').first);
+    final dir  = Directory('${base.path}/$date/$user');
+    await dir.create(recursive: true);
+    return dir;
+  }
+
+  // ── File naming ───────────────────────────────────────────────────────────
 
   String blockFileName({
     required String userId,
@@ -105,10 +131,10 @@ class LocalVideoStorage {
     return '${id}_${dt}_block${nn}of${mm}.mp4';
   }
 
-  // ─── Listing ──────────────────────────────────────────────────────────────
+  // ── Listing ───────────────────────────────────────────────────────────────
 
   Future<List<LocalSession>> listSessionsForUser(String userEmail) async {
-    final base = await _baseDir();
+    final base     = await _baseDir();
     final username = _safe(userEmail.split('@').first);
     final sessions = <LocalSession>[];
     if (!await base.exists()) return sessions;
@@ -127,15 +153,16 @@ class LocalVideoStorage {
 
       final groups = <String, List<File>>{};
       for (final f in files) {
-        final name = f.uri.pathSegments.last;
-        final prefix = _prefix(name);
+        final prefix = _prefix(f.uri.pathSegments.last);
         if (prefix != null) groups.putIfAbsent(prefix, () => []).add(f);
       }
 
-      final dateStr = dateDir.uri.pathSegments.where((s) => s.isNotEmpty).last;
+      final dateStr =
+          dateDir.uri.pathSegments.where((s) => s.isNotEmpty).last;
+
       for (final e in groups.entries) {
         final blocks = e.value;
-        final total = _totalBlocks(blocks.first.uri.pathSegments.last) ?? 1;
+        final total  = _totalBlocks(blocks.first.uri.pathSegments.last) ?? 1;
         sessions.add(LocalSession(
           prefix: e.key, dateStr: dateStr, username: username,
           blocks: blocks, totalBlocks: total,
@@ -154,7 +181,10 @@ class LocalVideoStorage {
     return s.fold<int>(0, (sum, s) => sum + s.estimatedDurationSeconds);
   }
 
-  String _safe(String s) => s.replaceAll(RegExp(r'[^a-zA-Z0-9_\-]'), '_');
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  String _safe(String s) =>
+      s.replaceAll(RegExp(r'[^a-zA-Z0-9_\-]'), '_');
 
   String? _prefix(String name) {
     final m1 = RegExp(r'^(.+_\d{8}_\d{6})_block\d+of\d+\.mp4$').firstMatch(name);
@@ -170,28 +200,30 @@ class LocalVideoStorage {
   }
 }
 
-// ─── Model ────────────────────────────────────────────────────────────────────
+// ── Model ─────────────────────────────────────────────────────────────────────
 
 class LocalSession {
-  final String prefix;
-  final String dateStr;
-  final String username;
+  final String     prefix;
+  final String     dateStr;
+  final String     username;
   final List<File> blocks;
-  final int totalBlocks;
-  final bool isComplete;
-  int? _cached;
+  final int        totalBlocks;
+  final bool       isComplete;
+  int?             _cached;
 
   LocalSession({
-    required this.prefix, required this.dateStr, required this.username,
-    required this.blocks, required this.totalBlocks, required this.isComplete,
+    required this.prefix,   required this.dateStr,
+    required this.username, required this.blocks,
+    required this.totalBlocks, required this.isComplete,
   });
 
   int get estimatedDurationSeconds {
     if (_cached != null) return _cached!;
     if (blocks.isNotEmpty) {
-      final s = File(blocks.first.path.replaceAll(RegExp(r'\.mp4$'), '.dur'));
-      if (s.existsSync()) {
-        final v = int.tryParse(s.readAsStringSync().trim());
+      final sidecar =
+          File(blocks.first.path.replaceAll(RegExp(r'\.mp4$'), '.dur'));
+      if (sidecar.existsSync()) {
+        final v = int.tryParse(sidecar.readAsStringSync().trim());
         if (v != null) { _cached = v; return v; }
       }
     }
@@ -201,7 +233,8 @@ class LocalSession {
   String get displayTitle {
     final m = RegExp(r'(\d{8})_(\d{6})').firstMatch(prefix);
     if (m == null) return prefix;
-    final d = m.group(1)!; final t = m.group(2)!;
+    final d = m.group(1)!;
+    final t = m.group(2)!;
     return '${d.substring(0,4)}-${d.substring(4,6)}-${d.substring(6,8)}'
         '  ${t.substring(0,2)}:${t.substring(2,4)}:${t.substring(4,6)}';
   }
@@ -212,7 +245,8 @@ class LocalSession {
   String get durationStr {
     final s = estimatedDurationSeconds;
     if (s < 60) return '${s}s';
-    final m = s ~/ 60; final r = s % 60;
+    final m = s ~/ 60;
+    final r = s % 60;
     return r > 0 ? '${m}m ${r}s' : '${m}m';
   }
 }
