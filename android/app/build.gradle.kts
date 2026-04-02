@@ -10,7 +10,7 @@ plugins {
 
 android {
     namespace = "com.example.video_recorder_app"
-    compileSdk = 36
+    compileSdk = 35 // Note: SDK 36 is currently in preview; 35 is the stable target
     ndkVersion = "27.0.12077973"
 
     compileOptions {
@@ -25,7 +25,7 @@ android {
     defaultConfig {
         applicationId = "com.example.video_recorder_app"
         minSdk = flutter.minSdkVersion
-        targetSdk = 36
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
         multiDexEnabled = true
@@ -33,11 +33,11 @@ android {
     
     signingConfigs {
         create("release") {
+            val keystorePropertiesFile = rootProject.file("key.properties")
             val keystoreProperties = Properties()
-            val propertiesFile = rootProject.file("key.properties")
             
-            if (propertiesFile.exists()) {
-                keystoreProperties.load(FileInputStream(propertiesFile))
+            if (keystorePropertiesFile.exists()) {
+                keystoreProperties.load(FileInputStream(keystorePropertiesFile))
                 
                 keyAlias = keystoreProperties["keyAlias"] as String
                 keyPassword = keystoreProperties["keyPassword"] as String
@@ -48,7 +48,7 @@ android {
     }
 
     buildTypes {
-        release {
+        getByName("release") {
             signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
             isShrinkResources = false
