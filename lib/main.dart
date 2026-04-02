@@ -6,6 +6,17 @@ import 'screens/login_screen.dart';
 import 'screens/dashboard_screen.dart';
 import 'services/local_video_storage.dart';
 
+// ── Ben10 Omnitrix colour palette ────────────────────────────────────────────
+// Inspired by the Omnitrix watch: white face, bright green accents, black trim
+const kGreen     = Color(0xFF00C853); // Omnitrix green
+const kGreenDark = Color(0xFF00A045); // darker green for pressed states
+const kBlack     = Color(0xFF0D0D0D); // near-black (watch body)
+const kSurface   = Color(0xFFF4F4F4); // light grey surface
+const kCard      = Color(0xFFFFFFFF); // white card
+const kBorder    = Color(0xFFE0E0E0); // subtle border
+const kText      = Color(0xFF1A1A1A); // primary text
+const kTextSub   = Color(0xFF666666); // secondary text
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -13,6 +24,12 @@ void main() async {
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
   ]);
+
+  // Light status bar (dark icons on white background)
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarBrightness: Brightness.light,
+    statusBarIconBrightness: Brightness.dark,
+  ));
 
   await Firebase.initializeApp(
     options: const FirebaseOptions(
@@ -24,9 +41,7 @@ void main() async {
     ),
   );
 
-  // Request storage permission before showing UI
   await LocalVideoStorage.requestStoragePermission();
-
   runApp(const OTNApp());
 }
 
@@ -38,24 +53,43 @@ class OTNApp extends StatelessWidget {
     return MaterialApp(
       title: 'OTN',
       debugShowCheckedModeBanner: false,
+      // Light theme — Ben10 Omnitrix style
       theme: ThemeData(
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xFF0F0F0F),
-        colorScheme: ColorScheme.dark(
-          primary: const Color(0xFFE8620A),
-          secondary: const Color(0xFFFF9D4A),
-          surface: const Color(0xFF1A1A1A),
-          background: const Color(0xFF0F0F0F),
+        brightness: Brightness.light,
+        scaffoldBackgroundColor: kSurface,
+        colorScheme: const ColorScheme.light(
+          primary: kGreen,
+          secondary: kGreenDark,
+          surface: kCard,
+          background: kSurface,
+          onPrimary: Colors.white,
+          onSurface: kText,
         ),
         useMaterial3: true,
+        cardColor: kCard,
+        dividerColor: kBorder,
+        appBarTheme: const AppBarTheme(
+          backgroundColor: kCard,
+          foregroundColor: kText,
+          elevation: 0,
+          surfaceTintColor: Colors.transparent,
+        ),
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: kGreen,
+            foregroundColor: Colors.white,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+            elevation: 0,
+          ),
+        ),
       ),
       home: StreamBuilder<User?>(
         stream: FirebaseAuth.instance.authStateChanges(),
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const Scaffold(
-              backgroundColor: Color(0xFF0F0F0F),
-              body: Center(child: CircularProgressIndicator(color: Color(0xFFE8620A))),
+              backgroundColor: kSurface,
+              body: Center(child: CircularProgressIndicator(color: kGreen)),
             );
           }
           if (snapshot.hasData) return const DashboardScreen();

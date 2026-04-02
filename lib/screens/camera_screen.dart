@@ -22,12 +22,13 @@ class _CameraScreenState extends State<CameraScreen> {
   Duration _elapsed = Duration.zero;
   DateTime? _recStart;
   bool _processingFrame = false;
-  bool _showHint = true;
+  bool _autoDetect = false;
 
   final _pose = PoseDetector(options: PoseDetectorOptions());
   Timer? _ticker;
 
-  static const _orange = Color(0xFFE8620A);
+  static const _green = Color(0xFF00C853);
+  static const _red   = Colors.redAccent;
 
   bool get _isRecording => _state == _S.recording;
   bool get _isCounting  => _state == _S.countdown;
@@ -59,27 +60,17 @@ class _CameraScreenState extends State<CameraScreen> {
       cams[0],
       ResolutionPreset.high,
       enableAudio: false,           // no audio
-      imageFormatGroup: ImageFormatGroup.nv21,
     );
     await _ctrl!.initialize();
     if (!mounted) return;
     setState(() => _state = _S.detecting);
-    _showHintBriefly();
-    _startStream();
-  }
-
-  void _showHintBriefly() {
-    setState(() => _showHint = true);
-    Future.delayed(const Duration(seconds: 4), () {
-      if (mounted) setState(() => _showHint = false);
-    });
   }
 
   // ── ML Kit stream ─────────────────────────────────────────────────────────
 
   void _startStream() {
-    if (_state != _S.detecting) return;
-    try { _ctrl?.startImageStream(_onFrame); } catch (_) {}
+    if (_state != _S.detecting || _ctrl == null) return;
+    try { _ctrl!.startImageStream(_onFrame); } catch (_) {}
   }
 
   Future<void> _stopStream() async {
@@ -117,17 +108,30 @@ class _CameraScreenState extends State<CameraScreen> {
       }
       if (both) {
         await _stopStream();
-        if (mounted && _state == _S.detecting) _runCountdown();
+        if (mounted && _state == _S.detecting) _doCountdown();
       }
-    } finally {
-      _processingFrame = false;
+    } finally { 
+      _processingFrame = false; 
+      }
+  }
+
+  // ── Toggle auto-detect ────────────────────────────────────────────────────
+
+  Future<void> _toggleAutoDetect() async {
+    if (_isRecording || _isCounting) return;
+    final next = !_autoDetect;
+    setState(() => _autoDetect = next);
+    if (next) {
+      _startStream();
+    } else {
+      await _stopStream();
     }
   }
 
   // ── Countdown ─────────────────────────────────────────────────────────────
 
-  Future<void> _runCountdown() async {
-    if (!mounted || _state != _S.detecting) return;
+  Future<void> _doCountdown() async {
+    if (!mounted) return;
     setState(() { _state = _S.countdown; _countdown = 3; });
     for (int i = 2; i >= 0; i--) {
       await Future.delayed(const Duration(seconds: 1));
@@ -142,7 +146,8 @@ class _CameraScreenState extends State<CameraScreen> {
   Future<void> _manualStart() async {
     if (_state != _S.detecting) return;
     await _stopStream();
-    if (mounted) _runCountdown();
+    setState(() => _autoDetect = false);
+    if (mounted) _doCountdown();
   }
 
   // ── Recording ─────────────────────────────────────────────────────────────
@@ -159,10 +164,7 @@ class _CameraScreenState extends State<CameraScreen> {
       });
     } catch (e) {
       print('=== Camera: startRecording error: $e');
-      if (mounted) {
-        setState(() { _state = _S.detecting; _countdown = 0; });
-        _startStream();
-      }
+      if (mounted) { setState(() { _state = _S.detecting; _countdown = 0; }); }
     }
   }
 
@@ -177,18 +179,12 @@ class _CameraScreenState extends State<CameraScreen> {
       await Navigator.push(context,
         MaterialPageRoute(builder: (_) => ReviewScreen(videoPath: file.path)));
       if (mounted) {
-        setState(() => _state = _S.detecting);
-        _showHintBriefly();
-        _startStream();
-        // Re-enable immersive mode after returning from review screen
+        setState(() { _state = _S.detecting; _autoDetect = false; });
         SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
       }
     } catch (e) {
       print('=== Camera: stopRecording error: $e');
-      if (mounted) {
-        setState(() { _state = _S.detecting; _elapsed = Duration.zero; });
-        _startStream();
-      }
+      if (mounted) setState(() { _state = _S.detecting; _elapsed = Duration.zero; });
     }
   }
 
@@ -221,8 +217,7 @@ class _CameraScreenState extends State<CameraScreen> {
     if (_state == _S.init || _ctrl == null) {
       return const Scaffold(
         backgroundColor: Colors.black,
-        body: Center(child: CircularProgressIndicator(color: _orange)),
-      );
+        body: Center(child: CircularProgressIndicator(color: _green)));
     }
 
     return Scaffold(
@@ -233,93 +228,76 @@ class _CameraScreenState extends State<CameraScreen> {
         // ── Full-screen camera preview ─────────────────────────────────────
         Positioned.fill(child: CameraPreview(_ctrl!)),
 
-        // ── Countdown big number ───────────────────────────────────────────
+        // Countdown big number
         if (_isCounting && _countdown > 0)
           Center(
             child: Container(
-              width: 140, height: 140,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: Colors.black.withOpacity(0.55),
-              ),
-              child: Center(
-                child: Text('$_countdown',
-                  style: const TextStyle(
-                    color: Colors.white, fontSize: 86,
-                    fontWeight: FontWeight.bold,
-                    shadows: [Shadow(color: Colors.black87, blurRadius: 12)],
-                  )),
-              ),
+            width: 120, height: 120,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: Colors.black.withOpacity(0.6),
+              border: Border.all(color: _green, width: 2),
             ),
-          ),
+            child: Center(
+              child: Text('$_countdown',
+                style: const TextStyle(
+                  color: Colors.white, fontSize: 72,
+                    fontWeight: FontWeight.bold))),
+          )),
 
-        // ── Stopping overlay ──────────────────────────────────────────────
+        // Stopping overlay
         if (_isStopping)
           Container(
             color: Colors.black54,
-            child: const Center(
-              child: Column(mainAxisSize: MainAxisSize.min, children: [
-                CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5),
-                SizedBox(height: 14),
-                Text('Saving...', style: TextStyle(color: Colors.white70, fontSize: 14)),
-              ]),
-            ),
-          ),
-
-        // ── Instruction overlay (auto-hides in 4s) ────────────────────────
-        if (_showHint && _isDetecting)
-          Center(
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 14),
-              decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.72),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: Colors.white24),
-              ),
+            child: Center(
               child: Column(mainAxisSize: MainAxisSize.min, children: const [
-                Icon(Icons.back_hand_outlined, color: Colors.white60, size: 28),
-                SizedBox(height: 8),
-                Text('Show both hands to auto-start',
-                  style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w500)),
-                SizedBox(height: 3),
-                Text('or tap  ▶ Start  to begin manually',
-                  style: TextStyle(color: Colors.white54, fontSize: 11)),
-              ]),
-            ),
+                CircularProgressIndicator(color: _green, strokeWidth: 2.5),
+              SizedBox(height: 12),
+              Text('Saving...', style: TextStyle(color: Colors.white70, fontSize: 14)),
+            ]),
           ),
+        ),
 
-        // ── Top-left: recording pill ──────────────────────────────────────
+        // Recording timer — top left
         if (_isRecording)
           Positioned(top: 16, left: 20,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
               decoration: BoxDecoration(
-                color: Colors.red.withOpacity(0.9),
+                color: _red.withOpacity(0.9),
                 borderRadius: BorderRadius.circular(22),
               ),
               child: Row(mainAxisSize: MainAxisSize.min, children: [
                 const Icon(Icons.fiber_manual_record, color: Colors.white, size: 10),
                 const SizedBox(width: 5),
-                Text(_fmt(_elapsed),
-                  style: const TextStyle(color: Colors.white, fontSize: 17,
-                    fontWeight: FontWeight.bold, letterSpacing: 1.2)),
+                Text(_fmt(_elapsed), 
+                  style: const TextStyle(color: Colors.white, fontSize: 17, 
+                    fontWeight: FontWeight.bold, letterSpacing: 1.1)),
               ]),
             )),
 
-        // ── Top-left: hand hint badge (when not recording) ────────────────
-        if (_isDetecting && !_showHint)
+        // Auto-detect status badge (top-left when detecting)
+        if (_isDetecting)
           Positioned(top: 16, left: 20,
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.6),
+                color: _autoDetect
+                    ? _green.withOpacity(0.15)
+                    : Colors.black.withOpacity(0.5),
                 borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: Colors.white.withOpacity(0.2)),
+                border: Border.all(color: _autoDetect ? _green : Colors.white24),
               ),
-              child: const Row(mainAxisSize: MainAxisSize.min, children: [
-                Icon(Icons.back_hand_outlined, color: Colors.white60, size: 14),
-                SizedBox(width: 5),
-                Text('Show hands', style: TextStyle(color: Colors.white70, fontSize: 12)),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(_autoDetect
+                    ? Icons.back_hand_rounded
+                    : Icons.back_hand_outlined,
+                    color: _autoDetect ? _green : Colors.white70, size: 14),
+                const SizedBox(width: 5),
+                Text(_autoDetect ? 'Hand detect ON' : 'Hand detect OFF',
+                    style: TextStyle(
+                        color: _autoDetect ? _green : Colors.white70,
+                        fontSize: 11, fontWeight: FontWeight.w500)),
               ]),
             )),
 
@@ -332,26 +310,24 @@ class _CameraScreenState extends State<CameraScreen> {
             // Gradient so controls are readable over any background
             decoration: BoxDecoration(
               gradient: LinearGradient(
-                begin: Alignment.bottomCenter,
+                begin: Alignment.bottomCenter, 
                 end: Alignment.topCenter,
-                colors: [Colors.black.withOpacity(0.88), Colors.transparent],
-                stops: const [0, 1],
+                colors: [Colors.black.withOpacity(0.92), Colors.transparent],
               ),
             ),
-            padding: const EdgeInsets.only(top: 20, bottom: 18, left: 24, right: 24),
+            padding: const EdgeInsets.fromLTRB(24, 14, 24, 18),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              crossAxisAlignment: CrossAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.end,
               children: [
 
-                // ── Left group: Home ───────────────────────────────────────
-                _BarBtn(
-                  icon: Icons.arrow_back_ios_new_rounded,
-                  label: 'Exit',
-                  onTap: () => Navigator.pop(context),
-                ),
+                // Left: Exit
+                _BarBtn(icon: Icons.arrow_back_ios_new_rounded,
+                    label: 'Exit',
+                    onTap: () => Navigator.pop(context),
+                  ),
 
-                // ── Centre group: primary action ───────────────────────────
+                // Centre group
                 Row(mainAxisSize: MainAxisSize.min, children: [
 
                   // Flash toggle
@@ -362,46 +338,54 @@ class _CameraScreenState extends State<CameraScreen> {
                     activeColor: const Color(0xFFFFD700),
                     onTap: _toggleTorch,
                   ),
+                  const SizedBox(width: 20),
 
-                  const SizedBox(width: 28),
-
-                  // Main record / stop button — large
+                  // Primary: Start / Stop
                   if (_isDetecting)
-                    _BigActionBtn(
+                    _BigBtn(
                       icon: Icons.play_arrow_rounded,
-                      label: 'Start',
-                      color: _orange,
+                      label: 'Start', 
+                      color: _green, 
                       onTap: _manualStart,
                     ),
                   if (_isRecording)
-                    _BigActionBtn(
+                    _BigBtn(
                       icon: Icons.stop_rounded,
-                      label: 'Stop',
-                      color: Colors.redAccent,
+                      label: 'Stop', 
+                      color: _red, 
                       onTap: _stopRecording,
                     ),
                   if (_isCounting)
-                    _BigActionBtn(
+                    _BigBtn(
                       icon: Icons.hourglass_top_rounded,
-                      label: 'Wait...',
-                      color: Colors.white30,
-                      onTap: null,
-                    ),
+                        label: 'Wait...', 
+                        color: Colors.white30, 
+                        onTap: null,
+                      ),
                   if (_isStopping)
-                    _BigActionBtn(
-                      icon: Icons.stop_circle_outlined,
-                      label: 'Saving',
-                      color: Colors.white30,
-                      onTap: null,
-                    ),
+                    _BigBtn(
+                      icon: Icons.hourglass_top_rounded,
+                        label: 'Saving', 
+                        color: Colors.white30, 
+                        onTap: null,
+                      ),
 
-                  const SizedBox(width: 28),
+                  const SizedBox(width: 20),
 
-                  // Spacer mirror so centre stays centred
-                  const SizedBox(width: 52),
+                  // Auto-detect toggle
+                  _BarBtn(
+                    icon: _autoDetect
+                        ? Icons.back_hand_rounded
+                        : Icons.back_hand_outlined,
+                    label: 'Auto',
+                    active: _autoDetect,
+                    activeColor: _green,
+                    onTap: (!_isRecording && !_isCounting)
+                        ? _toggleAutoDetect : null,
+                  ),
                 ]),
 
-                // ── Right: empty placeholder for visual balance ────────────
+                // Right: spacer mirror for visual balance
                 const SizedBox(width: 52),
               ],
             ),
@@ -438,14 +422,16 @@ class _BarBtn extends StatelessWidget {
             width: 48, height: 48,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: Colors.white.withOpacity(0.08),
-              border: Border.all(color: color.withOpacity(0.5), width: 1.2),
+              color: active
+                  ? activeColor.withOpacity(0.15)
+                  : Colors.white.withOpacity(0.1),
+              border: Border.all(color: color.withOpacity(0.6), width: 1.2),
             ),
             child: Icon(icon, color: color, size: 22),
           ),
-          const SizedBox(height: 4),
-          Text(label, style: TextStyle(color: color.withOpacity(0.7),
-            fontSize: 10, fontWeight: FontWeight.w500)),
+          const SizedBox(height: 3),
+          Text(label, style: TextStyle(color: color.withOpacity(0.8),
+              fontSize: 10, fontWeight: FontWeight.w500)),
         ]),
       ),
     );
@@ -454,16 +440,16 @@ class _BarBtn extends StatelessWidget {
 
 // ── Large primary action button ────────────────────────────────────────────────
 
-class _BigActionBtn extends StatelessWidget {
+class _BigBtn extends StatelessWidget {
   final IconData icon;
   final String label;
   final Color color;
   final VoidCallback? onTap;
 
-  const _BigActionBtn({
+  const _BigBtn({
     required this.icon, required this.label,
     required this.color, this.onTap,
-  });
+    });
 
   @override
   Widget build(BuildContext context) {
@@ -473,17 +459,17 @@ class _BigActionBtn extends StatelessWidget {
         opacity: onTap == null ? 0.4 : 1.0,
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           Container(
-            width: 68, height: 68,
+            width: 66, height: 66,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: color.withOpacity(0.18),
+              color: color.withOpacity(0.15),
               border: Border.all(color: color, width: 2.5),
             ),
-            child: Icon(icon, color: color, size: 34),
+            child: Icon(icon, color: color, size: 32),
           ),
-          const SizedBox(height: 5),
+          const SizedBox(height: 4),
           Text(label, style: TextStyle(color: color,
-            fontSize: 11, fontWeight: FontWeight.w600, letterSpacing: 0.3)),
+              fontSize: 11, fontWeight: FontWeight.w600)),
         ]),
       ),
     );

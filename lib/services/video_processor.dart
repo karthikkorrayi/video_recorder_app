@@ -1,18 +1,18 @@
 import 'dart:io';
-import 'package:video_compress/video_compress.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'local_video_storage.dart';
 import 'attendance_service.dart';
 import 'processing_manager.dart';
 
 class VideoProcessor {
-  static const int _blockSecs = 120; // 2-minute blocks
+  static const int blockSecs = 120;
 
-  final _storage   = LocalVideoStorage();
+  final _storage    = LocalVideoStorage();
   final _attendance = AttendanceService();
 
-  /// Kick off processing in background (non-blocking).
   String startBackgroundProcessing({
     required String rawVideoPath,
     required DateTime sessionTime,
@@ -43,128 +43,102 @@ class VideoProcessor {
         message: 'Analysing video...', progress: 0.05,
       ));
 
-      final durationSecs = await _getDuration(rawVideoPath);
-      final totalBlocks = (durationSecs / _blockSecs).ceil().clamp(1, 999);
-      print('=== Processor [$sessionId]: ${durationSecs}s → $totalBlocks blocks');
+      final durationSec = await _probeDurationSec(rawVideoPath);
+      final totalBlocks = (durationSec / blockSecs).ceil().clamp(1, 999);
+      print('=== Processor: ${durationSec}s → $totalBlocks block(s)');
 
-      // ── Step 2: Compress using native MediaCodec ──────────────────────────
-      // video_compress uses Android MediaCodec — no FFmpeg needed
-      // This handles: resolution scaling to 720p, codec compression
-      // Audio is already disabled at recording time (enableAudio: false)
-      manager.update(sessionId, ProcessingStatus(
-        sessionId: sessionId, state: ProcessingState.processing,
-        message: 'Compressing video...', progress: 0.15,
-        currentBlock: 0, totalBlocks: totalBlocks,
-      ));
-
-      final info = await VideoCompress.compressVideo(
-        rawVideoPath,
-        quality: VideoQuality.MediumQuality, // 720p equivalent
-        deleteOrigin: false,                 // we delete manually after
-        includeAudio: false,                 // no audio (matches recording setting)
-        frameRate: 30,
-      );
-
-      if (info == null || info.file == null) {
-        throw Exception('Compression failed — output is null');
-      }
-
-      final compressedPath = info.file!.path;
-      print('=== Processor [$sessionId]: compressed → $compressedPath');
-
-      // ── Step 3: Split into 2-minute blocks ───────────────────────────────
-      final dir = await _storage.sessionDir(sessionTime, userEmail);
+      final dir        = await _storage.sessionDir(sessionTime, userEmail);
       final savedPaths = <String>[];
 
       for (int i = 0; i < totalBlocks; i++) {
-        final blockNum = i + 1;
-        final progress = 0.2 + (i / totalBlocks) * 0.75;
+        final blockNum  = i + 1;
+        final startSec  = i * blockSecs;
+        final remaining = durationSec - startSec;
+        final blockDur  = remaining < blockSecs ? remaining : blockSecs.toDouble();
 
         manager.update(sessionId, ProcessingStatus(
           sessionId: sessionId, state: ProcessingState.processing,
           message: 'Saving block $blockNum of $totalBlocks...',
-          progress: progress, currentBlock: blockNum, totalBlocks: totalBlocks,
+          progress: 0.1 + (i / totalBlocks) * 0.85,
+          currentBlock: blockNum, totalBlocks: totalBlocks,
         ));
 
-        final fileName = _storage.blockFileName(
+        final fileName   = _storage.blockFileName(
           userId: userId, sessionTime: sessionTime,
           blockIndex: blockNum, totalBlocks: totalBlocks,
         );
         final outputPath = '${dir.path}/$fileName';
 
-        // Trim block: copy the time-range bytes using video_compress trim
-        // For single block (short video), just copy the compressed file
-        if (totalBlocks == 1) {
-          await File(compressedPath).copy(outputPath);
-        } else {
-          final startMs = i * _blockSecs * 1000;
-          final endMs   = (i + 1) * _blockSecs * 1000;
+        // -ss BEFORE -i = input seek (fast, frame-accurate for H.264)
+        // -t            = number of seconds to copy from the seek point
+        // -c copy       = no re-encode, instant split, zero quality loss
+        // -avoid_negative_ts make_zero = fix timestamps in split files
+        // -movflags +faststart = moov atom at front (fast playback start)
+        final cmd =
+            '-ss $startSec '
+            '-i "$rawVideoPath" '
+            '-t $blockDur '
+            '-c copy '
+            '-avoid_negative_ts make_zero '
+            '-movflags +faststart '
+            '"$outputPath"';
 
-          // video_compress trim — uses native MediaMuxer, very fast
-          final trimmed = await VideoCompress.compressVideo(
-            compressedPath,
-            quality: VideoQuality.DefaultQuality, // no re-encode, just trim
-            deleteOrigin: false,
-            includeAudio: false,
-            startTime: startMs ~/ 1000,   // seconds
-            duration: _blockSecs,
-          );
+        print('=== Block $blockNum: ss=$startSec t=$blockDur → $outputPath');
 
-          if (trimmed?.file != null) {
-            await trimmed!.file!.copy(outputPath);
-            await trimmed.file!.delete();
-          } else {
-            // Fallback: copy the whole compressed if trim fails
-            await File(compressedPath).copy(outputPath);
-          }
+        final session = await FFmpegKit.execute(cmd);
+        final rc      = await session.getReturnCode();
+
+        if (!ReturnCode.isSuccess(rc)) {
+          final logs = await session.getAllLogsAsString();
+          throw Exception('Block $blockNum failed:\n$logs');
+        }
+
+        final outFile = File(outputPath);
+        if (!await outFile.exists() || await outFile.length() < 512) {
+          throw Exception('Block $blockNum output missing or empty');
         }
 
         savedPaths.add(outputPath);
-        print('=== Processor [$sessionId]: block $blockNum → $outputPath');
+        final kb = (await outFile.length() / 1024).toStringAsFixed(0);
+        print('=== Block $blockNum ✓  ${kb}KB');
       }
 
-      // ── Step 4: Write sidecar + cleanup ──────────────────────────────────
       if (savedPaths.isNotEmpty) {
         final sidecar = savedPaths.first.replaceAll(RegExp(r'\.mp4$'), '.dur');
-        await File(sidecar).writeAsString('$durationSecs');
+        await File(sidecar).writeAsString('$durationSec');
       }
 
-      // Cleanup temp files
       try { await File(rawVideoPath).delete(); } catch (_) {}
-      try { await File(compressedPath).delete(); } catch (_) {}
-
-      await _attendance.recordSession(durationSecs);
+      await _attendance.recordSession(durationSec.toInt());
 
       manager.update(sessionId, ProcessingStatus(
         sessionId: sessionId, state: ProcessingState.done,
         message: 'Saved ${savedPaths.length} block${savedPaths.length == 1 ? '' : 's'}',
-        progress: 1.0,
-        currentBlock: savedPaths.length, totalBlocks: totalBlocks,
+        progress: 1.0, currentBlock: savedPaths.length, totalBlocks: totalBlocks,
       ));
+      print('=== Processor ✓ complete');
 
     } catch (e) {
-      print('=== Processor [$sessionId]: ERROR: $e');
+      print('=== Processor ERROR: $e');
       manager.update(sessionId, ProcessingStatus(
         sessionId: sessionId, state: ProcessingState.error,
         message: 'Failed: $e', progress: 0,
       ));
-    } finally {
-      VideoCompress.cancelCompression();
     }
   }
 
-  // ── Duration probe ────────────────────────────────────────────────────────
-
-  Future<int> getDuration(String path) => _getDuration(path);
-
-  static Future<int> _getDuration(String path) async {
+  static Future<double> _probeDurationSec(String path) async {
     try {
-      final info = await VideoCompress.getMediaInfo(path);
-      final ms = info.duration;
-      if (ms != null && ms > 0) return (ms / 1000).ceil();
-    } catch (e) {
-      print('=== Processor: getDuration error: $e');
-    }
-    return 60;
+      final s    = await FFprobeKit.getMediaInformation(path);
+      final info = s.getMediaInformation();
+      if (info != null) {
+        final d = double.tryParse(info.getDuration() ?? '');
+        if (d != null && d > 0) { print('=== Probe: ${d}s'); return d; }
+      }
+    } catch (e) { print('=== Probe error: $e'); }
+    return 60.0;
   }
+
+  Future<int> getDuration(String path) async =>
+      (await _probeDurationSec(path)).ceil();
 }

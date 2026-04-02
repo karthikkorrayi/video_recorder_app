@@ -7,15 +7,27 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
-val keystorePropertiesFile = rootProject.file("key.properties")
-val keystoreProperties = Properties()
-if (keystorePropertiesFile.exists()) {
-    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+val keystoreFile = rootProject.file("key.properties")
+val keystoreProps = Properties()
+if (keystoreFile.exists()) {
+    keystoreProps.load(FileInputStream(keystoreFile))
+}
+
+configurations.all {
+    resolutionStrategy.eachDependency {
+        if (requested.group == "com.arthenica") {
+            if (requested.name.startsWith("ffmpeg-kit-full")) {
+                // Swap full-gpl for min — same version, smaller package
+                useTarget("com.arthenica:ffmpeg-kit-min:${requested.version}")
+                because("OTN only needs H.264/AAC — min variant saves ~68MB")
+            }
+        }
+    }
 }
 
 android {
     namespace = "com.example.video_recorder_app"
-    compileSdk = 36          // ← bumped to 36 (fixes plugin warnings)
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -40,34 +52,30 @@ android {
             isEnable = true
             reset()
             include("arm64-v8a", "armeabi-v7a")
-            isUniversalApk = true   // also build one universal fallback APK
+            isUniversalApk = false
         }
     }
 
     signingConfigs {
-        if (keystorePropertiesFile.exists()) {
+        if (keystoreFile.exists()) {
             create("release") {
-                keyAlias     = keystoreProperties["keyAlias"] as String
-                keyPassword  = keystoreProperties["keyPassword"] as String
-                storeFile    = file(keystoreProperties["storeFile"] as String)
-                storePassword = keystoreProperties["storePassword"] as String
+                keyAlias      = keystoreProps["keyAlias"] as String
+                keyPassword   = keystoreProps["keyPassword"] as String
+                storeFile     = file(keystoreProps["storeFile"] as String)
+                storePassword = keystoreProps["storePassword"] as String
             }
         }
     }
 
     buildTypes {
         release {
-            signingConfig = if (keystorePropertiesFile.exists())
+            signingConfig = if (keystoreFile.exists())
                 signingConfigs.getByName("release")
             else
                 signingConfigs.getByName("debug")
 
-            isMinifyEnabled   = true
-            isShrinkResources = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+            isMinifyEnabled   = false
+            isShrinkResources = false
         }
         debug {
             isMinifyEnabled   = false
