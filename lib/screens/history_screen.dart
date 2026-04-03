@@ -35,6 +35,19 @@ class _HistoryScreenState extends State<HistoryScreen> {
     if (mounted) setState(() { _sessions = s; _loading = false; });
   }
 
+  // Total across all sessions using actual .dur sidecars only
+  String get _grandTotal {
+    int total = 0;
+    for (final s in _sessions) {
+      final d = s.durationSeconds; // reads .dur sidecar — never inflated
+      if (d > 0) total += d;
+    }
+    if (total <= 0) return '0s';
+    if (total < 60) return '${total}s';
+    final m = total ~/ 60; final r = total % 60;
+    return r > 0 ? '${m}m ${r}s' : '${m}m';
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -45,17 +58,19 @@ class _HistoryScreenState extends State<HistoryScreen> {
           const Text('My Recordings',
               style: TextStyle(color: _text, fontWeight: FontWeight.w700, fontSize: 17)),
           if (!_loading)
-            Text('${_sessions.length} video${_sessions.length == 1 ? '' : 's'}',
-                style: const TextStyle(color: _textSub, fontSize: 12)),
+            Text('${_sessions.length} session${_sessions.length == 1 ? '' : 's'}'
+                ' · $_grandTotal total',
+                style: const TextStyle(color: _textSub, fontSize: 11)),
         ]),
         iconTheme: const IconThemeData(color: _text),
         elevation: 0,
         surfaceTintColor: Colors.transparent,
-        bottom: PreferredSize(
-            preferredSize: const Size.fromHeight(1),
+        bottom: const PreferredSize(
+            preferredSize: Size.fromHeight(1),
             child: Divider(height: 1, color: _border)),
         actions: [
-          IconButton(icon: const Icon(Icons.refresh_rounded, color: _textSub), onPressed: _load),
+          IconButton(icon: const Icon(Icons.refresh_rounded, color: _textSub),
+              onPressed: _load),
         ],
       ),
       body: _loading
@@ -74,64 +89,126 @@ class _HistoryScreenState extends State<HistoryScreen> {
   }
 
   Widget _card(LocalSession s) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      decoration: BoxDecoration(
-        color: _cardColor, borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-            color: s.isComplete ? _border : Colors.orange.shade300),
-      ),
-      child: ListTile(
-        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        leading: Container(
-          width: 46, height: 46,
-          decoration: BoxDecoration(
-            color: _green.withOpacity(0.1),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: _green.withOpacity(0.3)),
-          ),
-          child: const Icon(Icons.video_file_rounded, color: _green, size: 22),
+    // durationStr reads the actual .dur sidecar written by FFprobe
+    // Shows '—' if sidecar not found (video still processing)
+    final timeStr = s.durationStr;
+
+    return GestureDetector(
+      onTap: () => Navigator.push(context,
+          MaterialPageRoute(builder: (_) => VideoPlaybackScreen(session: s))),
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        decoration: BoxDecoration(
+          color: _cardColor, borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+              color: s.isComplete ? _border : Colors.orange.shade300),
+          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04),
+              blurRadius: 8, offset: const Offset(0, 2))],
         ),
-        title: Text(s.displayTitle,
-            style: const TextStyle(color: _text, fontWeight: FontWeight.w600, fontSize: 14)),
-        subtitle: Padding(
-          padding: const EdgeInsets.only(top: 4),
-          child: Row(children: [
-            // Actual duration (from sidecar or estimate)
-            Text(s.durationStr,
-                style: const TextStyle(color: _green, fontSize: 13, fontWeight: FontWeight.w600)),
-            const SizedBox(width: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-              decoration: BoxDecoration(
-                color: _green.withOpacity(0.08),
-                borderRadius: BorderRadius.circular(6),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+
+            // ── Row 1: Date title + play button ─────────────────────────
+            Row(children: [
+              Container(
+                width: 40, height: 40,
+                decoration: BoxDecoration(
+                  color: _green.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: _green.withOpacity(0.3)),
+                ),
+                child: const Icon(Icons.video_file_rounded, color: _green, size: 20),
               ),
-              child: Text(s.blockSummary,
-                  style: const TextStyle(color: _green, fontSize: 11,
-                      fontWeight: FontWeight.w500)),
-            ),
-            if (!s.isComplete) ...[
-              const SizedBox(width: 8),
-              const Text('incomplete',
-                  style: TextStyle(color: Colors.orange, fontSize: 11)),
-            ],
+              const SizedBox(width: 12),
+              Expanded(child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(s.displayTitle,
+                    style: const TextStyle(color: _text,
+                        fontWeight: FontWeight.w700, fontSize: 14)),
+                const SizedBox(height: 2),
+                if (!s.isComplete)
+                  const Text('Incomplete recording',
+                      style: TextStyle(color: Colors.orange, fontSize: 11)),
+              ])),
+              Container(
+                width: 34, height: 34,
+                decoration: const BoxDecoration(color: _green, shape: BoxShape.circle),
+                child: const Icon(Icons.play_arrow_rounded, color: Colors.white, size: 20),
+              ),
+            ]),
+
+            const SizedBox(height: 14),
+            const Divider(height: 1, color: _border),
+            const SizedBox(height: 12),
+
+            // ── Row 2: 4-metric grid ─────────────────────────────────────
+            // All values come from actual recorded data — no estimates.
+            Row(children: [
+              // Total Time — from .dur sidecar (actual FFprobe duration)
+              _metric(
+                icon: Icons.timer_outlined,
+                label: 'Total Time',
+                value: timeStr,
+                color: _green,
+                note: timeStr == '—' ? 'processing' : null,
+              ),
+              _divider(),
+
+              // Blocks — how many saved / total expected
+              _metric(
+                icon: Icons.video_collection_outlined,
+                label: 'Blocks',
+                value: '${s.blocks.length} / ${s.totalBlocks}',
+                color: const Color(0xFF0091EA),
+              ),
+              _divider(),
+
+              // Start time — from .meta sidecar or filename
+              _metric(
+                icon: Icons.play_circle_outline,
+                label: 'Start',
+                value: s.startTimeStr,
+                color: const Color(0xFF7B1FA2),
+              ),
+              _divider(),
+
+              // End time — from .meta sidecar or estimated
+              _metric(
+                icon: Icons.stop_circle_outlined,
+                label: 'End',
+                value: s.endTimeStr,
+                color: const Color(0xFFE53935),
+              ),
+            ]),
           ]),
         ),
-        trailing: Container(
-          width: 36, height: 36,
-          decoration: BoxDecoration(
-            color: _green.withOpacity(0.1),
-            shape: BoxShape.circle,
-            border: Border.all(color: _green.withOpacity(0.4)),
-          ),
-          child: const Icon(Icons.play_arrow_rounded, color: _green, size: 20),
-        ),
-        onTap: () => Navigator.push(context,
-          MaterialPageRoute(builder: (_) => VideoPlaybackScreen(session: s))),
       ),
     );
   }
+
+  Widget _metric({
+    required IconData icon,
+    required String label,
+    required String value,
+    required Color color,
+    String? note,
+  }) {
+    return Expanded(child: Column(children: [
+      Icon(icon, color: color, size: 15),
+      const SizedBox(height: 4),
+      Text(value,
+          style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w700)),
+      const SizedBox(height: 1),
+      Text(note ?? label,
+          style: TextStyle(
+              color: note != null ? Colors.orange : _textSub,
+              fontSize: 9.5)),
+    ]));
+  }
+
+  Widget _divider() =>
+      Container(width: 1, height: 36, color: _border);
 
   Widget _empty() => Center(
     child: Column(mainAxisSize: MainAxisSize.min, children: [
@@ -141,7 +218,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
           style: TextStyle(color: _textSub, fontSize: 16,
               fontWeight: FontWeight.w600)),
       const SizedBox(height: 6),
-      const Text('Start recording to see your videos here',
+      const Text('Start recording to see your sessions here',
           style: TextStyle(color: _textSub, fontSize: 13)),
     ]),
   );

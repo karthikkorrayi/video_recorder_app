@@ -8,7 +8,7 @@ import 'attendance_service.dart';
 import 'processing_manager.dart';
 
 class VideoProcessor {
-  static const int blockSecs = 120;
+  static const int blockSecs = 300;
 
   final _storage    = LocalVideoStorage();
   final _attendance = AttendanceService();
@@ -16,11 +16,13 @@ class VideoProcessor {
   String startBackgroundProcessing({
     required String rawVideoPath,
     required DateTime sessionTime,
+    required DateTime recordingEnd,
   }) {
     final sessionId = '${DateTime.now().millisecondsSinceEpoch}';
     Future.microtask(() => _run(
       rawVideoPath: rawVideoPath,
       sessionTime: sessionTime,
+      recordingEnd: recordingEnd,
       sessionId: sessionId,
     ));
     return sessionId;
@@ -29,11 +31,12 @@ class VideoProcessor {
   Future<void> _run({
     required String rawVideoPath,
     required DateTime sessionTime,
+    required DateTime recordingEnd,
     required String sessionId,
   }) async {
-    final manager = ProcessingManager();
-    final user = FirebaseAuth.instance.currentUser!;
-    final userId = user.uid;
+    final manager   = ProcessingManager();
+    final user      = FirebaseAuth.instance.currentUser!;
+    final userId    = user.uid;
     final userEmail = user.email ?? userId;
 
     try {
@@ -45,7 +48,7 @@ class VideoProcessor {
 
       final durationSec = await _probeDurationSec(rawVideoPath);
       final totalBlocks = (durationSec / blockSecs).ceil().clamp(1, 999);
-      print('=== Processor: ${durationSec}s → $totalBlocks block(s)');
+      print('=== Processor: ${durationSec}s → $totalBlocks block(s) @ ${blockSecs}s each');
 
       final dir        = await _storage.sessionDir(sessionTime, userEmail);
       final savedPaths = <String>[];
@@ -69,11 +72,9 @@ class VideoProcessor {
         );
         final outputPath = '${dir.path}/$fileName';
 
-        // -ss BEFORE -i = input seek (fast, frame-accurate for H.264)
-        // -t            = number of seconds to copy from the seek point
-        // -c copy       = no re-encode, instant split, zero quality loss
-        // -avoid_negative_ts make_zero = fix timestamps in split files
-        // -movflags +faststart = moov atom at front (fast playback start)
+        // -ss before -i = fast input seek
+        // -t = duration of this specific block
+        // -c copy = no re-encode, instant, zero quality loss
         final cmd =
             '-ss $startSec '
             '-i "$rawVideoPath" '
@@ -83,7 +84,7 @@ class VideoProcessor {
             '-movflags +faststart '
             '"$outputPath"';
 
-        print('=== Block $blockNum: ss=$startSec t=$blockDur → $outputPath');
+        print('=== Block $blockNum: ss=$startSec t=$blockDur');
 
         final session = await FFmpegKit.execute(cmd);
         final rc      = await session.getReturnCode();
@@ -99,13 +100,18 @@ class VideoProcessor {
         }
 
         savedPaths.add(outputPath);
-        final kb = (await outFile.length() / 1024).toStringAsFixed(0);
-        print('=== Block $blockNum ✓  ${kb}KB');
+        print('=== Block $blockNum ✓');
       }
 
+      // Write sidecar with duration + recording times for history screen
       if (savedPaths.isNotEmpty) {
         final sidecar = savedPaths.first.replaceAll(RegExp(r'\.mp4$'), '.dur');
         await File(sidecar).writeAsString('$durationSec');
+
+        // Write metadata sidecar: start|end timestamps
+        final meta = savedPaths.first.replaceAll(RegExp(r'\.mp4$'), '.meta');
+        await File(meta).writeAsString(
+            '${sessionTime.toIso8601String()}|${recordingEnd.toIso8601String()}');
       }
 
       try { await File(rawVideoPath).delete(); } catch (_) {}

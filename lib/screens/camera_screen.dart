@@ -28,7 +28,9 @@ class _CameraScreenState extends State<CameraScreen> {
   Timer? _ticker;
 
   static const _green = Color(0xFF00C853);
-  static const _red   = Colors.redAccent;
+  static const _red   = Color(0xFFE53935);
+  static const _panel = Color(0xFFFFFFFF);
+  static const _bg    = Color(0xFFF4F4F4);
 
   bool get _isRecording => _state == _S.recording;
   bool get _isCounting  => _state == _S.countdown;
@@ -56,12 +58,28 @@ class _CameraScreenState extends State<CameraScreen> {
   Future<void> _initCamera() async {
     final cams = await availableCameras();
     if (!mounted) return;
+
+    // Fix 1: Use 1080p resolution + lock to standard 1.0x zoom
     _ctrl = CameraController(
       cams[0],
-      ResolutionPreset.high,
-      enableAudio: false,           // no audio
+      ResolutionPreset.veryHigh,  // 1080p on most devices
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.nv21,
     );
     await _ctrl!.initialize();
+
+    // Lock to standard 1.0x zoom (no digital zoom)
+    try {
+      final minZoom = await _ctrl!.getMinZoomLevel();
+      await _ctrl!.setZoomLevel(minZoom); // 1.0x = minimum = optical
+    } catch (_) {}
+
+    // Lock exposure and focus for stability
+    try {
+      await _ctrl!.setExposureMode(ExposureMode.auto);
+      await _ctrl!.setFocusMode(FocusMode.auto);
+    } catch (_) {}
+
     if (!mounted) return;
     setState(() => _state = _S.detecting);
   }
@@ -174,10 +192,15 @@ class _CameraScreenState extends State<CameraScreen> {
     setState(() => _state = _S.stopping);
     try {
       final file = await _ctrl!.stopVideoRecording();
+      final endTime = DateTime.now();
       if (!mounted) return;
       setState(() { _state = _S.detecting; _elapsed = Duration.zero; });
       await Navigator.push(context,
-        MaterialPageRoute(builder: (_) => ReviewScreen(videoPath: file.path)));
+        MaterialPageRoute(builder: (_) => ReviewScreen(
+          videoPath: file.path,
+          recordingStart: _recStart ?? endTime.subtract(const Duration(minutes: 1)),
+          recordingEnd: endTime,
+        )));
       if (mounted) {
         setState(() { _state = _S.detecting; _autoDetect = false; });
         SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
@@ -202,7 +225,6 @@ class _CameraScreenState extends State<CameraScreen> {
   @override
   void dispose() {
     _ticker?.cancel();
-    // Restore portrait + show system UI when leaving camera
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     WakelockPlus.disable();
@@ -222,173 +244,260 @@ class _CameraScreenState extends State<CameraScreen> {
 
     return Scaffold(
       backgroundColor: Colors.black,
-      // No AppBar — full immersive camera view
-      body: Stack(children: [
+      body: Row(children: [
 
-        // ── Full-screen camera preview ─────────────────────────────────────
-        Positioned.fill(child: CameraPreview(_ctrl!)),
+        // ── LEFT: Camera preview (takes 60% of width) ──────────────────
+        Expanded(
+          flex: 60,
+          child: Stack(children: [
+            // Full camera preview
+            Positioned.fill(child: CameraPreview(_ctrl!)),
 
-        // Countdown big number
-        if (_isCounting && _countdown > 0)
-          Center(
-            child: Container(
-            width: 120, height: 120,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: Colors.black.withOpacity(0.6),
-              border: Border.all(color: _green, width: 2),
-            ),
-            child: Center(
-              child: Text('$_countdown',
-                style: const TextStyle(
-                  color: Colors.white, fontSize: 72,
-                    fontWeight: FontWeight.bold))),
-          )),
+            // Stopping overlay
+            if (_isStopping)
+              Container(color: Colors.black54,
+                child: const Center(child: CircularProgressIndicator(color: _green))),
 
-        // Stopping overlay
-        if (_isStopping)
-          Container(
-            color: Colors.black54,
-            child: Center(
-              child: Column(mainAxisSize: MainAxisSize.min, children: const [
-                CircularProgressIndicator(color: _green, strokeWidth: 2.5),
-              SizedBox(height: 12),
-              Text('Saving...', style: TextStyle(color: Colors.white70, fontSize: 14)),
-            ]),
-          ),
+            // Countdown overlay
+            if (_isCounting && _countdown > 0)
+              Center(child: Container(
+                width: 100, height: 100,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Colors.black.withOpacity(0.65),
+                  border: Border.all(color: _green, width: 2.5),
+                ),
+                child: Center(child: Text('$_countdown',
+                    style: const TextStyle(color: Colors.white, fontSize: 56,
+                        fontWeight: FontWeight.bold))),
+              )),
+
+            // Top-left: zoom label + resolution
+            Positioned(top: 12, left: 12,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.55),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Text('Standard · 1.0x · 1080p · 30fps',
+                    style: TextStyle(color: Colors.white, fontSize: 10,
+                        fontWeight: FontWeight.w500)),
+              )),
+
+            // Top-left: recording timer
+            if (_isRecording)
+              Positioned(top: 40, left: 12,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: _red.withOpacity(0.9),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    const Icon(Icons.fiber_manual_record, color: Colors.white, size: 9),
+                    const SizedBox(width: 4),
+                    Text(_fmt(_elapsed), style: const TextStyle(color: Colors.white,
+                        fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 1)),
+                  ]),
+                )),
+          ]),
         ),
 
-        // Recording timer — top left
-        if (_isRecording)
-          Positioned(top: 16, left: 20,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-              decoration: BoxDecoration(
-                color: _red.withOpacity(0.9),
-                borderRadius: BorderRadius.circular(22),
-              ),
-              child: Row(mainAxisSize: MainAxisSize.min, children: [
-                const Icon(Icons.fiber_manual_record, color: Colors.white, size: 10),
-                const SizedBox(width: 5),
-                Text(_fmt(_elapsed), 
-                  style: const TextStyle(color: Colors.white, fontSize: 17, 
-                    fontWeight: FontWeight.bold, letterSpacing: 1.1)),
-              ]),
-            )),
-
-        // Auto-detect status badge (top-left when detecting)
-        if (_isDetecting)
-          Positioned(top: 16, left: 20,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              decoration: BoxDecoration(
-                color: _autoDetect
-                    ? _green.withOpacity(0.15)
-                    : Colors.black.withOpacity(0.5),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: _autoDetect ? _green : Colors.white24),
-              ),
-              child: Row(mainAxisSize: MainAxisSize.min, children: [
-                Icon(_autoDetect
-                    ? Icons.back_hand_rounded
-                    : Icons.back_hand_outlined,
-                    color: _autoDetect ? _green : Colors.white70, size: 14),
-                const SizedBox(width: 5),
-                Text(_autoDetect ? 'Hand detect ON' : 'Hand detect OFF',
-                    style: TextStyle(
-                        color: _autoDetect ? _green : Colors.white70,
-                        fontSize: 11, fontWeight: FontWeight.w500)),
-              ]),
-            )),
-
-        // ══════════════════════════════════════════════════════════════════
-        // ── BOTTOM CONTROL BAR (landscape-friendly, clear of nav bar) ────
-        // ══════════════════════════════════════════════════════════════════
-        Positioned(
-          left: 0, right: 0, bottom: 0,
+        // ── RIGHT: Controls panel (40% of width) ──────────────────────
+        Expanded(
+          flex: 40,
           child: Container(
-            // Gradient so controls are readable over any background
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.bottomCenter, 
-                end: Alignment.topCenter,
-                colors: [Colors.black.withOpacity(0.92), Colors.transparent],
+            color: _bg,
+            child: Column(children: [
+
+              // ── Top section: stats ──────────────────────────────────
+              Container(
+                padding: const EdgeInsets.fromLTRB(12, 14, 12, 10),
+                decoration: BoxDecoration(
+                  color: _panel,
+                  border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
+                ),
+                child: Row(children: [
+                  // Total recorded
+                  Expanded(child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(children: [
+                      const Text('TOTAL', style: TextStyle(fontSize: 10,
+                          fontWeight: FontWeight.w700, color: Color(0xFF888888),
+                          letterSpacing: 1)),
+                      const SizedBox(width: 4),
+                      Icon(Icons.keyboard_arrow_down_rounded,
+                          size: 14, color: Colors.grey.shade500),
+                    ]),
+                    const SizedBox(height: 4),
+                    Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                      Text(_isRecording
+                          ? '${_elapsed.inSeconds}'
+                          : '0',
+                        style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold,
+                            color: Color(0xFF1A1A1A))),
+                      const SizedBox(width: 2),
+                      const Text('s', style: TextStyle(fontSize: 13, color: Color(0xFF888888))),
+                    ]),
+                    const SizedBox(height: 4),
+                    Row(children: [
+                      Container(width: 7, height: 7,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: _isRecording ? _red : Colors.grey.shade400,
+                        )),
+                      const SizedBox(width: 5),
+                      Text(_fmt(_elapsed),
+                        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600,
+                            color: Color(0xFF1A1A1A))),
+                    ]),
+                  ])),
+
+                  // Divider
+                  Container(width: 1, height: 52, color: Colors.grey.shade200),
+                  const SizedBox(width: 8),
+
+                  // Right mini controls
+                  Column(children: [
+                    Row(children: [
+                      _MiniBtn(icon: Icons.home_rounded, label: 'HOME',
+                          onTap: () => Navigator.pop(context)),
+                      const SizedBox(width: 6),
+                      _MiniBtn(
+                        icon: _torchOn ? Icons.flashlight_on : Icons.flashlight_off,
+                        label: 'FLASH',
+                        active: _torchOn, activeColor: const Color(0xFFFFD600),
+                        onTap: _toggleTorch,
+                      ),
+                    ]),
+                    const SizedBox(height: 6),
+                    // PENDING / auto-detect row
+                    GestureDetector(
+                      onTap: (!_isRecording && !_isCounting) ? _toggleAutoDetect : null,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: _autoDetect ? _green.withOpacity(0.1) : Colors.grey.shade100,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                              color: _autoDetect ? _green : Colors.grey.shade300),
+                        ),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.back_hand_outlined,
+                              size: 12,
+                              color: _autoDetect ? _green : Colors.grey.shade500),
+                          const SizedBox(width: 4),
+                          Text(_autoDetect ? 'HAND ON' : 'PENDING',
+                              style: TextStyle(fontSize: 9, fontWeight: FontWeight.w700,
+                                  letterSpacing: 0.5,
+                                  color: _autoDetect ? _green : Colors.grey.shade500)),
+                          const SizedBox(width: 4),
+                          Icon(Icons.keyboard_arrow_right_rounded, size: 12,
+                              color: _autoDetect ? _green : Colors.grey.shade500),
+                        ]),
+                      ),
+                    ),
+                  ]),
+                ]),
               ),
-            ),
-            padding: const EdgeInsets.fromLTRB(24, 14, 24, 18),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
 
-                // Left: Exit
-                _BarBtn(icon: Icons.arrow_back_ios_new_rounded,
-                    label: 'Exit',
-                    onTap: () => Navigator.pop(context),
-                  ),
-
-                // Centre group
-                Row(mainAxisSize: MainAxisSize.min, children: [
-
-                  // Flash toggle
-                  _BarBtn(
-                    icon: _torchOn ? Icons.flashlight_on : Icons.flashlight_off,
-                    label: 'Flash',
-                    active: _torchOn,
-                    activeColor: const Color(0xFFFFD700),
-                    onTap: _toggleTorch,
-                  ),
-                  const SizedBox(width: 20),
-
-                  // Primary: Start / Stop
-                  if (_isDetecting)
-                    _BigBtn(
-                      icon: Icons.play_arrow_rounded,
-                      label: 'Start', 
-                      color: _green, 
-                      onTap: _manualStart,
-                    ),
-                  if (_isRecording)
-                    _BigBtn(
-                      icon: Icons.stop_rounded,
-                      label: 'Stop', 
-                      color: _red, 
-                      onTap: _stopRecording,
-                    ),
-                  if (_isCounting)
-                    _BigBtn(
-                      icon: Icons.hourglass_top_rounded,
-                        label: 'Wait...', 
-                        color: Colors.white30, 
-                        onTap: null,
+              // ── Middle: video preview label ─────────────────────────
+              Expanded(
+                child: Container(
+                  alignment: Alignment.center,
+                  child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    // Resolution info
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      margin: const EdgeInsets.only(bottom: 12),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: Colors.grey.shade200),
                       ),
-                  if (_isStopping)
-                    _BigBtn(
-                      icon: Icons.hourglass_top_rounded,
-                        label: 'Saving', 
-                        color: Colors.white30, 
-                        onTap: null,
+                      child: Column(children: [
+                        Text('1080p · 30fps',
+                            style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700,
+                                color: Colors.grey.shade700)),
+                        const SizedBox(height: 2),
+                        Text('Standard 1.0x',
+                            style: TextStyle(fontSize: 10, color: Colors.grey.shade500)),
+                      ]),
+                    ),
+
+                    // Auto-detect status
+                    if (_autoDetect && _isDetecting)
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: _green.withOpacity(0.08),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text('Show both hands to auto-start',
+                            style: TextStyle(fontSize: 10, color: _green.withOpacity(0.8))),
                       ),
+                  ]),
+                ),
+              ),
 
-                  const SizedBox(width: 20),
+              // ── Bottom: Start New Recording button ──────────────────
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+                child: Column(children: [
 
-                  // Auto-detect toggle
-                  _BarBtn(
-                    icon: _autoDetect
-                        ? Icons.back_hand_rounded
-                        : Icons.back_hand_outlined,
-                    label: 'Auto',
-                    active: _autoDetect,
-                    activeColor: _green,
-                    onTap: (!_isRecording && !_isCounting)
-                        ? _toggleAutoDetect : null,
+                  // Main action button — full width
+                  SizedBox(
+                    width: double.infinity,
+                    child: _isDetecting
+                        ? ElevatedButton.icon(
+                            onPressed: _manualStart,
+                            icon: const Icon(Icons.play_arrow_rounded,
+                                color: Colors.white, size: 22),
+                            label: const Text('Start New Recording',
+                                style: TextStyle(color: Colors.white,
+                                    fontSize: 13, fontWeight: FontWeight.w700)),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: _green,
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14)),
+                              elevation: 0,
+                            ),
+                          )
+                        : _isRecording
+                            ? ElevatedButton.icon(
+                                onPressed: _stopRecording,
+                                icon: const Icon(Icons.stop_rounded,
+                                    color: Colors.white, size: 22),
+                                label: const Text('Stop Recording',
+                                    style: TextStyle(color: Colors.white,
+                                        fontSize: 13, fontWeight: FontWeight.w700)),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: _red,
+                                  padding: const EdgeInsets.symmetric(vertical: 14),
+                                  shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(14)),
+                                  elevation: 0,
+                                ),
+                              )
+                            : ElevatedButton(
+                                onPressed: null,
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.grey.shade300,
+                                  padding: const EdgeInsets.symmetric(vertical: 14),
+                                  shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(14)),
+                                  elevation: 0,
+                                ),
+                                child: Text(_isCounting ? 'Starting in $_countdown...' : 'Please wait...',
+                                    style: TextStyle(color: Colors.grey.shade600,
+                                        fontSize: 13, fontWeight: FontWeight.w700)),
+                              ),
                   ),
                 ]),
-
-                // Right: spacer mirror for visual balance
-                const SizedBox(width: 52),
-              ],
-            ),
+              ),
+            ]),
           ),
         ),
       ]),
@@ -396,80 +505,39 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 }
 
-// ── Small bar button (Exit, Flash) ────────────────────────────────────────────
+// ── Mini button widget ────────────────────────────────────────────────────────
 
-class _BarBtn extends StatelessWidget {
+class _MiniBtn extends StatelessWidget {
   final IconData icon;
   final String label;
   final VoidCallback? onTap;
   final bool active;
   final Color activeColor;
 
-  const _BarBtn({
+  const _MiniBtn({
     required this.icon, required this.label,
-    this.onTap, this.active = false, this.activeColor = Colors.white,
+    this.onTap, this.active = false, this.activeColor = Colors.black,
   });
 
   @override
   Widget build(BuildContext context) {
-    final color = active ? activeColor : Colors.white;
     return GestureDetector(
       onTap: onTap,
-      child: Opacity(
-        opacity: onTap == null ? 0.3 : 1.0,
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Container(
-            width: 48, height: 48,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: active
-                  ? activeColor.withOpacity(0.15)
-                  : Colors.white.withOpacity(0.1),
-              border: Border.all(color: color.withOpacity(0.6), width: 1.2),
-            ),
-            child: Icon(icon, color: color, size: 22),
-          ),
-          const SizedBox(height: 3),
-          Text(label, style: TextStyle(color: color.withOpacity(0.8),
-              fontSize: 10, fontWeight: FontWeight.w500)),
-        ]),
-      ),
-    );
-  }
-}
-
-// ── Large primary action button ────────────────────────────────────────────────
-
-class _BigBtn extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final Color color;
-  final VoidCallback? onTap;
-
-  const _BigBtn({
-    required this.icon, required this.label,
-    required this.color, this.onTap,
-    });
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Opacity(
-        opacity: onTap == null ? 0.4 : 1.0,
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Container(
-            width: 66, height: 66,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: color.withOpacity(0.15),
-              border: Border.all(color: color, width: 2.5),
-            ),
-            child: Icon(icon, color: color, size: 32),
-          ),
-          const SizedBox(height: 4),
-          Text(label, style: TextStyle(color: color,
-              fontSize: 11, fontWeight: FontWeight.w600)),
+      child: Container(
+        width: 52, height: 44,
+        decoration: BoxDecoration(
+          color: active ? activeColor.withOpacity(0.1) : Colors.grey.shade100,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+              color: active ? activeColor : Colors.grey.shade300),
+        ),
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Icon(icon, size: 18,
+              color: active ? activeColor : Colors.grey.shade600),
+          const SizedBox(height: 2),
+          Text(label, style: TextStyle(fontSize: 8, fontWeight: FontWeight.w700,
+              letterSpacing: 0.4,
+              color: active ? activeColor : Colors.grey.shade500)),
         ]),
       ),
     );

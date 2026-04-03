@@ -4,12 +4,19 @@ import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import '../services/video_processor.dart';
 
-const _green  = Color(0xFF00C853);
-const _greenD = Color(0xFF00A045);
+const _green = Color(0xFF00C853);
 
 class ReviewScreen extends StatefulWidget {
   final String videoPath;
-  const ReviewScreen({super.key, required this.videoPath});
+  final DateTime recordingStart;
+  final DateTime recordingEnd;
+
+  const ReviewScreen({
+    super.key,
+    required this.videoPath,
+    required this.recordingStart,
+    required this.recordingEnd,
+  });
 
   @override
   State<ReviewScreen> createState() => _ReviewScreenState();
@@ -53,7 +60,7 @@ class _ReviewScreenState extends State<ReviewScreen> {
 
   void _onUpdate() {
     if (!mounted) return;
-    final c = _player;
+    final c = _player; 
     if (c == null) return;
     final pos = c.value.position;
     final pl  = c.value.isPlaying;
@@ -91,21 +98,13 @@ class _ReviewScreenState extends State<ReviewScreen> {
       '${d.inMinutes.remainder(60).toString().padLeft(2,'0')}:'
       '${d.inSeconds.remainder(60).toString().padLeft(2,'0')}';
 
-  Future<void> _recapture() async {
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
-    Navigator.pop(context, 'recapture');
-  }
-
   Future<void> _saveAndReturn() async {
     setState(() => _saving = true);
     _player?.pause();
-
     VideoProcessor().startBackgroundProcessing(
       rawVideoPath: widget.videoPath,
-      sessionTime: DateTime.now(),
+      sessionTime: widget.recordingStart,
+      recordingEnd: widget.recordingEnd,
     );
 
     await Future.delayed(const Duration(milliseconds: 400));
@@ -148,160 +147,134 @@ class _ReviewScreenState extends State<ReviewScreen> {
           if (_saving)
             Container(
               color: Colors.black.withOpacity(0.75),
-              child: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-                const CircularProgressIndicator(color: _green, strokeWidth: 2.5),
-                const SizedBox(height: 14),
-                const Text('Queuing for processing...',
+              child: const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                CircularProgressIndicator(color: _green, strokeWidth: 2.5),
+                SizedBox(height: 14),
+                Text('Queuing for processing...',
                     style: TextStyle(color: Colors.white70, fontSize: 14)),
-              ])),
-            ),
+              ]))),
 
           // ── Controls ────────────────────────────────────────────────────
           if (_showCtrls && !_saving)
-            AnimatedOpacity(
-              opacity: 1.0,
-              duration: const Duration(milliseconds: 200),
-              child: Stack(children: [
+            Stack(children: [
 
                 // Top bar — Recapture | Review | Save
-                Positioned(top: 0, left: 0, right: 0,
-                  child: Container(
-                    decoration: BoxDecoration(gradient: LinearGradient(
-                      begin: Alignment.topCenter, end: Alignment.bottomCenter,
-                      colors: [Colors.black.withOpacity(0.75), Colors.transparent],
-                    )),
-                    padding: const EdgeInsets.fromLTRB(18, 14, 18, 18),
-                    child: Row(children: [
+              Positioned(top: 0, left: 0, right: 0,
+                child: Container(
+                  decoration: BoxDecoration(gradient: LinearGradient(
+                    begin: Alignment.topCenter, end: Alignment.bottomCenter,
+                    colors: [Colors.black.withOpacity(0.75), Colors.transparent],
+                  )),
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
+                  child: Row(children: [
                       // Recapture — green outline
-                      GestureDetector(
-                        onTap: _recapture,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 14, vertical: 8),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withOpacity(0.1),
-                            borderRadius: BorderRadius.circular(22),
-                            border: Border.all(color: _green.withOpacity(0.7)),
-                          ),
-                          child: Row(mainAxisSize: MainAxisSize.min, children: const [
-                            Icon(Icons.replay_rounded, color: _green, size: 16),
-                            SizedBox(width: 6),
-                            Text('Recapture', style: TextStyle(color: _green,
-                                fontSize: 13, fontWeight: FontWeight.w600)),
-                          ]),
+                    GestureDetector(
+                      onTap: () {
+                        SystemChrome.setPreferredOrientations([
+                          DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
+                        Navigator.pop(context, 'recapture');
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(22),
+                          border: Border.all(color: _green.withOpacity(0.7)),
                         ),
+                        child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.replay_rounded, color: _green, size: 16),
+                          SizedBox(width: 6),
+                          Text('Recapture', style: TextStyle(color: _green,
+                              fontSize: 13, fontWeight: FontWeight.w600)),
+                        ]),
                       ),
-                      const Spacer(),
-                      const Text('Review', style: TextStyle(color: Colors.white,
-                          fontSize: 15, fontWeight: FontWeight.w600)),
-                      const Spacer(),
+                    ),
+                    const Spacer(),
+                    const Text('Review', style: TextStyle(color: Colors.white,
+                        fontSize: 15, fontWeight: FontWeight.w600)),
+                    const Spacer(),
                       // Save — solid green
-                      GestureDetector(
-                        onTap: _saveAndReturn,
+                    GestureDetector(
+                      onTap: _saveAndReturn,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 18, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: _green, borderRadius: BorderRadius.circular(22)),
+                        child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.check_rounded, color: Colors.white, size: 16),
+                          SizedBox(width: 6),
+                          Text('Save', style: TextStyle(color: Colors.white,
+                              fontSize: 13, fontWeight: FontWeight.w600)),
+                        ]),
+                      ),
+                    ),
+                  ]),
+                )),
+
+                // Bottom seek bar + controls
+              Positioned(bottom: 0, left: 0, right: 0,
+                child: Container(
+                  decoration: BoxDecoration(gradient: LinearGradient(
+                    begin: Alignment.bottomCenter, end: Alignment.topCenter,
+                    colors: [Colors.black.withOpacity(0.85), Colors.transparent],
+                  )),
+                  padding: const EdgeInsets.fromLTRB(24, 12, 24, 20),
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                      // Seek bar — green
+                    SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        trackHeight: 3,
+                        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+                        overlayShape: const RoundSliderOverlayShape(overlayRadius: 16),
+                        activeTrackColor: _green,
+                        inactiveTrackColor: Colors.white24,
+                        thumbColor: _green,
+                        overlayColor: _green.withOpacity(0.2),
+                      ),
+                      child: Slider(
+                        value: frac,
+                        onChanged: _seekTo,
+                        onChangeStart: (_) => _player?.pause(),
+                        onChangeEnd:   (_) { if (_isPlaying) _player?.play(); },
+                      ),
+                    ),
+                      // Time + skip controls
+                    Row(children: [
+                      Text(_fmt(_pos), style: const TextStyle(
+                        color: Colors.white60, fontSize: 11)),
+                      const Spacer(),
+                      Text(_fmt(_dur), style: const TextStyle(color: Colors.white60, fontSize: 11)),
+                    ]),
+                    const SizedBox(height: 10),
+
+                    // ── CENTRED play/pause button — medium width ──────────
+                    Center(
+                      child: GestureDetector(
+                        onTap: _togglePlay,
                         child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 18, vertical: 8),
+                          width: 160, height: 44,
                           decoration: BoxDecoration(
                             color: _green,
                             borderRadius: BorderRadius.circular(22),
                           ),
-                          child: Row(mainAxisSize: MainAxisSize.min, children: const [
-                            Icon(Icons.check_rounded, color: Colors.white, size: 16),
-                            SizedBox(width: 6),
-                            Text('Save', style: TextStyle(color: Colors.white,
-                                fontSize: 13, fontWeight: FontWeight.w600)),
+                          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                            Icon(_isPlaying
+                                ? Icons.pause_rounded
+                                : Icons.play_arrow_rounded,
+                                color: Colors.white, size: 22),
+                            const SizedBox(width: 6),
+                            Text(_isPlaying ? 'Pause' : 'Play',
+                                style: const TextStyle(color: Colors.white,
+                                    fontSize: 14, fontWeight: FontWeight.w600)),
                           ]),
                         ),
                       ),
-                    ]),
-                  ),
-                ),
-
-                // Centre play/pause
-                Center(child: GestureDetector(
-                  onTap: _togglePlay,
-                  child: Container(
-                    width: 62, height: 62,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: Colors.black.withOpacity(0.5),
-                      border: Border.all(color: _green.withOpacity(0.6)),
                     ),
-                    child: Icon(
-                      _isPlaying
-                          ? Icons.pause_rounded
-                          : Icons.play_arrow_rounded,
-                      color: _green, size: 34),
-                  ),
+                  ]),
                 )),
-
-                // Bottom seek bar + controls
-                Positioned(bottom: 0, left: 0, right: 0,
-                  child: Container(
-                    decoration: BoxDecoration(gradient: LinearGradient(
-                      begin: Alignment.bottomCenter, end: Alignment.topCenter,
-                      colors: [Colors.black.withOpacity(0.8), Colors.transparent],
-                    )),
-                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-                    child: Column(mainAxisSize: MainAxisSize.min, children: [
-                      // Seek bar — green
-                      SliderTheme(
-                        data: SliderTheme.of(context).copyWith(
-                          trackHeight: 3,
-                          thumbShape: const RoundSliderThumbShape(
-                              enabledThumbRadius: 7),
-                          overlayShape: const RoundSliderOverlayShape(
-                              overlayRadius: 16),
-                          activeTrackColor: _green,
-                          inactiveTrackColor: Colors.white24,
-                          thumbColor: _green,
-                          overlayColor: _green.withOpacity(0.2),
-                        ),
-                        child: Slider(
-                          value: frac,
-                          onChanged: _seekTo,
-                          onChangeStart: (_) => _player?.pause(),
-                          onChangeEnd:   (_) { if (_isPlaying) _player?.play(); },
-                        ),
-                      ),
-                      // Time + skip controls
-                      Row(children: [
-                        Text(_fmt(_pos), style: const TextStyle(
-                            color: Colors.white60, fontSize: 12)),
-                        const Spacer(),
-                        // -5s
-                        GestureDetector(
-                          onTap: () => _player?.seekTo(Duration(
-                              milliseconds: (posMs - 5000).clamp(0, totalMs))),
-                          child: const Padding(padding: EdgeInsets.all(6),
-                            child: Icon(Icons.replay_5_rounded,
-                                color: Colors.white70, size: 24))),
-                        const SizedBox(width: 8),
-                        // Play/pause
-                        GestureDetector(
-                          onTap: _togglePlay,
-                          child: Icon(
-                            _isPlaying
-                                ? Icons.pause_circle_filled_rounded
-                                : Icons.play_circle_filled_rounded,
-                            color: _green, size: 40)),
-                        const SizedBox(width: 8),
-                        // +5s
-                        GestureDetector(
-                          onTap: () => _player?.seekTo(Duration(
-                              milliseconds: (posMs + 5000).clamp(0, totalMs))),
-                          child: const Padding(padding: EdgeInsets.all(6),
-                            child: Icon(Icons.forward_5_rounded,
-                                color: Colors.white70, size: 24))),
-                        const Spacer(),
-                        Text(_fmt(_dur), style: const TextStyle(
-                            color: Colors.white60, fontSize: 12)),
-                      ]),
-                    ]),
-                  ),
-                ),
-              ]),
-            ),
+            ]),
         ]),
       ),
     );
