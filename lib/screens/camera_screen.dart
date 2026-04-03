@@ -5,6 +5,7 @@ import 'package:camera/camera.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'review_screen.dart';
+import '../services/beep_service.dart';
 
 enum _S { init, detecting, countdown, recording, stopping }
 
@@ -24,13 +25,17 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _processingFrame = false;
   bool _autoDetect = false;
 
-  final _pose = PoseDetector(options: PoseDetectorOptions());
+  final _pose  = PoseDetector(options: PoseDetectorOptions());
+  final _beep  = BeepService();
   Timer? _ticker;
 
-  static const _green = Color(0xFF00C853);
-  static const _red   = Color(0xFFE53935);
-  static const _panel = Color(0xFFFFFFFF);
-  static const _bg    = Color(0xFFF4F4F4);
+  static const _green   = Color(0xFF00C853);
+  static const _red     = Color(0xFFE53935);
+  static const _panel   = Color(0xFFFFFFFF);
+  static const _bg      = Color(0xFFF4F4F4);
+  static const _text    = Color(0xFF1A1A1A);
+  static const _textSub = Color(0xFF666666);
+  static const _border  = Color(0xFFE0E0E0);
 
   bool get _isRecording => _state == _S.recording;
   bool get _isCounting  => _state == _S.countdown;
@@ -52,6 +57,7 @@ class _CameraScreenState extends State<CameraScreen> {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
 
     WakelockPlus.enable();
+    _beep.init(); // pre-warm audio session
     _initCamera();
   }
 
@@ -146,17 +152,32 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // ── Countdown ─────────────────────────────────────────────────────────────
+  // ── 5-second countdown with beep on every tick ────────────────────────────
 
   Future<void> _doCountdown() async {
     if (!mounted) return;
-    setState(() { _state = _S.countdown; _countdown = 3; });
-    for (int i = 2; i >= 0; i--) {
-      await Future.delayed(const Duration(seconds: 1));
+
+    // Start at 5 and count down to 1, then GO
+    const startCount = 5;
+    setState(() { _state = _S.countdown; _countdown = startCount; });
+
+    for (int i = startCount; i >= 1; i--) {
       if (!mounted || _state != _S.countdown) return;
       setState(() => _countdown = i);
+
+      // Play tick beep — do NOT await so it doesn't delay the countdown
+      _beep.tick();
+
+      await Future.delayed(const Duration(seconds: 1));
     }
-    await Future.delayed(const Duration(milliseconds: 150));
+
+    if (!mounted || _state != _S.countdown) return;
+
+    // Final GO beep when recording actually starts
+    setState(() => _countdown = 0);
+    await _beep.go(); // await this one so it plays before camera starts
+    await Future.delayed(const Duration(milliseconds: 100));
+
     if (!mounted || _state != _S.countdown) return;
     await _startRecording();
   }
@@ -231,6 +252,7 @@ class _CameraScreenState extends State<CameraScreen> {
     _stopStream();
     _ctrl?.dispose();
     _pose.close();
+    _beep.dispose();
     super.dispose();
   }
 
@@ -238,7 +260,7 @@ class _CameraScreenState extends State<CameraScreen> {
   Widget build(BuildContext context) {
     if (_state == _S.init || _ctrl == null) {
       return const Scaffold(
-        backgroundColor: Colors.black,
+        backgroundColor: Color(0xFF0D0D0D),
         body: Center(child: CircularProgressIndicator(color: _green)));
     }
 
@@ -250,7 +272,6 @@ class _CameraScreenState extends State<CameraScreen> {
         Expanded(
           flex: 60,
           child: Stack(children: [
-            // Full camera preview
             Positioned.fill(child: CameraPreview(_ctrl!)),
 
             // Stopping overlay
@@ -260,19 +281,42 @@ class _CameraScreenState extends State<CameraScreen> {
 
             // Countdown overlay
             if (_isCounting && _countdown > 0)
-              Center(child: Container(
-                width: 100, height: 100,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: Colors.black.withOpacity(0.65),
-                  border: Border.all(color: _green, width: 2.5),
-                ),
-                child: Center(child: Text('$_countdown',
-                    style: const TextStyle(color: Colors.white, fontSize: 56,
-                        fontWeight: FontWeight.bold))),
-              )),
+              Center(
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  // Large countdown number with green ring
+                  Container(
+                    width: 110, height: 110,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Colors.black.withOpacity(0.6),
+                      border: Border.all(
+                        color: _countdown <= 2 ? _red : _green,
+                        width: 3,
+                      ),
+                    ),
+                    child: Center(
+                      child: Text('$_countdown',
+                        style: TextStyle(
+                          color: _countdown <= 2 ? _red : Colors.white,
+                          fontSize: 58,
+                          fontWeight: FontWeight.bold,
+                        )),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 5),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.55),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Text('Recording starts soon...',
+                        style: TextStyle(color: Colors.white70, fontSize: 12)),
+                  ),
+                ]),
+              ),
 
-            // Top-left: zoom label + resolution
+            // Top-left info bar
             Positioned(top: 12, left: 12,
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
@@ -287,7 +331,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
             // Top-left: recording timer
             if (_isRecording)
-              Positioned(top: 40, left: 12,
+              Positioned(top: 38, left: 12,
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                   decoration: BoxDecoration(
@@ -311,54 +355,48 @@ class _CameraScreenState extends State<CameraScreen> {
             color: _bg,
             child: Column(children: [
 
-              // ── Top section: stats ──────────────────────────────────
+              // Stats header
               Container(
                 padding: const EdgeInsets.fromLTRB(12, 14, 12, 10),
                 decoration: BoxDecoration(
                   color: _panel,
-                  border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
+                  border: Border(bottom: BorderSide(color: _border)),
                 ),
                 child: Row(children: [
                   // Total recorded
                   Expanded(child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      crossAxisAlignment: CrossAxisAlignment.start, children: [
                     Row(children: [
                       const Text('TOTAL', style: TextStyle(fontSize: 10,
-                          fontWeight: FontWeight.w700, color: Color(0xFF888888),
-                          letterSpacing: 1)),
-                      const SizedBox(width: 4),
+                          fontWeight: FontWeight.w700, color: _textSub, letterSpacing: 1)),
+                      const SizedBox(width: 3),
                       Icon(Icons.keyboard_arrow_down_rounded,
-                          size: 14, color: Colors.grey.shade500),
+                          size: 13, color: Colors.grey.shade400),
                     ]),
                     const SizedBox(height: 4),
                     Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                      Text(_isRecording
-                          ? '${_elapsed.inSeconds}'
-                          : '0',
-                        style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold,
-                            color: Color(0xFF1A1A1A))),
+                      Text(_isRecording ? '${_elapsed.inSeconds}' : '0',
+                          style: const TextStyle(fontSize: 24,
+                              fontWeight: FontWeight.bold, color: _text)),
                       const SizedBox(width: 2),
-                      const Text('s', style: TextStyle(fontSize: 13, color: Color(0xFF888888))),
+                      const Text('s', style: TextStyle(fontSize: 12, color: _textSub)),
                     ]),
                     const SizedBox(height: 4),
                     Row(children: [
                       Container(width: 7, height: 7,
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
-                          color: _isRecording ? _red : Colors.grey.shade400,
-                        )),
+                          color: _isRecording ? _red : Colors.grey.shade400)),
                       const SizedBox(width: 5),
                       Text(_fmt(_elapsed),
-                        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600,
-                            color: Color(0xFF1A1A1A))),
+                          style: const TextStyle(fontSize: 13,
+                              fontWeight: FontWeight.w600, color: _text)),
                     ]),
                   ])),
 
-                  // Divider
-                  Container(width: 1, height: 52, color: Colors.grey.shade200),
+                  Container(width: 1, height: 52, color: _border),
                   const SizedBox(width: 8),
 
-                  // Right mini controls
                   Column(children: [
                     Row(children: [
                       _MiniBtn(icon: Icons.home_rounded, label: 'HOME',
@@ -372,7 +410,6 @@ class _CameraScreenState extends State<CameraScreen> {
                       ),
                     ]),
                     const SizedBox(height: 6),
-                    // PENDING / auto-detect row
                     GestureDetector(
                       onTap: (!_isRecording && !_isCounting) ? _toggleAutoDetect : null,
                       child: Container(
@@ -384,8 +421,7 @@ class _CameraScreenState extends State<CameraScreen> {
                               color: _autoDetect ? _green : Colors.grey.shade300),
                         ),
                         child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          Icon(Icons.back_hand_outlined,
-                              size: 12,
+                          Icon(Icons.back_hand_outlined, size: 12,
                               color: _autoDetect ? _green : Colors.grey.shade500),
                           const SizedBox(width: 4),
                           Text(_autoDetect ? 'HAND ON' : 'PENDING',
@@ -402,36 +438,52 @@ class _CameraScreenState extends State<CameraScreen> {
                 ]),
               ),
 
-              // ── Middle: video preview label ─────────────────────────
+              // Middle info area
               Expanded(
-                child: Container(
-                  alignment: Alignment.center,
+                child: Center(
                   child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    // Resolution info
+                    // Resolution badge
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                      margin: const EdgeInsets.only(bottom: 12),
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                       decoration: BoxDecoration(
-                        color: Colors.white,
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(color: Colors.grey.shade200),
+                        color: _panel, borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: _border),
                       ),
                       child: Column(children: [
-                        Text('1080p · 30fps',
-                            style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700,
-                                color: Colors.grey.shade700)),
+                        Text('1080p · 30fps', style: TextStyle(fontSize: 11,
+                            fontWeight: FontWeight.w700, color: Colors.grey.shade700)),
                         const SizedBox(height: 2),
-                        Text('Standard 1.0x',
-                            style: TextStyle(fontSize: 10, color: Colors.grey.shade500)),
+                        Text('Standard 1.0x', style: TextStyle(fontSize: 10,
+                            color: Colors.grey.shade500)),
                       ]),
                     ),
+                    const SizedBox(height: 12),
 
-                    // Auto-detect status
-                    if (_autoDetect && _isDetecting)
+                    // Countdown hint when active
+                    if (_isCounting)
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                        decoration: BoxDecoration(
+                          color: (_countdown <= 2 ? _red : _green).withOpacity(0.08),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                              color: (_countdown <= 2 ? _red : _green).withOpacity(0.4)),
+                        ),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.volume_up_rounded,
+                              size: 13,
+                              color: _countdown <= 2 ? _red : _green),
+                          const SizedBox(width: 5),
+                          Text('Starting in $_countdown...',
+                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600,
+                                  color: _countdown <= 2 ? _red : _green)),
+                        ]),
+                      )
+                    else if (_autoDetect && _isDetecting)
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                         decoration: BoxDecoration(
-                          color: _green.withOpacity(0.08),
+                          color: _green.withOpacity(0.06),
                           borderRadius: BorderRadius.circular(8),
                         ),
                         child: Text('Show both hands to auto-start',
@@ -441,61 +493,60 @@ class _CameraScreenState extends State<CameraScreen> {
                 ),
               ),
 
-              // ── Bottom: Start New Recording button ──────────────────
+              // Bottom: main action button
               Padding(
                 padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
-                child: Column(children: [
-
-                  // Main action button — full width
-                  SizedBox(
-                    width: double.infinity,
-                    child: _isDetecting
-                        ? ElevatedButton.icon(
-                            onPressed: _manualStart,
-                            icon: const Icon(Icons.play_arrow_rounded,
-                                color: Colors.white, size: 22),
-                            label: const Text('Start New Recording',
-                                style: TextStyle(color: Colors.white,
-                                    fontSize: 13, fontWeight: FontWeight.w700)),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: _green,
-                              padding: const EdgeInsets.symmetric(vertical: 14),
-                              shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(14)),
-                              elevation: 0,
-                            ),
-                          )
-                        : _isRecording
-                            ? ElevatedButton.icon(
-                                onPressed: _stopRecording,
-                                icon: const Icon(Icons.stop_rounded,
-                                    color: Colors.white, size: 22),
-                                label: const Text('Stop Recording',
-                                    style: TextStyle(color: Colors.white,
-                                        fontSize: 13, fontWeight: FontWeight.w700)),
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: _red,
-                                  padding: const EdgeInsets.symmetric(vertical: 14),
-                                  shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(14)),
-                                  elevation: 0,
-                                ),
-                              )
-                            : ElevatedButton(
-                                onPressed: null,
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: Colors.grey.shade300,
-                                  padding: const EdgeInsets.symmetric(vertical: 14),
-                                  shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(14)),
-                                  elevation: 0,
-                                ),
-                                child: Text(_isCounting ? 'Starting in $_countdown...' : 'Please wait...',
-                                    style: TextStyle(color: Colors.grey.shade600,
-                                        fontSize: 13, fontWeight: FontWeight.w700)),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: _isDetecting
+                      ? ElevatedButton.icon(
+                          onPressed: _manualStart,
+                          icon: const Icon(Icons.play_arrow_rounded,
+                              color: Colors.white, size: 20),
+                          label: const Text('Start New Recording',
+                              style: TextStyle(color: Colors.white,
+                                  fontSize: 13, fontWeight: FontWeight.w700)),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _green,
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14)),
+                            elevation: 0,
+                          ),
+                        )
+                      : _isRecording
+                          ? ElevatedButton.icon(
+                              onPressed: _stopRecording,
+                              icon: const Icon(Icons.stop_rounded,
+                                  color: Colors.white, size: 20),
+                              label: const Text('Stop Recording',
+                                  style: TextStyle(color: Colors.white,
+                                      fontSize: 13, fontWeight: FontWeight.w700)),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: _red,
+                                padding: const EdgeInsets.symmetric(vertical: 14),
+                                shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14)),
+                                elevation: 0,
                               ),
-                  ),
-                ]),
+                            )
+                          : ElevatedButton(
+                              onPressed: null,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.grey.shade300,
+                                padding: const EdgeInsets.symmetric(vertical: 14),
+                                shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14)),
+                                elevation: 0,
+                              ),
+                              child: Text(
+                                _isCounting
+                                    ? '♪  Starting in $_countdown...'
+                                    : 'Please wait...',
+                                style: TextStyle(color: Colors.grey.shade600,
+                                    fontSize: 13, fontWeight: FontWeight.w700)),
+                            ),
+                ),
               ),
             ]),
           ),
@@ -505,7 +556,7 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 }
 
-// ── Mini button widget ────────────────────────────────────────────────────────
+// ── Mini control button ───────────────────────────────────────────────────────
 
 class _MiniBtn extends StatelessWidget {
   final IconData icon;
@@ -528,8 +579,7 @@ class _MiniBtn extends StatelessWidget {
         decoration: BoxDecoration(
           color: active ? activeColor.withOpacity(0.1) : Colors.grey.shade100,
           borderRadius: BorderRadius.circular(10),
-          border: Border.all(
-              color: active ? activeColor : Colors.grey.shade300),
+          border: Border.all(color: active ? activeColor : Colors.grey.shade300),
         ),
         child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
           Icon(icon, size: 18,
