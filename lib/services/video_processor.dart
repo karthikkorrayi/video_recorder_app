@@ -8,7 +8,7 @@ import 'attendance_service.dart';
 import 'processing_manager.dart';
 
 class VideoProcessor {
-  static const int blockSecs = 300;
+  static const int blockSecs = 20 * 60; // 1200 seconds
 
   final _storage    = LocalVideoStorage();
   final _attendance = AttendanceService();
@@ -48,7 +48,7 @@ class VideoProcessor {
 
       final durationSec = await _probeDurationSec(rawVideoPath);
       final totalBlocks = (durationSec / blockSecs).ceil().clamp(1, 999);
-      print('=== Processor: ${durationSec}s → $totalBlocks block(s) @ ${blockSecs}s each');
+      print('=== Processor: ${durationSec}s → $totalBlocks block(s)');
 
       final dir        = await _storage.sessionDir(sessionTime, userEmail);
       final savedPaths = <String>[];
@@ -84,8 +84,6 @@ class VideoProcessor {
             '-movflags +faststart '
             '"$outputPath"';
 
-        print('=== Block $blockNum: ss=$startSec t=$blockDur');
-
         final session = await FFmpegKit.execute(cmd);
         final rc      = await session.getReturnCode();
 
@@ -105,13 +103,10 @@ class VideoProcessor {
 
       // Write sidecar with duration + recording times for history screen
       if (savedPaths.isNotEmpty) {
-        final sidecar = savedPaths.first.replaceAll(RegExp(r'\.mp4$'), '.dur');
-        await File(sidecar).writeAsString('$durationSec');
-
-        // Write metadata sidecar: start|end timestamps
-        final meta = savedPaths.first.replaceAll(RegExp(r'\.mp4$'), '.meta');
-        await File(meta).writeAsString(
-            '${sessionTime.toIso8601String()}|${recordingEnd.toIso8601String()}');
+        await File(savedPaths.first.replaceAll(RegExp(r'\.mp4$'), '.dur'))
+            .writeAsString('$durationSec');
+        await File(savedPaths.first.replaceAll(RegExp(r'\.mp4$'), '.meta'))
+            .writeAsString('${sessionTime.toIso8601String()}|${recordingEnd.toIso8601String()}');
       }
 
       try { await File(rawVideoPath).delete(); } catch (_) {}
@@ -122,7 +117,6 @@ class VideoProcessor {
         message: 'Saved ${savedPaths.length} block${savedPaths.length == 1 ? '' : 's'}',
         progress: 1.0, currentBlock: savedPaths.length, totalBlocks: totalBlocks,
       ));
-      print('=== Processor ✓ complete');
 
     } catch (e) {
       print('=== Processor ERROR: $e');
@@ -139,9 +133,9 @@ class VideoProcessor {
       final info = s.getMediaInformation();
       if (info != null) {
         final d = double.tryParse(info.getDuration() ?? '');
-        if (d != null && d > 0) { print('=== Probe: ${d}s'); return d; }
+        if (d != null && d > 0) return d;
       }
-    } catch (e) { print('=== Probe error: $e'); }
+    } catch (e) { print('=== Probe: $e'); }
     return 60.0;
   }
 

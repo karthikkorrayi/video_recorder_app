@@ -8,108 +8,101 @@ class BeepService {
   BeepService._();
 
   final _player = AudioPlayer();
+  final _player2 = AudioPlayer(); // second player for overlapping alerts
   bool _ready = false;
 
   Future<void> init() async {
     if (_ready) return;
     await _player.setReleaseMode(ReleaseMode.release);
+    await _player2.setReleaseMode(ReleaseMode.release);
     _ready = true;
   }
 
-  /// Short tick beep — play on each countdown second
-  Future<void> tick() => _play(
-    frequency: 880,       // A5 — clear, sharp tick
-    durationMs: 120,      // short
-    amplitude: 0.6,
-  );
+  /// Short tick — each countdown second (5, 4, 3, 2, 1)
+  Future<void> tick() => _play(_player,
+    frequency: 880, durationMs: 120, amplitude: 0.6);
 
-  Future<void> go() => _play(
-    frequency: 1320,      // E6 — bright, distinct from tick
-    durationMs: 280,      // longer for emphasis
-    amplitude: 0.85,
-  );
+  /// GO beep — when recording starts
+  Future<void> go() => _play(_player,
+    frequency: 1320, durationMs: 280, amplitude: 0.85);
 
-  Future<void> _play({
+  /// Warning alert — plays at 19:50 (block about to end)
+  /// Three rapid ascending beeps to grab attention
+  Future<void> blockWarning() async {
+    await init();
+    // beep-beep-beep ascending
+    await _play(_player,  frequency: 660,  durationMs: 180, amplitude: 0.9);
+    await Future.delayed(const Duration(milliseconds: 80));
+    await _play(_player2, frequency: 880,  durationMs: 180, amplitude: 0.9);
+    await Future.delayed(const Duration(milliseconds: 80));
+    await _play(_player,  frequency: 1100, durationMs: 280, amplitude: 0.9);
+  }
+
+  /// Block save + new start tone — plays at 20:00 when auto-splitting
+  /// Two-tone chime: save → start fresh
+  Future<void> blockTransition() async {
+    await init();
+    // Low-high chime: "saving... new block starting"
+    await _play(_player,  frequency: 440,  durationMs: 250, amplitude: 0.9);
+    await Future.delayed(const Duration(milliseconds: 100));
+    await _play(_player2, frequency: 880,  durationMs: 350, amplitude: 0.95);
+  }
+
+  Future<void> _play(AudioPlayer p, {
     required double frequency,
     required int durationMs,
     required double amplitude,
   }) async {
     try {
       await init();
-      final bytes = _generateWav(
-        frequency: frequency,
-        durationMs: durationMs,
-        amplitude: amplitude,
-      );
-      await _player.play(BytesSource(bytes));
+      final bytes = _wav(frequency: frequency, durationMs: durationMs, amplitude: amplitude);
+      await p.play(BytesSource(bytes));
     } catch (e) {
-      print('=== BeepService: play error: $e');
+      print('=== BeepService: $e');
     }
   }
 
-  /// Generates a WAV file as bytes.
-  /// Uses a sine wave with a short fade-out to avoid clicks.
-  Uint8List _generateWav({
+  Uint8List _wav({
     required double frequency,
     required int durationMs,
     required double amplitude,
   }) {
-    const sampleRate   = 44100;
-    const numChannels  = 1;      // mono
+    const sampleRate    = 44100;
+    const numChannels   = 1;
     const bitsPerSample = 16;
-
     final numSamples = (sampleRate * durationMs / 1000).round();
-    final dataSize   = numSamples * numChannels * (bitsPerSample ~/ 8);
+    final dataSize   = numSamples * 2;
+    final buf        = ByteData(44 + dataSize);
 
-    // WAV header (44 bytes) + audio data
-    final buffer = ByteData(44 + dataSize);
+    _str(buf, 0,  'RIFF');
+    buf.setUint32(4,  36 + dataSize, Endian.little);
+    _str(buf, 8,  'WAVE');
+    _str(buf, 12, 'fmt ');
+    buf.setUint32(16, 16,          Endian.little);
+    buf.setUint16(20, 1,           Endian.little);
+    buf.setUint16(22, numChannels, Endian.little);
+    buf.setUint32(24, sampleRate,  Endian.little);
+    buf.setUint32(28, sampleRate * 2, Endian.little);
+    buf.setUint16(32, 2,           Endian.little);
+    buf.setUint16(34, bitsPerSample, Endian.little);
+    _str(buf, 36, 'data');
+    buf.setUint32(40, dataSize,    Endian.little);
 
-    // RIFF chunk
-    _writeStr(buffer, 0,  'RIFF');
-    buffer.setUint32(4,   36 + dataSize, Endian.little);
-    _writeStr(buffer, 8,  'WAVE');
-
-    // fmt sub-chunk
-    _writeStr(buffer, 12, 'fmt ');
-    buffer.setUint32(16, 16,           Endian.little); // chunk size
-    buffer.setUint16(20,  1,           Endian.little); // PCM = 1
-    buffer.setUint16(22, numChannels,  Endian.little);
-    buffer.setUint32(24, sampleRate,   Endian.little);
-    buffer.setUint32(28, sampleRate * numChannels * bitsPerSample ~/ 8,
-                                       Endian.little); // byte rate
-    buffer.setUint16(32, numChannels * bitsPerSample ~/ 8,
-                                       Endian.little); // block align
-    buffer.setUint16(34, bitsPerSample, Endian.little);
-
-    // data sub-chunk
-    _writeStr(buffer, 36, 'data');
-    buffer.setUint32(40, dataSize, Endian.little);
-
-    // Generate sine wave samples with fade-out
-    final fadeOutSamples = (sampleRate * 0.04).round(); // 40ms fade-out
+    final fadeOut = (sampleRate * 0.04).round();
     for (int i = 0; i < numSamples; i++) {
-      final t = i / sampleRate;
-      double sample = math.sin(2 * math.pi * frequency * t) * amplitude;
-
-      // Apply fade-out in the last 40ms to avoid audio click
-      if (i >= numSamples - fadeOutSamples) {
-        final fade = (numSamples - i) / fadeOutSamples;
-        sample *= fade;
-      }
-
-      // Convert to 16-bit signed integer
-      final int16 = (sample * 32767).round().clamp(-32768, 32767);
-      buffer.setInt16(44 + i * 2, int16, Endian.little);
+      double s = math.sin(2 * math.pi * frequency * i / sampleRate) * amplitude;
+      if (i >= numSamples - fadeOut) s *= (numSamples - i) / fadeOut;
+      buf.setInt16(44 + i * 2, (s * 32767).round().clamp(-32768, 32767), Endian.little);
     }
-
-    return buffer.buffer.asUint8List();
+    return buf.buffer.asUint8List();
   }
 
-  void _writeStr(ByteData buf, int offset, String s) {
-    for (int i = 0; i < s.length; i++) {
-      buf.setUint8(offset + i, s.codeUnitAt(i));
-    }
+  void _str(ByteData b, int o, String s) {
+    for (int i = 0; i < s.length; i++) b.setUint8(o + i, s.codeUnitAt(i));
   }
 
-  void dispose() => _player.dispose();
+  void dispose() {
+    _player.dispose();
+    _player2.dispose();
+  }
 }

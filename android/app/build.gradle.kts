@@ -51,7 +51,7 @@ android {
         abi {
             isEnable = true
             reset()
-            include("arm64-v8a", "armeabi-v7a")
+            include("arm64-v8a", "armeabi-v7a", "x86_64")
             isUniversalApk = false
         }
     }
@@ -100,9 +100,7 @@ android {
     }
 }
 
-flutter {
-    source = "../.."
-}
+flutter { source = "../.." }
 
 dependencies {
     implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.25")
