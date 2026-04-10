@@ -38,11 +38,6 @@ class _CameraScreenState extends State<CameraScreen> {
   // Rotation needed for ML Kit (not for preview — CameraPreview handles its own display)
   InputImageRotation _mlRotation = InputImageRotation.rotation90deg;
 
-  // Quarter-turns needed to rotate the raw CameraPreview widget to match landscape
-  // Android camera sensors are portrait-oriented (90° rotated physically).
-  // CameraPreview on Android does NOT auto-rotate in landscape — we must do it.
-  int _previewQuarterTurns = 0;
-
   static const _green   = Color(0xFF00C853);
   static const _red     = Color(0xFFE53935);
   static const _white   = Color(0xFFFFFFFF);
@@ -81,60 +76,52 @@ class _CameraScreenState extends State<CameraScreen> {
     if (!mounted) return;
     final cam = cams[0];
 
-    // ── Camera preview rotation fix ────────────────────────────────────────
+    // ── Camera orientation — the correct approach ──────────────────────────
     //
-    // On Android, the camera sensor is physically mounted portrait (90°).
-    // CameraPreview renders raw sensor output without correcting for device rotation.
-    // When the device is in landscape, the preview appears rotated 90° sideways.
+    // WRONG: RotatedBox(quarterTurns: N, child: CameraPreview(...))
+    //   CameraPreview internally applies a Transform for device orientation.
+    //   Adding RotatedBox on top creates double-rotation → unpredictable results.
     //
-    // Fix: wrap CameraPreview in RotatedBox with quarterTurns calculated from
-    // the camera's sensorOrientation value.
+    // CORRECT: lockCaptureOrientation(landscapeLeft)
+    //   This tells the camera plugin to always produce landscape-oriented frames,
+    //   regardless of how the user holds the device.
+    //   CameraPreview then renders the frame correctly with no extra rotation needed.
     //
-    // sensorOrientation = 90  (typical back camera, most Android devices)
-    // Device in landscapeLeft → we need to rotate preview by -1 quarterTurns (CCW)
-    //
-    // Formula: quarterTurns = sensorOrientation / 90
-    // But we negate for back camera in landscape:
-    //   sensor=90  → quarterTurns = -1  (3 turns CW = 1 turn CCW)
-    //   sensor=270 → quarterTurns = 1
-    //   sensor=0   → quarterTurns = 0
-    //   sensor=180 → quarterTurns = 2
-    //
-    // This correctly orients the preview for landscape recording.
-
-    final sensor = cam.sensorOrientation; // degrees: 0, 90, 180, 270
-    switch (sensor) {
-      case 90:
-        _previewQuarterTurns = 3; // -1 CCW = 3 CW quarter-turns
-        _mlRotation = InputImageRotation.rotation90deg;
-        break;
-      case 180:
-        _previewQuarterTurns = 2;
-        _mlRotation = InputImageRotation.rotation180deg;
-        break;
-      case 270:
-        _previewQuarterTurns = 1;
-        _mlRotation = InputImageRotation.rotation270deg;
-        break;
-      default: // 0
-        _previewQuarterTurns = 0;
-        _mlRotation = InputImageRotation.rotation0deg;
-    }
+    // ML Kit rotation:
+    //   When capture is locked to landscapeLeft and sensor is at 90° (typical back cam):
+    //   The frame data is already rotated by the plugin, so ML Kit gets rotation0deg.
+    //   For a sensor at 270°: still rotation0deg after lock.
+    //   This is because lockCaptureOrientation compensates the sensor offset internally.
 
     _ctrl = CameraController(
       cam,
-      ResolutionPreset.veryHigh,  // 1080p on most devices
+      ResolutionPreset.veryHigh, // 1080p
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.nv21,
     );
     await _ctrl!.initialize();
+
+    // Lock orientation BEFORE starting any stream or recording
+    // This is the key fix — no RotatedBox needed
+    try {
+      await _ctrl!.lockCaptureOrientation(DeviceOrientation.landscapeLeft);
+    } catch (e) {
+      print('=== lockCaptureOrientation failed: $e');
+      // Some devices don't support this — fall back gracefully
+    }
+
+    // After locking to landscape, ML Kit should use rotation0deg because
+    // the plugin already compensates the sensor orientation in the locked frame
+    _mlRotation = InputImageRotation.rotation0deg;
+
     try { await _ctrl!.setZoomLevel(await _ctrl!.getMinZoomLevel()); } catch (_) {}
     try { await _ctrl!.setExposureMode(ExposureMode.auto); } catch (_) {}
+
     if (!mounted) return;
     setState(() => _state = _S.detecting);
   }
 
-  // ── ML Kit stream ─────────────────────────────────────────────────────────
+  // ── ML Kit hand detection ─────────────────────────────────────────────────
 
   void _startStream() {
     if (_state != _S.detecting || _ctrl == null) return;
@@ -143,9 +130,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Future<void> _stopStream() async {
     try {
-      if (_ctrl?.value.isStreamingImages == true) {
-        await _ctrl!.stopImageStream();
-      }
+      if (_ctrl?.value.isStreamingImages == true) await _ctrl!.stopImageStream();
     } catch (_) {}
   }
 
@@ -170,9 +155,7 @@ class _CameraScreenState extends State<CameraScreen> {
       if (poses.isNotEmpty) {
         final lw = poses.first.landmarks[PoseLandmarkType.leftWrist];
         final rw = poses.first.landmarks[PoseLandmarkType.rightWrist];
-        if (lw != null && rw != null) {
-          both = lw.likelihood > 0.55 && rw.likelihood > 0.55;
-        }
+        if (lw != null && rw != null) both = lw.likelihood > 0.55 && rw.likelihood > 0.55;
       }
       if (both) {
         await _stopStream();
@@ -196,7 +179,7 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // ── 5-second countdown with beep on every tick ────────────────────────────
+  // ── 5-second countdown with beeps ─────────────────────────────────────────
 
   Future<void> _doCountdown() async {
     if (!mounted) return;
@@ -207,7 +190,6 @@ class _CameraScreenState extends State<CameraScreen> {
 
       // Play tick beep — do NOT await so it doesn't delay the countdown
       _beep.tick();
-
       await Future.delayed(const Duration(seconds: 1));
     }
 
@@ -250,6 +232,7 @@ class _CameraScreenState extends State<CameraScreen> {
         if (secs >= _blockSecs) { _ticker?.cancel(); await _autoSplitBlock(); }
       });
     } catch (e) {
+      print('=== startRecording: $e');
       if (mounted) setState(() { _state = _S.detecting; _elapsed = Duration.zero; });
     }
   }
@@ -324,8 +307,7 @@ class _CameraScreenState extends State<CameraScreen> {
   @override
   Widget build(BuildContext context) {
     if (_state == _S.init || _ctrl == null) {
-      return const Scaffold(
-        backgroundColor: Color(0xFF0D0D0D),
+      return const Scaffold(backgroundColor: Color(0xFF0D0D0D),
           body: Center(child: CircularProgressIndicator(color: _green)));
     }
 
@@ -333,276 +315,274 @@ class _CameraScreenState extends State<CameraScreen> {
       backgroundColor: Colors.black,
       body: Row(children: [
 
-        // ── LEFT: Camera preview (58%) ─────────────────────────────────────
-        Expanded(
-          flex: 58,
-          child: Stack(children: [
+        // ── LEFT: Camera preview (no RotatedBox — lockCaptureOrientation handles it) ──
+        Expanded(flex: 58, child: Stack(children: [
+          Positioned.fill(child: CameraPreview(_ctrl!)),
 
-            // ── THE FIX: RotatedBox corrects 90° sensor offset ─────────────
-            // CameraPreview on Android outputs raw sensor frames which are
-            // portrait-oriented. In landscape mode the device rotates 90° but
-            // the preview stays portrait unless we explicitly rotate it.
-            // RotatedBox(quarterTurns: 3) = 270° CW = 90° CCW which corrects
-            // the typical back camera sensor offset of 90°.
-            Positioned.fill(
-              child: RotatedBox(
-                quarterTurns: _previewQuarterTurns,
-                child: CameraPreview(_ctrl!),
-              ),
-            ),
-
-            // Info badge
-            Positioned(top: 14, left: 14,
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                _badge('Standard · 1.0x · 1080p · 30fps', Colors.black.withOpacity(0.6)),
-                const SizedBox(height: 6),
-                if (_isRecording || _isSplitting)
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                    decoration: BoxDecoration(color: _red.withOpacity(0.9),
-                        borderRadius: BorderRadius.circular(20)),
-                    child: Row(mainAxisSize: MainAxisSize.min, children: [
-                      const Icon(Icons.fiber_manual_record, color: Colors.white, size: 9),
-                      const SizedBox(width: 4),
-                      Text(_fmt(_elapsed), style: const TextStyle(color: Colors.white,
-                          fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 1)),
-                    ]),
-                  ),
-              ])),
-
-            // Countdown
-            if (_isCounting && _countdown > 0)
-              Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          // Info badge top-left
+          Positioned(top: 14, left: 14,
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _pill('Standard · 1.0x · 1080p · 30fps',
+                  Colors.black.withOpacity(0.6), Colors.white),
+              const SizedBox(height: 6),
+              if (_isRecording || _isSplitting)
                 Container(
-                  width: 110, height: 110,
-                  decoration: BoxDecoration(shape: BoxShape.circle,
-                    color: Colors.black.withOpacity(0.65),
-                    border: Border.all(
-                        color: _countdown <= 2 ? _red : _green, width: 3)),
-                  child: Center(child: Text('$_countdown',
-                      style: TextStyle(
-                          color: _countdown <= 2 ? _red : Colors.white,
-                          fontSize: 58, fontWeight: FontWeight.bold))),
-                ),
-                const SizedBox(height: 10),
-                _badge('Recording starts soon...', Colors.black.withOpacity(0.6)),
-              ])),
-
-            // Splitting
-            if (_isSplitting)
-              Container(color: Colors.black.withOpacity(0.45),
-                child: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  const CircularProgressIndicator(color: _green, strokeWidth: 2.5),
-                  const SizedBox(height: 12),
-                  _badge('Saving block & starting next...', Colors.black.withOpacity(0.6)),
-                ]))),
-
-            // Warning banner bottom
-            if (_isWarning && !_isSplitting)
-              Positioned(bottom: 16, left: 16, right: 16,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                  decoration: BoxDecoration(color: _red.withOpacity(0.9),
-                      borderRadius: BorderRadius.circular(12)),
-                  child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 16),
-                    const SizedBox(width: 8),
-                    Text('Block ends in $_remainingLabel — get ready!',
-                        style: const TextStyle(color: Colors.white, fontSize: 12,
-                            fontWeight: FontWeight.w600)),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                  decoration: BoxDecoration(
+                      color: _red.withOpacity(0.9),
+                      borderRadius: BorderRadius.circular(20)),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    const Icon(Icons.fiber_manual_record, color: Colors.white, size: 9),
+                    const SizedBox(width: 4),
+                    Text(_fmt(_elapsed), style: const TextStyle(color: Colors.white,
+                        fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 1)),
                   ]),
-                )),
-          ]),
-        ),
+                ),
+            ])),
 
-        // ── RIGHT: Control panel (42%) ─────────────────────────────────────
-        Expanded(
-          flex: 42,
-          child: Container(
-            color: _surface,
-            // Use SafeArea only on top/bottom for landscape notches
-            child: SafeArea(
-              left: false, right: false,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
+          // Countdown overlay
+          if (_isCounting && _countdown > 0)
+            Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Container(
+                width: 110, height: 110,
+                decoration: BoxDecoration(shape: BoxShape.circle,
+                  color: Colors.black.withOpacity(0.65),
+                  border: Border.all(
+                      color: _countdown <= 2 ? _red : _green, width: 3)),
+                child: Center(child: Text('$_countdown',
+                    style: TextStyle(
+                        color: _countdown <= 2 ? _red : Colors.white,
+                        fontSize: 58, fontWeight: FontWeight.bold))),
+              ),
+              const SizedBox(height: 10),
+              _pill('Recording starts soon...',
+                  Colors.black.withOpacity(0.6), Colors.white70),
+            ])),
 
-                  // ── Header ───────────────────────────────────────────────
-                  Container(
-                    color: _white,
-                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Row(children: [
-                        const Text('RECORDING', style: TextStyle(fontSize: 10,
-                            fontWeight: FontWeight.w800, color: _sub, letterSpacing: 1.5)),
-                        const Spacer(),
-                        if (_blockNumber > 0 || _isRecording)
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                            decoration: BoxDecoration(
-                                color: _green.withOpacity(0.1),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(color: _green.withOpacity(0.4))),
-                            child: Text('Block ${_blockNumber + 1}',
-                                style: const TextStyle(color: _green, fontSize: 10,
-                                    fontWeight: FontWeight.w700)),
-                          ),
-                      ]),
-                      const SizedBox(height: 6),
-                      Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                        Text(
-                          _isRecording || _isSplitting ? _fmt(_elapsed) : '--:--',
-                          style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold,
-                              color: _isWarning ? _red : _text, letterSpacing: 1),
-                        ),
-                        const SizedBox(width: 8),
-                        if (_isRecording)
-                          Padding(padding: const EdgeInsets.only(bottom: 5),
-                            child: Row(children: [
-                              Container(width: 7, height: 7,
-                                  decoration: const BoxDecoration(
-                                      color: _red, shape: BoxShape.circle)),
-                              const SizedBox(width: 5),
-                              const Text('REC', style: TextStyle(color: _red,
-                                  fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 1)),
-                            ])),
-                      ]),
-                      if (_isRecording || _isSplitting) ...[
-                        const SizedBox(height: 8),
-                        ClipRRect(borderRadius: BorderRadius.circular(4),
-                          child: LinearProgressIndicator(
-                            value: _blockProgress, minHeight: 5,
-                            backgroundColor: _border,
-                            valueColor: AlwaysStoppedAnimation<Color>(
-                                _isWarning ? _red : _green))),
-                        const SizedBox(height: 4),
-                        Row(children: [
-                          Text('Block time',
-                              style: TextStyle(color: _sub, fontSize: 10)),
-                          const Spacer(),
-                          Text('$_remainingLabel left',
-                              style: TextStyle(
-                                color: _isWarning ? _red : _sub, fontSize: 10,
-                                fontWeight: _isWarning ? FontWeight.w700 : FontWeight.normal,
-                              )),
-                        ]),
-                      ],
-                      if (_isCounting) ...[
-                        const SizedBox(height: 8),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                          decoration: BoxDecoration(
-                            color: (_countdown <= 2 ? _red : _green).withOpacity(0.08),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(
-                                color: (_countdown <= 2 ? _red : _green).withOpacity(0.4)),
-                          ),
-                          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                            Icon(Icons.volume_up_rounded, size: 13,
-                                color: _countdown <= 2 ? _red : _green),
-                            const SizedBox(width: 5),
-                            Text('Starting in $_countdown...',
-                                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700,
-                                    color: _countdown <= 2 ? _red : _green)),
-                          ]),
-                        ),
-                      ],
-                    ]),
+          // Splitting overlay
+          if (_isSplitting)
+            Container(color: Colors.black.withOpacity(0.45),
+              child: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                const CircularProgressIndicator(color: _green, strokeWidth: 2.5),
+                const SizedBox(height: 12),
+                _pill('Saving block & starting next...',
+                    Colors.black.withOpacity(0.65), Colors.white),
+              ]))),
+
+          // Warning banner
+          if (_isWarning && !_isSplitting)
+            Positioned(bottom: 14, left: 14, right: 14,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(color: _red.withOpacity(0.9),
+                    borderRadius: BorderRadius.circular(12)),
+                child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                  const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 16),
+                  const SizedBox(width: 8),
+                  Text('Block ends in $_remainingLabel — get ready!',
+                      style: const TextStyle(color: Colors.white,
+                          fontSize: 12, fontWeight: FontWeight.w600)),
+                ]),
+              )),
+        ])),
+
+        // ── RIGHT: Control panel ───────────────────────────────────────────
+        Expanded(flex: 42, child: Container(
+          color: _surface,
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+
+            // ── HEADER: timer + block info ─────────────────────────────────
+            Container(
+              color: _white,
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                // Label row
+                Row(children: [
+                  const Text('RECORDING', style: TextStyle(fontSize: 10,
+                      fontWeight: FontWeight.w800, color: _sub, letterSpacing: 1.5)),
+                  const Spacer(),
+                  if (_blockNumber > 0 || _isRecording)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                      decoration: BoxDecoration(
+                          color: _green.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(color: _green.withOpacity(0.4))),
+                      child: Text('Block ${_blockNumber + 1}',
+                          style: const TextStyle(color: _green, fontSize: 11,
+                              fontWeight: FontWeight.w700)),
+                    ),
+                ]),
+                const SizedBox(height: 8),
+
+                // Large elapsed time + REC badge
+                Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+                  Text(
+                    _isRecording || _isSplitting ? _fmt(_elapsed) : '--:--',
+                    style: TextStyle(
+                      fontSize: 38, fontWeight: FontWeight.bold,
+                      color: _isWarning ? _red : _text,
+                      letterSpacing: 1.5,
+                    ),
                   ),
+                  const SizedBox(width: 10),
+                  if (_isRecording)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                          color: _red.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: _red.withOpacity(0.4))),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        Container(width: 7, height: 7,
+                            decoration: const BoxDecoration(
+                                color: _red, shape: BoxShape.circle)),
+                        const SizedBox(width: 5),
+                        const Text('REC', style: TextStyle(color: _red,
+                            fontSize: 11, fontWeight: FontWeight.w800, letterSpacing: 1)),
+                      ]),
+                    ),
+                ]),
 
-                  const Divider(height: 1, color: _border),
+                // Block progress bar
+                if (_isRecording || _isSplitting) ...[
+                  const SizedBox(height: 10),
+                  ClipRRect(borderRadius: BorderRadius.circular(4),
+                    child: LinearProgressIndicator(
+                      value: _blockProgress, minHeight: 6,
+                      backgroundColor: _border,
+                      valueColor: AlwaysStoppedAnimation<Color>(
+                          _isWarning ? _red : _green))),
+                  const SizedBox(height: 5),
+                  Row(children: [
+                    Text('Block time', style: TextStyle(color: _sub, fontSize: 10)),
+                    const Spacer(),
+                    Text('$_remainingLabel left', style: TextStyle(
+                      color: _isWarning ? _red : _sub, fontSize: 10,
+                      fontWeight: _isWarning ? FontWeight.w700 : FontWeight.normal)),
+                  ]),
+                ],
 
-                  // ── Controls ─────────────────────────────────────────────
-                  Expanded(child: Padding(
-                    padding: const EdgeInsets.all(12),
-                    child: Column(children: [
-
-                      // Home + Flash
-                      Expanded(child: Row(children: [
-                        Expanded(child: _PanelBtn(
-                          icon: Icons.home_rounded, label: 'Home',
-                          onTap: () {
-                            SystemChrome.setPreferredOrientations(
-                                [DeviceOrientation.portraitUp]);
-                            SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-                            Navigator.pop(context);
-                          },
-                        )),
-                        const SizedBox(width: 10),
-                        Expanded(child: _PanelBtn(
-                          icon: _torchOn ? Icons.flashlight_on : Icons.flashlight_off,
-                          label: _torchOn ? 'Flash ON' : 'Flash',
-                          active: _torchOn,
-                          activeColor: const Color(0xFFFFB300),
-                          onTap: _toggleTorch,
-                        )),
-                      ])),
-                      const SizedBox(height: 10),
-
-                      // Hand detect
-                      Expanded(child: _PanelBtn(
-                        icon: _autoDetect
-                            ? Icons.back_hand_rounded
-                            : Icons.back_hand_outlined,
-                        label: _autoDetect ? 'Hand Detect: ON' : 'Hand Detect: OFF',
-                        active: _autoDetect,
-                        activeColor: _green,
-                        fullWidth: true,
-                        onTap: (!_isRecording && !_isCounting) ? _toggleAutoDetect : null,
-                      )),
-                      const SizedBox(height: 10),
-
-                      // Info card
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                        decoration: BoxDecoration(color: _white,
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(color: _border)),
-                        child: Row(children: [
-                          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                            const Text('1080p · 30fps', style: TextStyle(fontSize: 11,
-                                fontWeight: FontWeight.w700, color: _text)),
-                            Text('Standard 1.0x',
-                                style: TextStyle(fontSize: 10, color: _sub)),
-                          ]),
-                          const Spacer(),
-                          Container(width: 1, height: 26, color: _border),
-                          const SizedBox(width: 12),
-                          Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                            const Text('Auto-split', style: TextStyle(fontSize: 11,
-                                fontWeight: FontWeight.w700, color: _text)),
-                            Text('Every 20 min',
-                                style: TextStyle(fontSize: 10, color: _sub)),
-                          ]),
-                        ]),
-                      ),
+                // Countdown status
+                if (_isCounting) ...[
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: (_countdown <= 2 ? _red : _green).withOpacity(0.08),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                          color: (_countdown <= 2 ? _red : _green).withOpacity(0.4)),
+                    ),
+                    child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                      Icon(Icons.volume_up_rounded, size: 13,
+                          color: _countdown <= 2 ? _red : _green),
+                      const SizedBox(width: 6),
+                      Text('Starting in $_countdown...',
+                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700,
+                              color: _countdown <= 2 ? _red : _green)),
                     ]),
-                  )),
-
-                  // ── Action button ────────────────────────────────────────
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 14),
-                    child: _buildActionBtn(),
                   ),
                 ],
-              ),
+              ]),
             ),
-          ),
-        ),
+
+            const Divider(height: 1, color: _border),
+
+            // ── MIDDLE: control buttons ────────────────────────────────────
+            Expanded(child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(children: [
+
+                // ── Home + Flash: fixed height row ─────────────────────────
+                SizedBox(
+                  height: 56, // explicit height so icons are not small
+                  child: Row(children: [
+                    Expanded(child: _CtrlTile(
+                      icon: Icons.home_rounded,
+                      label: 'Home',
+                      onTap: () {
+                        SystemChrome.setPreferredOrientations(
+                            [DeviceOrientation.portraitUp]);
+                        SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+                        Navigator.pop(context);
+                      },
+                    )),
+                    const SizedBox(width: 10),
+                    Expanded(child: _CtrlTile(
+                      icon: _torchOn ? Icons.flashlight_on : Icons.flashlight_off,
+                      label: _torchOn ? 'Flash ON' : 'Flash',
+                      active: _torchOn,
+                      activeColor: const Color(0xFFFFB300),
+                      onTap: _toggleTorch,
+                    )),
+                  ]),
+                ),
+                const SizedBox(height: 10),
+
+                // ── Hand detect: fixed height ──────────────────────────────
+                SizedBox(
+                  height: 56,
+                  child: _CtrlTile(
+                    icon: _autoDetect
+                        ? Icons.back_hand_rounded
+                        : Icons.back_hand_outlined,
+                    label: _autoDetect ? 'Hand Detect: ON' : 'Hand Detect: OFF',
+                    active: _autoDetect,
+                    activeColor: _green,
+                    fullWidth: true,
+                    onTap: (!_isRecording && !_isCounting) ? _toggleAutoDetect : null,
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // ── Info card ──────────────────────────────────────────────
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                  decoration: BoxDecoration(color: _white,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: _border)),
+                  child: Row(children: [
+                    Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Text('1080p · 30fps', style: TextStyle(fontSize: 12,
+                          fontWeight: FontWeight.w700, color: _text)),
+                      const SizedBox(height: 2),
+                      const Text('Standard 1.0x',
+                          style: TextStyle(fontSize: 10, color: _sub)),
+                    ]),
+                    const Spacer(),
+                    Container(width: 1, height: 28, color: _border),
+                    const SizedBox(width: 14),
+                    Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                      const Text('Auto-split', style: TextStyle(fontSize: 12,
+                          fontWeight: FontWeight.w700, color: _text)),
+                      const SizedBox(height: 2),
+                      const Text('Every 20 min',
+                          style: TextStyle(fontSize: 10, color: _sub)),
+                    ]),
+                  ]),
+                ),
+              ]),
+            )),
+
+            // ── BOTTOM: action button ──────────────────────────────────────
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+              child: _buildActionBtn(),
+            ),
+          ]),
+        )),
       ]),
     );
   }
 
-  Widget _badge(String text, Color bg) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(8)),
-      child: Text(text, style: const TextStyle(color: Colors.white,
-          fontSize: 11, fontWeight: FontWeight.w500)),
-    );
-  }
+  Widget _pill(String text, Color bg, Color fg) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+    decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(8)),
+    child: Text(text, style: TextStyle(color: fg, fontSize: 11,
+        fontWeight: FontWeight.w500)),
+  );
 
   Widget _buildActionBtn() {
     if (_isDetecting) return _ActionBtn(icon: Icons.play_arrow_rounded,
@@ -618,59 +598,89 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 }
 
-// ── Panel button ──────────────────────────────────────────────────────────────
+// ── Control tile — fills its parent's height explicitly ─────────────────────
 
-class _PanelBtn extends StatelessWidget {
-  final IconData icon; final String label; final VoidCallback? onTap;
-  final bool active; final Color activeColor; final bool fullWidth;
-  const _PanelBtn({required this.icon, required this.label, this.onTap,
-      this.active = false, this.activeColor = Colors.black87, this.fullWidth = false});
+class _CtrlTile extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final VoidCallback? onTap;
+  final bool active;
+  final Color activeColor;
+  final bool fullWidth;
+
+  const _CtrlTile({
+    required this.icon, required this.label,
+    this.onTap, this.active = false,
+    this.activeColor = Colors.black87, this.fullWidth = false,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final fg = active ? activeColor : const Color(0xFF555555);
+    final fg = active ? activeColor : const Color(0xFF444444);
     final bg = active ? activeColor.withOpacity(0.08) : Colors.white;
-    final bd = active ? activeColor.withOpacity(0.4) : const Color(0xFFE8E8E8);
+    final bd = active ? activeColor.withOpacity(0.5) : const Color(0xFFE0E0E0);
+
     return GestureDetector(
       onTap: onTap,
-      child: Opacity(opacity: onTap == null ? 0.4 : 1.0,
+      child: Opacity(
+        opacity: onTap == null ? 0.35 : 1.0,
         child: Container(
           width: double.infinity,
-          decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: bd)),
-          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            Icon(icon, color: fg, size: 18),
-            const SizedBox(width: 7),
-            Text(label, style: TextStyle(color: fg, fontSize: 12,
-                fontWeight: FontWeight.w600)),
-          ]),
-        )),
+          // No explicit height — fills the SizedBox parent
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: bd, width: 1.2),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, color: fg, size: 20),   // larger icon
+              const SizedBox(width: 8),
+              Text(label, style: TextStyle(
+                color: fg, fontSize: 13,         // slightly larger text
+                fontWeight: FontWeight.w600,
+              )),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
 
-// ── Action button ─────────────────────────────────────────────────────────────
+// ── Primary action button ─────────────────────────────────────────────────────
 
 class _ActionBtn extends StatelessWidget {
-  final IconData icon; final String label; final Color color; final VoidCallback? onTap;
+  final IconData icon;
+  final String label;
+  final Color color;
+  final VoidCallback? onTap;
+
   const _ActionBtn({required this.icon, required this.label,
       required this.color, this.onTap});
+
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
-      child: Opacity(opacity: onTap == null ? 0.6 : 1.0,
+      child: Opacity(
+        opacity: onTap == null ? 0.55 : 1.0,
         child: Container(
           width: double.infinity,
-          padding: const EdgeInsets.symmetric(vertical: 15),
-          decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(14)),
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          decoration: BoxDecoration(
+            color: color,
+            borderRadius: BorderRadius.circular(14),
+          ),
           child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            Icon(icon, color: Colors.white, size: 20),
-            const SizedBox(width: 8),
-            Text(label, style: const TextStyle(color: Colors.white,
-                fontSize: 14, fontWeight: FontWeight.w700)),
+            Icon(icon, color: Colors.white, size: 22),
+            const SizedBox(width: 10),
+            Text(label, style: const TextStyle(
+                color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700)),
           ]),
-        )),
+        ),
+      ),
     );
   }
 }
