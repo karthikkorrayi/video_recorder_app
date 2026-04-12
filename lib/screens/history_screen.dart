@@ -1,16 +1,8 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import '../services/local_video_storage.dart';
-import 'video_playback_screen.dart';
-
-const _green   = Color(0xFF00C853);
-const _red     = Color(0xFFE53935);
-const _surface = Color(0xFFF5F5F5);
-const _card    = Color(0xFFFFFFFF);
-const _text    = Color(0xFF1A1A1A);
-const _sub     = Color(0xFF888888);
-const _border  = Color(0xFFE8E8E8);
+import 'package:intl/intl.dart';
+import '../services/session_store.dart';
+import '../models/session_model.dart';
+import 'upload_progress_screen.dart';
 
 class HistoryScreen extends StatefulWidget {
   const HistoryScreen({super.key});
@@ -19,8 +11,8 @@ class HistoryScreen extends StatefulWidget {
 }
 
 class _HistoryScreenState extends State<HistoryScreen> {
-  final _storage = LocalVideoStorage();
-  List<LocalSession> _sessions = [];
+  final _store = SessionStore();
+  List<SessionModel> _sessions = [];
   bool _loading = true;
 
   @override
@@ -30,327 +22,340 @@ class _HistoryScreenState extends State<HistoryScreen> {
   }
 
   Future<void> _load() async {
-    setState(() => _loading = true);
-    final user = FirebaseAuth.instance.currentUser!;
-    final s = await _storage.listSessionsForUser(user.email ?? user.uid);
-    if (mounted) setState(() { _sessions = s; _loading = false; });
+    final all = await _store.getAll();
+    if (mounted) setState(() { _sessions = all; _loading = false; });
   }
 
-  // Total across all sessions using actual .dur sidecars only
-  String get _grandTotal {
-    int t = 0;
-    for (final s in _sessions) { final d = s.durationSeconds; if (d > 0) t += d; }
-    if (t <= 0) return '0s';
-    if (t < 60) return '${t}s';
-    final m = t ~/ 60; final r = t % 60;
-    return r > 0 ? '${m}m ${r}s' : '${m}m';
-  }
-
-  // ── Delete ─────────────────────────────────────────────────────────────────
-
-  Future<void> _confirmDelete(LocalSession session) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: _card,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        icon: const Icon(Icons.delete_forever_rounded, color: _red, size: 36),
-        title: const Text('Delete Recording?',
-            style: TextStyle(color: _text, fontWeight: FontWeight.w700)),
-        content: Column(mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('This will permanently delete:', style: TextStyle(color: _sub, fontSize: 13)),
-          const SizedBox(height: 8),
-          _deleteItem(Icons.video_file_rounded,
-              '${session.blocks.length} video block${session.blocks.length == 1 ? '' : 's'}'),
-          _deleteItem(Icons.timer_outlined, session.durationStr),
-          _deleteItem(Icons.calendar_today_rounded, session.displayTitle),
-          const SizedBox(height: 8),
-          const Text('This action cannot be undone.',
-              style: TextStyle(color: _red, fontSize: 12, fontWeight: FontWeight.w600)),
-        ]),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel',
-                style: TextStyle(color: _sub, fontWeight: FontWeight.w600)),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: _red,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-              elevation: 0,
-            ),
-            child: const Text('Delete', style: TextStyle(color: Colors.white,
-                fontWeight: FontWeight.w700)),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed == true) await _deleteSession(session);
-  }
-
-  Widget _deleteItem(IconData icon, String text) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Row(children: [
-        Icon(icon, size: 14, color: _sub),
-        const SizedBox(width: 6),
-        Text(text, style: const TextStyle(color: _text, fontSize: 13)),
-      ]),
-    );
-  }
-
-  Future<void> _deleteSession(LocalSession session) async {
-    // Show loading
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Deleting...'), duration: Duration(seconds: 1)));
-
-    try {
-      for (final blockFile in session.blocks) {
-        // Delete .mp4
-        try { await blockFile.delete(); } catch (_) {}
-        // Delete .dur sidecar
-        try {
-          final dur = File(blockFile.path.replaceAll(RegExp(r'\.mp4$'), '.dur'));
-          if (await dur.exists()) await dur.delete();
-        } catch (_) {}
-        // Delete .meta sidecar
-        try {
-          final meta = File(blockFile.path.replaceAll(RegExp(r'\.mp4$'), '.meta'));
-          if (await meta.exists()) await meta.delete();
-        } catch (_) {}
-      }
-
-      // Try to remove the parent folder if it's now empty
-      try {
-        if (session.blocks.isNotEmpty) {
-          final parent = session.blocks.first.parent;
-          final remaining = parent.listSync();
-          if (remaining.isEmpty) await parent.delete();
-        }
-      } catch (_) {}
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Recording deleted'),
-            backgroundColor: _red,
-            duration: Duration(seconds: 2),
-          ));
-        _load(); // refresh list
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Delete failed: $e'), backgroundColor: _red));
-      }
+  // ── Status helpers ───────────────────────────────────────────────────────
+  Color _statusColor(String status) {
+    switch (status) {
+      case 'synced':    return const Color(0xFF00C853);
+      case 'uploading': return Colors.blueAccent;
+      case 'partial':   return Colors.orangeAccent;
+      default:          return Colors.redAccent;
     }
   }
 
-  // ── Preview ────────────────────────────────────────────────────────────────
-
-  void _preview(LocalSession session) {
-    Navigator.push(context,
-        MaterialPageRoute(builder: (_) => VideoPlaybackScreen(session: session)));
+  IconData _statusIcon(String status) {
+    switch (status) {
+      case 'synced':    return Icons.cloud_done;
+      case 'uploading': return Icons.cloud_upload;
+      case 'partial':   return Icons.cloud_sync;
+      default:          return Icons.cloud_off;
+    }
   }
 
-  // ── Build ──────────────────────────────────────────────────────────────────
+  String _statusLabel(SessionModel s) {
+    switch (s.status) {
+      case 'synced':    return 'Synced';
+      case 'uploading': return 'Uploading...';
+      case 'partial':   return '${s.uploadedBlocks.length}/${s.blockCount} blocks';
+      default:          return 'Pending';
+    }
+  }
+
+  // ── Summary counts ───────────────────────────────────────────────────────
+  Map<String, int> get _counts => {
+    'pending':  _sessions.where((s) => s.status == 'pending').length,
+    'partial':  _sessions.where((s) => s.status == 'partial').length,
+    'uploading':_sessions.where((s) => s.status == 'uploading').length,
+    'synced':   _sessions.where((s) => s.status == 'synced').length,
+  };
+
+  // ── Upload tap ───────────────────────────────────────────────────────────
+  Future<void> _onUpload(SessionModel session) async {
+    final result = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(builder: (_) => UploadProgressScreen(session: session)),
+    );
+    if (result == true) _load(); // Refresh list after successful upload
+  }
+
+  // ── Delete tap ───────────────────────────────────────────────────────────
+  Future<void> _onDelete(SessionModel session) async {
+    if (session.status == 'synced') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Cannot delete — already synced to OneDrive'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+      return;
+    }
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: const Text('Delete session?', style: TextStyle(color: Colors.white)),
+        content: const Text('This will delete the local recording. It has not been uploaded.',
+            style: TextStyle(color: Colors.white54)),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Delete', style: TextStyle(color: Colors.redAccent))),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      await _store.delete(session.id);
+      _load();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
+    final counts = _counts;
     return Scaffold(
-      backgroundColor: _surface,
+      backgroundColor: const Color(0xFF0A0A0A),
       appBar: AppBar(
-        backgroundColor: _card,
-        title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('My Recordings',
-              style: TextStyle(color: _text, fontWeight: FontWeight.w700, fontSize: 17)),
-          if (!_loading)
-            Text('${_sessions.length} session${_sessions.length == 1 ? '' : 's'}'
-                '  ·  $_grandTotal total',
-                style: const TextStyle(color: _sub, fontSize: 11)),
-        ]),
-        iconTheme: const IconThemeData(color: _text),
-        elevation: 0,
-        surfaceTintColor: Colors.transparent,
-        bottom: const PreferredSize(preferredSize: Size.fromHeight(1),
-            child: Divider(height: 1, color: _border)),
+        backgroundColor: const Color(0xFF0A0A0A),
+        title: const Text('Session History',
+            style: TextStyle(color: Colors.white)),
+        iconTheme: const IconThemeData(color: Colors.white),
         actions: [
-          IconButton(icon: const Icon(Icons.refresh_rounded, color: _sub),
-              onPressed: _load),
+          IconButton(
+            icon: const Icon(Icons.refresh, color: Colors.white54),
+            onPressed: _load,
+          ),
         ],
       ),
       body: _loading
-          ? const Center(child: CircularProgressIndicator(color: _green))
-          : _sessions.isEmpty ? _empty()
-          : RefreshIndicator(
-              onRefresh: _load, color: _green,
-              child: ListView.builder(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 28),
-                itemCount: _sessions.length,
-                itemBuilder: (_, i) => _buildCard(_sessions[i]),
-              ),
+          ? const Center(child: CircularProgressIndicator(color: Color(0xFF00C853)))
+          : Column(
+              children: [
+                // ── Summary pills ──────────────────────────────────
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(children: [
+                      _Pill('Pending',   counts['pending']!,  Colors.redAccent),
+                      const SizedBox(width: 8),
+                      _Pill('Partial',   counts['partial']!,  Colors.orangeAccent),
+                      const SizedBox(width: 8),
+                      _Pill('Uploading', counts['uploading']!, Colors.blueAccent),
+                      const SizedBox(width: 8),
+                      _Pill('Synced',    counts['synced']!,   const Color(0xFF00C853)),
+                    ]),
+                  ),
+                ),
+
+                // ── Session list ───────────────────────────────────
+                Expanded(
+                  child: _sessions.isEmpty
+                      ? const Center(
+                          child: Text('No sessions recorded yet',
+                              style: TextStyle(color: Colors.white38)))
+                      : ListView.builder(
+                          padding: const EdgeInsets.all(16),
+                          itemCount: _sessions.length,
+                          itemBuilder: (ctx, i) => _SessionCard(
+                            session: _sessions[i],
+                            statusColor: _statusColor(_sessions[i].status),
+                            statusIcon:  _statusIcon(_sessions[i].status),
+                            statusLabel: _statusLabel(_sessions[i]),
+                            onUpload: _onUpload,
+                            onDelete: _onDelete,
+                          ),
+                        ),
+                ),
+              ],
             ),
     );
   }
-
-  Widget _buildCard(LocalSession s) {
-    final timeStr = s.durationStr;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      decoration: BoxDecoration(
-        color: _card, borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: s.isComplete ? _border : Colors.orange.shade300),
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04),
-            blurRadius: 8, offset: const Offset(0, 2))],
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-
-          // ── Title row ─────────────────────────────────────────────────
-          Row(children: [
-            Container(width: 38, height: 38,
-              decoration: BoxDecoration(color: _green.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(9),
-                  border: Border.all(color: _green.withOpacity(0.3))),
-              child: const Icon(Icons.video_file_rounded, color: _green, size: 19)),
-            const SizedBox(width: 10),
-            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(s.displayTitle, style: const TextStyle(color: _text,
-                  fontWeight: FontWeight.w700, fontSize: 13)),
-              if (!s.isComplete)
-                const Text('Incomplete', style: TextStyle(color: Colors.orange, fontSize: 11)),
-            ])),
-          ]),
-
-          const SizedBox(height: 10),
-          const Divider(height: 1, color: _border),
-          const SizedBox(height: 10),
-
-          // ── Metrics row ───────────────────────────────────────────────
-          Row(children: [
-            _metric(Icons.timer_outlined, timeStr == '—' ? 'Processing' : timeStr,
-                'Total Time', _green),
-            _divider(),
-            _metric(Icons.video_collection_outlined,
-                '${s.blocks.length}/${s.totalBlocks}', 'Blocks', const Color(0xFF0091EA)),
-            _divider(),
-            _metric(Icons.play_circle_outline, s.startTimeStr, 'Start', const Color(0xFF7B1FA2)),
-            _divider(),
-            _metric(Icons.stop_circle_outlined, s.endTimeStr, 'End', const Color(0xFFE53935)),
-          ]),
-
-          const SizedBox(height: 12),
-          const Divider(height: 1, color: _border),
-          const SizedBox(height: 10),
-
-          // ── Action buttons: Preview | Delete | Upload (coming soon) ───
-          Row(children: [
-
-            // Preview
-            Expanded(child: _ActionChip(
-              icon: Icons.play_circle_rounded,
-              label: 'Preview',
-              color: _green,
-              onTap: () => _preview(s),
-            )),
-            const SizedBox(width: 8),
-
-            // Delete
-            Expanded(child: _ActionChip(
-              icon: Icons.delete_outline_rounded,
-              label: 'Delete',
-              color: _red,
-              onTap: () => _confirmDelete(s),
-            )),
-            const SizedBox(width: 8),
-
-            // Upload (coming soon)
-            Expanded(child: _ActionChip(
-              icon: Icons.cloud_upload_outlined,
-              label: 'Upload',
-              color: _sub,
-              onTap: null, // placeholder
-              disabled: true,
-              tooltip: 'Coming soon',
-            )),
-          ]),
-        ]),
-      ),
-    );
-  }
-
-  Widget _metric(IconData icon, String value, String label, Color color) {
-    return Expanded(child: Column(children: [
-      Icon(icon, color: color, size: 15),
-      const SizedBox(height: 3),
-      Text(value, style: TextStyle(color: color, fontSize: 11,
-          fontWeight: FontWeight.w700)),
-      const SizedBox(height: 1),
-      Text(label, style: const TextStyle(color: _sub, fontSize: 9)),
-    ]));
-  }
-
-  Widget _divider() => Container(width: 1, height: 32, color: _border);
-
-  Widget _empty() => Center(
-    child: Column(mainAxisSize: MainAxisSize.min, children: [
-      Icon(Icons.videocam_off_rounded, color: Colors.grey.shade300, size: 72),
-      const SizedBox(height: 16),
-      const Text('No recordings yet',
-          style: TextStyle(color: _sub, fontSize: 16, fontWeight: FontWeight.w600)),
-      const SizedBox(height: 6),
-      const Text('Start recording to see your sessions here',
-          style: TextStyle(color: _sub, fontSize: 13)),
-    ]),
-  );
 }
 
-// ── Action chip button ────────────────────────────────────────────────────────
+// ── Session card ─────────────────────────────────────────────────────────────
+class _SessionCard extends StatelessWidget {
+  final SessionModel session;
+  final Color    statusColor;
+  final IconData statusIcon;
+  final String   statusLabel;
+  final Future<void> Function(SessionModel) onUpload;
+  final Future<void> Function(SessionModel) onDelete;
 
-class _ActionChip extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final Color color;
-  final VoidCallback? onTap;
-  final bool disabled;
-  final String? tooltip;
-
-  const _ActionChip({
-    required this.icon, required this.label, required this.color,
-    this.onTap, this.disabled = false, this.tooltip,
+  const _SessionCard({
+    required this.session,
+    required this.statusColor,
+    required this.statusIcon,
+    required this.statusLabel,
+    required this.onUpload,
+    required this.onDelete,
   });
 
   @override
   Widget build(BuildContext context) {
-    final Widget btn = GestureDetector(
-      onTap: disabled ? null : onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 9),
-        decoration: BoxDecoration(
-          color: disabled ? const Color(0xFFF5F5F5) : color.withOpacity(0.08),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(
-              color: disabled ? const Color(0xFFE0E0E0) : color.withOpacity(0.35)),
+    final isSynced   = session.status == 'synced';
+    final canUpload  = session.status == 'pending' || session.status == 'partial';
+    final dateStr    = DateFormat('dd MMM yyyy, hh:mm a').format(session.createdAt);
+    final durMin     = (session.durationSeconds / 60).toStringAsFixed(1);
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: isSynced
+              ? const Color(0xFF00C853).withOpacity(0.25)
+              : Colors.white10,
         ),
-        child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          Icon(icon, size: 15,
-              color: disabled ? const Color(0xFFBBBBBB) : color),
-          const SizedBox(width: 5),
-          Text(label, style: TextStyle(
-              fontSize: 11, fontWeight: FontWeight.w600,
-              color: disabled ? const Color(0xFFBBBBBB) : color)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // ── Top row: date + status ─────────────────────────────
+          Row(children: [
+            Expanded(
+              child: Text(dateStr,
+                  style: const TextStyle(
+                      color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: statusColor.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: statusColor.withOpacity(0.4)),
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(statusIcon, size: 12, color: statusColor),
+                const SizedBox(width: 5),
+                Text(statusLabel,
+                    style: TextStyle(
+                        color: statusColor,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600)),
+              ]),
+            ),
+          ]),
+
+          const SizedBox(height: 8),
+
+          // ── Meta info ──────────────────────────────────────────
+          Row(children: [
+            _Meta(Icons.timer_outlined, '$durMin min'),
+            const SizedBox(width: 16),
+            _Meta(Icons.video_file_outlined, '${session.blockCount} block${session.blockCount != 1 ? 's' : ''}'),
+            if (session.isPartial) ...[
+              const SizedBox(width: 16),
+              _Meta(Icons.upload, '${session.uploadedBlocks.length} uploaded',
+                  color: Colors.orangeAccent),
+            ],
+          ]),
+
+          // ── Block progress bar (for partial/synced) ────────────
+          if (session.blockCount > 0 && !isSynced && session.uploadedBlocks.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: session.uploadedBlocks.length / session.blockCount,
+                minHeight: 4,
+                backgroundColor: Colors.white10,
+                valueColor: const AlwaysStoppedAnimation<Color>(Colors.orangeAccent),
+              ),
+            ),
+          ],
+
+          const SizedBox(height: 12),
+
+          // ── Action buttons ─────────────────────────────────────
+          Row(children: [
+            // Upload button
+            if (canUpload)
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: () => onUpload(session),
+                  icon: const Icon(Icons.cloud_upload, size: 16),
+                  label: Text(session.isPartial ? 'Resume Upload' : 'Upload to OneDrive'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF00C853),
+                    foregroundColor: Colors.black,
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10)),
+                  ),
+                ),
+              ),
+
+            // Synced indicator (no upload button)
+            if (isSynced)
+              Expanded(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF00C853).withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: const Color(0xFF00C853).withOpacity(0.2)),
+                  ),
+                  child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Icon(Icons.cloud_done, size: 14, color: Color(0xFF00C853)),
+                    SizedBox(width: 6),
+                    Text('Synced to OneDrive',
+                        style: TextStyle(
+                            color: Color(0xFF00C853),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600)),
+                  ]),
+                ),
+              ),
+
+            const SizedBox(width: 8),
+
+            // Delete button — disabled (greyed out) when synced
+            Tooltip(
+              message: isSynced ? 'Cannot delete — already uploaded to OneDrive' : 'Delete local recording',
+              child: IconButton(
+                onPressed: isSynced ? null : () => onDelete(session),
+                icon: Icon(
+                  Icons.delete_outline,
+                  color: isSynced ? Colors.white12 : Colors.redAccent.withOpacity(0.6),
+                ),
+              ),
+            ),
+          ]),
         ]),
       ),
     );
-
-    if (tooltip != null) {
-      return Tooltip(message: tooltip!, child: btn);
-    }
-    return btn;
   }
+}
+
+class _Meta extends StatelessWidget {
+  final IconData icon;
+  final String   text;
+  final Color    color;
+  const _Meta(this.icon, this.text, {this.color = const Color(0xFF888888)});
+
+  @override
+  Widget build(BuildContext context) => Row(mainAxisSize: MainAxisSize.min, children: [
+    Icon(icon, size: 13, color: color),
+    const SizedBox(width: 4),
+    Text(text, style: TextStyle(color: color, fontSize: 12)),
+  ]);
+}
+
+class _Pill extends StatelessWidget {
+  final String label;
+  final int    count;
+  final Color  color;
+  const _Pill(this.label, this.count, this.color);
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+    decoration: BoxDecoration(
+      color: color.withOpacity(0.1),
+      borderRadius: BorderRadius.circular(20),
+      border: Border.all(color: color.withOpacity(0.3)),
+    ),
+    child: Text('$label: $count',
+        style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600)),
+  );
 }

@@ -1,12 +1,19 @@
+import 'dart:convert';
+
+/// Status values:
+///   'pending'   — recorded locally, not yet uploaded
+///   'uploading' — upload in progress
+///   'synced'    — all blocks confirmed uploaded to OneDrive
+///   'partial'   — some blocks uploaded, some still pending
 class SessionModel {
-  final String id;
-  final String userId;
-  final DateTime createdAt;
-  final double durationSeconds;
-  final int blockCount;
-  final String status; // pending | uploading | synced
+  final String       id;
+  final String       userId;
+  final DateTime     createdAt;
+  final int          durationSeconds;
+  final int          blockCount;
+  String             status;
   final List<String> localChunkPaths;
-  final double uploadProgress;
+  List<int>          uploadedBlocks; // 0-based indices of blocks confirmed uploaded
 
   SessionModel({
     required this.id,
@@ -16,26 +23,32 @@ class SessionModel {
     required this.blockCount,
     required this.status,
     required this.localChunkPaths,
-    this.uploadProgress = 0,
-  });
+    List<int>? uploadedBlocks,
+  }) : uploadedBlocks = uploadedBlocks ?? [];
 
-  Map<String, dynamic> toMap() => {
-        'id': id,
-        'userId': userId,
-        'createdAt': createdAt.toIso8601String(),
-        'durationSeconds': durationSeconds,
-        'blockCount': blockCount,
-        'status': status,
-        'localChunkPaths': localChunkPaths,
-      };
+  bool get isFullySynced => uploadedBlocks.length >= blockCount;
+  bool get isPartial     => uploadedBlocks.isNotEmpty && !isFullySynced;
+  int  get pendingBlocks => blockCount - uploadedBlocks.length;
 
-  factory SessionModel.fromMap(Map<String, dynamic> map) => SessionModel(
-        id: map['id'],
-        userId: map['userId'],
-        createdAt: DateTime.parse(map['createdAt']),
-        durationSeconds: (map['durationSeconds'] as num).toDouble(),
-        blockCount: map['blockCount'],
-        status: map['status'],
-        localChunkPaths: List<String>.from(map['localChunkPaths'] ?? []),
-      );
+  Map<String, dynamic> toJson() => {
+    'id':             id,
+    'userId':         userId,
+    'createdAt':      createdAt.toIso8601String(),
+    'durationSeconds':durationSeconds,
+    'blockCount':     blockCount,
+    'status':         status,
+    'localChunkPaths':localChunkPaths,
+    'uploadedBlocks': uploadedBlocks,
+  };
+
+  factory SessionModel.fromJson(Map<String, dynamic> j) => SessionModel(
+    id:             j['id'],
+    userId:         j['userId'],
+    createdAt:      DateTime.parse(j['createdAt']),
+    durationSeconds:j['durationSeconds'] ?? 0,
+    blockCount:     j['blockCount'] ?? 1,
+    status:         j['status'] ?? 'pending',
+    localChunkPaths:List<String>.from(j['localChunkPaths'] ?? []),
+    uploadedBlocks: List<int>.from(j['uploadedBlocks'] ?? []),
+  );
 }
