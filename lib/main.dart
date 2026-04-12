@@ -5,6 +5,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'screens/login_screen.dart';
 import 'screens/dashboard_screen.dart';
 import 'services/local_video_storage.dart';
+import 'services/notification_service.dart';
 
 // ── Ben10 Omnitrix colour palette ────────────────────────────────────────────
 // Inspired by the Omnitrix watch: white face, bright green accents, black trim
@@ -19,6 +20,7 @@ const kTextSub   = Color(0xFF666666); // secondary text
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await NotificationService().init();
 
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,

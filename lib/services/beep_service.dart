@@ -7,56 +7,52 @@ class BeepService {
   factory BeepService() => _i;
   BeepService._();
 
-  final _player = AudioPlayer();
-  final _player2 = AudioPlayer(); // second player for overlapping alerts
+  // Use fresh players each time instead of reusing disposed ones
   bool _ready = false;
 
   Future<void> init() async {
-    if (_ready) return;
-    await _player.setReleaseMode(ReleaseMode.release);
-    await _player2.setReleaseMode(ReleaseMode.release);
     _ready = true;
   }
 
-  /// Short tick — each countdown second (5, 4, 3, 2, 1)
-  Future<void> tick() => _play(_player,
-    frequency: 880, durationMs: 120, amplitude: 0.6);
+  /// Short tick — each countdown second
+  Future<void> tick() => _play(frequency: 880, durationMs: 120, amplitude: 0.6);
 
   /// GO beep — when recording starts
-  Future<void> go() => _play(_player,
-    frequency: 1320, durationMs: 280, amplitude: 0.85);
+  Future<void> go() => _play(frequency: 1320, durationMs: 280, amplitude: 0.85);
 
-  /// Warning alert — plays at 19:50 (block about to end)
-  /// Three rapid ascending beeps to grab attention
+  /// Warning — block about to end
   Future<void> blockWarning() async {
-    await init();
-    // beep-beep-beep ascending
-    await _play(_player,  frequency: 660,  durationMs: 180, amplitude: 0.9);
+    await _play(frequency: 660,  durationMs: 180, amplitude: 0.9);
     await Future.delayed(const Duration(milliseconds: 80));
-    await _play(_player2, frequency: 880,  durationMs: 180, amplitude: 0.9);
+    await _play(frequency: 880,  durationMs: 180, amplitude: 0.9);
     await Future.delayed(const Duration(milliseconds: 80));
-    await _play(_player,  frequency: 1100, durationMs: 280, amplitude: 0.9);
+    await _play(frequency: 1100, durationMs: 280, amplitude: 0.9);
   }
 
-  /// Block save + new start tone — plays at 20:00 when auto-splitting
-  /// Two-tone chime: save → start fresh
+  /// Block transition chime
   Future<void> blockTransition() async {
-    await init();
-    // Low-high chime: "saving... new block starting"
-    await _play(_player,  frequency: 440,  durationMs: 250, amplitude: 0.9);
+    await _play(frequency: 440, durationMs: 250, amplitude: 0.9);
     await Future.delayed(const Duration(milliseconds: 100));
-    await _play(_player2, frequency: 880,  durationMs: 350, amplitude: 0.95);
+    await _play(frequency: 880, durationMs: 350, amplitude: 0.95);
   }
 
-  Future<void> _play(AudioPlayer p, {
+  // ── KEY FIX: create a new AudioPlayer for every sound ──────────────────
+  // AudioPlayer.dispose() permanently kills the player — reusing a disposed
+  // player silently fails. Creating a fresh one each time is cheap and correct.
+  Future<void> _play({
     required double frequency,
     required int durationMs,
     required double amplitude,
   }) async {
     try {
-      await init();
       final bytes = _wav(frequency: frequency, durationMs: durationMs, amplitude: amplitude);
-      await p.play(BytesSource(bytes));
+      final player = AudioPlayer();
+      await player.setReleaseMode(ReleaseMode.release);
+      await player.play(BytesSource(bytes));
+      // Dispose after sound finishes (non-blocking)
+      Future.delayed(Duration(milliseconds: durationMs + 200), () {
+        player.dispose();
+      });
     } catch (e) {
       print('=== BeepService: $e');
     }
@@ -78,15 +74,15 @@ class BeepService {
     buf.setUint32(4,  36 + dataSize, Endian.little);
     _str(buf, 8,  'WAVE');
     _str(buf, 12, 'fmt ');
-    buf.setUint32(16, 16,          Endian.little);
-    buf.setUint16(20, 1,           Endian.little);
-    buf.setUint16(22, numChannels, Endian.little);
-    buf.setUint32(24, sampleRate,  Endian.little);
+    buf.setUint32(16, 16,             Endian.little);
+    buf.setUint16(20, 1,              Endian.little);
+    buf.setUint16(22, numChannels,    Endian.little);
+    buf.setUint32(24, sampleRate,     Endian.little);
     buf.setUint32(28, sampleRate * 2, Endian.little);
-    buf.setUint16(32, 2,           Endian.little);
-    buf.setUint16(34, bitsPerSample, Endian.little);
+    buf.setUint16(32, 2,              Endian.little);
+    buf.setUint16(34, bitsPerSample,  Endian.little);
     _str(buf, 36, 'data');
-    buf.setUint32(40, dataSize,    Endian.little);
+    buf.setUint32(40, dataSize,       Endian.little);
 
     final fadeOut = (sampleRate * 0.04).round();
     for (int i = 0; i < numSamples; i++) {
@@ -101,8 +97,6 @@ class BeepService {
     for (int i = 0; i < s.length; i++) b.setUint8(o + i, s.codeUnitAt(i));
   }
 
-  void dispose() {
-    _player.dispose();
-    _player2.dispose();
-  }
+  // Don't dispose the singleton — just mark not ready so init() re-runs
+  void dispose() { _ready = false; }
 }

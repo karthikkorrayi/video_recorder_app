@@ -1,8 +1,19 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
+import 'package:video_player/video_player.dart';
 import '../services/session_store.dart';
 import '../models/session_model.dart';
 import 'upload_progress_screen.dart';
+
+const _green  = Color(0xFF00C853);
+const _red    = Color(0xFFE53935);
+const _surface= Color(0xFFF4F6F8);
+const _card   = Color(0xFFFFFFFF);
+const _text   = Color(0xFF1A1A1A);
+const _sub    = Color(0xFF888888);
+const _border = Color(0xFFE8E8E8);
 
 class HistoryScreen extends StatefulWidget {
   const HistoryScreen({super.key});
@@ -10,352 +21,508 @@ class HistoryScreen extends StatefulWidget {
   State<HistoryScreen> createState() => _HistoryScreenState();
 }
 
-class _HistoryScreenState extends State<HistoryScreen> {
+class _HistoryScreenState extends State<HistoryScreen>
+    with SingleTickerProviderStateMixin {
   final _store = SessionStore();
-  List<SessionModel> _sessions = [];
+  late TabController _tabs;
+  List<SessionModel> _local  = [];
+  List<SessionModel> _synced = [];
   bool _loading = true;
 
   @override
   void initState() {
     super.initState();
+    _tabs = TabController(length: 2, vsync: this);
     _load();
   }
 
+  @override
+  void dispose() { _tabs.dispose(); super.dispose(); }
+
   Future<void> _load() async {
     final all = await _store.getAll();
-    if (mounted) setState(() { _sessions = all; _loading = false; });
-  }
-
-  // ── Status helpers ───────────────────────────────────────────────────────
-  Color _statusColor(String status) {
-    switch (status) {
-      case 'synced':    return const Color(0xFF00C853);
-      case 'uploading': return Colors.blueAccent;
-      case 'partial':   return Colors.orangeAccent;
-      default:          return Colors.redAccent;
-    }
-  }
-
-  IconData _statusIcon(String status) {
-    switch (status) {
-      case 'synced':    return Icons.cloud_done;
-      case 'uploading': return Icons.cloud_upload;
-      case 'partial':   return Icons.cloud_sync;
-      default:          return Icons.cloud_off;
-    }
-  }
-
-  String _statusLabel(SessionModel s) {
-    switch (s.status) {
-      case 'synced':    return 'Synced';
-      case 'uploading': return 'Uploading...';
-      case 'partial':   return '${s.uploadedBlocks.length}/${s.blockCount} blocks';
-      default:          return 'Pending';
-    }
-  }
-
-  // ── Summary counts ───────────────────────────────────────────────────────
-  Map<String, int> get _counts => {
-    'pending':  _sessions.where((s) => s.status == 'pending').length,
-    'partial':  _sessions.where((s) => s.status == 'partial').length,
-    'uploading':_sessions.where((s) => s.status == 'uploading').length,
-    'synced':   _sessions.where((s) => s.status == 'synced').length,
-  };
-
-  // ── Upload tap ───────────────────────────────────────────────────────────
-  Future<void> _onUpload(SessionModel session) async {
-    final result = await Navigator.push<bool>(
-      context,
-      MaterialPageRoute(builder: (_) => UploadProgressScreen(session: session)),
-    );
-    if (result == true) _load(); // Refresh list after successful upload
-  }
-
-  // ── Delete tap ───────────────────────────────────────────────────────────
-  Future<void> _onDelete(SessionModel session) async {
-    if (session.status == 'synced') {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Cannot delete — already synced to OneDrive'),
-          backgroundColor: Colors.redAccent,
-        ),
-      );
-      return;
-    }
-
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A1A),
-        title: const Text('Delete session?', style: TextStyle(color: Colors.white)),
-        content: const Text('This will delete the local recording. It has not been uploaded.',
-            style: TextStyle(color: Colors.white54)),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
-          TextButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Delete', style: TextStyle(color: Colors.redAccent))),
-        ],
-      ),
-    );
-
-    if (confirm == true) {
-      await _store.delete(session.id);
-      _load();
-    }
+    if (mounted) setState(() {
+      _local  = all.where((s) => s.status != 'synced').toList();
+      _synced = all.where((s) => s.status == 'synced').toList();
+      _loading = false;
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    final counts = _counts;
     return Scaffold(
-      backgroundColor: const Color(0xFF0A0A0A),
+      backgroundColor: _surface,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0A0A0A),
-        title: const Text('Session History',
-            style: TextStyle(color: Colors.white)),
-        iconTheme: const IconThemeData(color: Colors.white),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh, color: Colors.white54),
-            onPressed: _load,
-          ),
-        ],
+        backgroundColor: _card,
+        elevation: 0,
+        foregroundColor: _text,
+        title: const Text('My Recordings',
+            style: TextStyle(color: _text, fontWeight: FontWeight.w700, fontSize: 18)),
+        actions: [IconButton(icon: const Icon(Icons.refresh, color: _sub), onPressed: _load)],
+        bottom: TabBar(
+          controller: _tabs,
+          labelColor: _green,
+          unselectedLabelColor: _sub,
+          indicatorColor: _green,
+          indicatorWeight: 3,
+          labelStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
+          tabs: [
+            Tab(text: 'Local  (${_local.length})'),
+            Tab(text: 'Synced  (${_synced.length})'),
+          ],
+        ),
       ),
       body: _loading
-          ? const Center(child: CircularProgressIndicator(color: Color(0xFF00C853)))
-          : Column(
-              children: [
-                // ── Summary pills ──────────────────────────────────
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(children: [
-                      _Pill('Pending',   counts['pending']!,  Colors.redAccent),
-                      const SizedBox(width: 8),
-                      _Pill('Partial',   counts['partial']!,  Colors.orangeAccent),
-                      const SizedBox(width: 8),
-                      _Pill('Uploading', counts['uploading']!, Colors.blueAccent),
-                      const SizedBox(width: 8),
-                      _Pill('Synced',    counts['synced']!,   const Color(0xFF00C853)),
-                    ]),
-                  ),
-                ),
-
-                // ── Session list ───────────────────────────────────
-                Expanded(
-                  child: _sessions.isEmpty
-                      ? const Center(
-                          child: Text('No sessions recorded yet',
-                              style: TextStyle(color: Colors.white38)))
-                      : ListView.builder(
-                          padding: const EdgeInsets.all(16),
-                          itemCount: _sessions.length,
-                          itemBuilder: (ctx, i) => _SessionCard(
-                            session: _sessions[i],
-                            statusColor: _statusColor(_sessions[i].status),
-                            statusIcon:  _statusIcon(_sessions[i].status),
-                            statusLabel: _statusLabel(_sessions[i]),
-                            onUpload: _onUpload,
-                            onDelete: _onDelete,
-                          ),
-                        ),
-                ),
-              ],
-            ),
+          ? const Center(child: CircularProgressIndicator(color: _green))
+          : TabBarView(controller: _tabs, children: [
+              _LocalTab(sessions: _local, onRefresh: _load),
+              _SyncedTab(sessions: _synced),
+            ]),
     );
   }
 }
 
-// ── Session card ─────────────────────────────────────────────────────────────
-class _SessionCard extends StatelessWidget {
-  final SessionModel session;
-  final Color    statusColor;
-  final IconData statusIcon;
-  final String   statusLabel;
-  final Future<void> Function(SessionModel) onUpload;
-  final Future<void> Function(SessionModel) onDelete;
-
-  const _SessionCard({
-    required this.session,
-    required this.statusColor,
-    required this.statusIcon,
-    required this.statusLabel,
-    required this.onUpload,
-    required this.onDelete,
-  });
+// ── LOCAL TAB ─────────────────────────────────────────────────────────────────
+class _LocalTab extends StatelessWidget {
+  final List<SessionModel> sessions;
+  final VoidCallback onRefresh;
+  const _LocalTab({required this.sessions, required this.onRefresh});
 
   @override
   Widget build(BuildContext context) {
-    final isSynced   = session.status == 'synced';
-    final canUpload  = session.status == 'pending' || session.status == 'partial';
-    final dateStr    = DateFormat('dd MMM yyyy, hh:mm a').format(session.createdAt);
-    final durMin     = (session.durationSeconds / 60).toStringAsFixed(1);
+    if (sessions.isEmpty) {
+      return const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Icon(Icons.video_library_outlined, size: 52, color: _sub),
+        SizedBox(height: 12),
+        Text('No local recordings', style: TextStyle(color: _sub, fontSize: 15)),
+        SizedBox(height: 4),
+        Text('Record a video to see it here', style: TextStyle(color: _sub, fontSize: 12)),
+      ]));
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: sessions.length,
+      itemBuilder: (ctx, i) => _LocalCard(session: sessions[i], onRefresh: onRefresh),
+    );
+  }
+}
+
+class _LocalCard extends StatelessWidget {
+  final SessionModel session;
+  final VoidCallback onRefresh;
+  const _LocalCard({required this.session, required this.onRefresh});
+
+  String get _date => DateFormat('dd MMM yyyy, hh:mm a').format(session.createdAt);
+  String get _dur {
+    final m = session.durationSeconds ~/ 60;
+    final s = session.durationSeconds % 60;
+    return m > 0 ? '${m}m ${s}s' : '${s}s';
+  }
+
+  Color get _statusColor {
+    switch (session.status) {
+      case 'partial':   return Colors.orange;
+      case 'uploading': return Colors.blue;
+      default:          return _red;
+    }
+  }
+  String get _statusLabel {
+    switch (session.status) {
+      case 'partial':   return '${session.uploadedBlocks.length}/${session.blockCount} uploaded';
+      case 'uploading': return 'Uploading...';
+      default:          return 'Not uploaded';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canUpload = session.status == 'pending' || session.status == 'partial';
+    final hasLocal  = session.localChunkPaths.isNotEmpty &&
+        File(session.localChunkPaths.first).existsSync();
 
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.05),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: isSynced
-              ? const Color(0xFF00C853).withOpacity(0.25)
-              : Colors.white10,
-        ),
-      ),
+      decoration: BoxDecoration(color: _card,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _border),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04),
+            blurRadius: 8, offset: const Offset(0, 2))]),
       child: Padding(
         padding: const EdgeInsets.all(14),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          // ── Top row: date + status ─────────────────────────────
           Row(children: [
-            Expanded(
-              child: Text(dateStr,
-                  style: const TextStyle(
-                      color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
-            ),
+            Expanded(child: Text(_date, style: const TextStyle(
+                color: _text, fontSize: 13, fontWeight: FontWeight.w600))),
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
               decoration: BoxDecoration(
-                color: statusColor.withOpacity(0.12),
+                color: _statusColor.withOpacity(0.1),
                 borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: statusColor.withOpacity(0.4)),
+                border: Border.all(color: _statusColor.withOpacity(0.4))),
+              child: Text(_statusLabel, style: TextStyle(
+                  color: _statusColor, fontSize: 11, fontWeight: FontWeight.w600)),
+            ),
+          ]),
+          const SizedBox(height: 8),
+          Row(children: [
+            _Meta(Icons.timer_outlined, _dur),
+            const SizedBox(width: 14),
+            _Meta(Icons.video_file_outlined,
+                '${session.blockCount} block${session.blockCount != 1 ? 's' : ''}'),
+          ]),
+          if (session.isPartial) ...[
+            const SizedBox(height: 8),
+            ClipRRect(borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: session.uploadedBlocks.length / session.blockCount,
+                minHeight: 4, backgroundColor: _border,
+                valueColor: const AlwaysStoppedAnimation<Color>(Colors.orange))),
+          ],
+          const SizedBox(height: 12),
+          Row(children: [
+            // Preview button
+            if (hasLocal) Expanded(child: OutlinedButton.icon(
+              onPressed: () => _openPreview(context),
+              icon: const Icon(Icons.play_circle_outline, size: 16),
+              label: const Text('Preview'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: _text, side: const BorderSide(color: _border),
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+            )),
+            if (hasLocal && canUpload) const SizedBox(width: 8),
+            // Upload button
+            if (canUpload) Expanded(child: ElevatedButton.icon(
+              onPressed: () async {
+                await Navigator.push(context, MaterialPageRoute(
+                  builder: (_) => UploadProgressScreen(session: session)));
+                onRefresh();
+              },
+              icon: const Icon(Icons.cloud_upload, size: 16),
+              label: Text(session.isPartial ? 'Resume' : 'Upload'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _green, foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+            )),
+            // Delete button — only for local pending sessions
+            if (canUpload) ...[
+              const SizedBox(width: 8),
+              GestureDetector(
+                onTap: () => _confirmDelete(context),
+                child: Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: _red.withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: _red.withValues(alpha: 0.3))),
+                  child: const Icon(Icons.delete_outline, color: _red, size: 20),
+                ),
               ),
-              child: Row(mainAxisSize: MainAxisSize.min, children: [
-                Icon(statusIcon, size: 12, color: statusColor),
-                const SizedBox(width: 5),
-                Text(statusLabel,
-                    style: TextStyle(
-                        color: statusColor,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600)),
+            ],
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  void _openPreview(BuildContext ctx) => Navigator.push(ctx, MaterialPageRoute(
+    builder: (_) => _VideoPreviewScreen(
+      chunkPaths: session.localChunkPaths,
+      title: DateFormat('dd MMM yyyy').format(session.createdAt))));
+
+  Future<void> _confirmDelete(BuildContext ctx) async {
+    final confirmed = await showDialog<bool>(
+      context: ctx,
+      builder: (_) => AlertDialog(
+        title: const Text('Delete local recording?'),
+        content: const Text(
+            'This will permanently delete the local video files. '
+            'This cannot be undone. Upload first if you want to keep it.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete', style: TextStyle(color: _red))),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    // Delete all local chunk files
+    for (final path in session.localChunkPaths) {
+      try { await File(path).delete(); } catch (_) {}
+    }
+    // Remove from session store
+    await SessionStore().delete(session.id);
+    onRefresh();
+  }
+}
+
+// ── SYNCED TAB ────────────────────────────────────────────────────────────────
+class _SyncedTab extends StatelessWidget {
+  final List<SessionModel> sessions;
+  const _SyncedTab({required this.sessions});
+
+  @override
+  Widget build(BuildContext context) {
+    if (sessions.isEmpty) {
+      return const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Icon(Icons.cloud_done_outlined, size: 52, color: _sub),
+        SizedBox(height: 12),
+        Text('No synced videos yet', style: TextStyle(color: _sub, fontSize: 15)),
+        SizedBox(height: 4),
+        Text('Upload a recording to see it here', style: TextStyle(color: _sub, fontSize: 12)),
+      ]));
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: sessions.length,
+      itemBuilder: (ctx, i) => _SyncedCard(session: sessions[i]),
+    );
+  }
+}
+
+class _SyncedCard extends StatelessWidget {
+  final SessionModel session;
+  const _SyncedCard({required this.session});
+
+  String get _date => DateFormat('dd MMM yyyy, hh:mm a').format(session.createdAt);
+  String get _dur {
+    final m = session.durationSeconds ~/ 60;
+    final s = session.durationSeconds % 60;
+    return m > 0 ? '${m}m ${s}s' : '${s}s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(color: _card,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _green.withOpacity(0.3)),
+        boxShadow: [BoxShadow(color: _green.withOpacity(0.05),
+            blurRadius: 8, offset: const Offset(0, 2))]),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Expanded(child: Text(_date, style: const TextStyle(
+                color: _text, fontSize: 13, fontWeight: FontWeight.w600))),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+              decoration: BoxDecoration(
+                color: _green.withOpacity(0.1), borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: _green.withOpacity(0.3))),
+              child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.cloud_done, size: 12, color: _green),
+                SizedBox(width: 4),
+                Text('Synced to OneDrive', style: TextStyle(color: _green,
+                    fontSize: 11, fontWeight: FontWeight.w600)),
               ]),
             ),
           ]),
-
           const SizedBox(height: 8),
-
-          // ── Meta info ──────────────────────────────────────────
           Row(children: [
-            _Meta(Icons.timer_outlined, '$durMin min'),
-            const SizedBox(width: 16),
-            _Meta(Icons.video_file_outlined, '${session.blockCount} block${session.blockCount != 1 ? 's' : ''}'),
-            if (session.isPartial) ...[
-              const SizedBox(width: 16),
-              _Meta(Icons.upload, '${session.uploadedBlocks.length} uploaded',
-                  color: Colors.orangeAccent),
-            ],
+            _Meta(Icons.timer_outlined, _dur),
+            const SizedBox(width: 14),
+            _Meta(Icons.cloud_done_outlined,
+                '${session.blockCount} block${session.blockCount != 1 ? 's' : ''}'),
           ]),
-
-          // ── Block progress bar (for partial/synced) ────────────
-          if (session.blockCount > 0 && !isSynced && session.uploadedBlocks.isNotEmpty) ...[
-            const SizedBox(height: 10),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(4),
-              child: LinearProgressIndicator(
-                value: session.uploadedBlocks.length / session.blockCount,
-                minHeight: 4,
-                backgroundColor: Colors.white10,
-                valueColor: const AlwaysStoppedAnimation<Color>(Colors.orangeAccent),
-              ),
-            ),
-          ],
-
           const SizedBox(height: 12),
-
-          // ── Action buttons ─────────────────────────────────────
-          Row(children: [
-            // Upload button
-            if (canUpload)
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: () => onUpload(session),
-                  icon: const Icon(Icons.cloud_upload, size: 16),
-                  label: Text(session.isPartial ? 'Resume Upload' : 'Upload to OneDrive'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF00C853),
-                    foregroundColor: Colors.black,
-                    padding: const EdgeInsets.symmetric(vertical: 10),
-                    textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(10)),
-                  ),
-                ),
-              ),
-
-            // Synced indicator (no upload button)
-            if (isSynced)
-              Expanded(
-                child: Container(
-                  padding: const EdgeInsets.symmetric(vertical: 10),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF00C853).withOpacity(0.08),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: const Color(0xFF00C853).withOpacity(0.2)),
-                  ),
-                  child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    Icon(Icons.cloud_done, size: 14, color: Color(0xFF00C853)),
-                    SizedBox(width: 6),
-                    Text('Synced to OneDrive',
-                        style: TextStyle(
-                            color: Color(0xFF00C853),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600)),
-                  ]),
-                ),
-              ),
-
-            const SizedBox(width: 8),
-
-            // Delete button — disabled (greyed out) when synced
-            Tooltip(
-              message: isSynced ? 'Cannot delete — already uploaded to OneDrive' : 'Delete local recording',
-              child: IconButton(
-                onPressed: isSynced ? null : () => onDelete(session),
-                icon: Icon(
-                  Icons.delete_outline,
-                  color: isSynced ? Colors.white12 : Colors.redAccent.withOpacity(0.6),
-                ),
-              ),
-            ),
-          ]),
+          Container(width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 10),
+            decoration: BoxDecoration(
+              color: _green.withOpacity(0.05), borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: _green.withOpacity(0.15))),
+            child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              Icon(Icons.cloud_done, size: 14, color: _green),
+              SizedBox(width: 6),
+              Text('Uploaded — local copy removed',
+                  style: TextStyle(color: _green, fontSize: 12, fontWeight: FontWeight.w500)),
+            ]),
+          ),
         ]),
       ),
     );
   }
 }
 
-class _Meta extends StatelessWidget {
-  final IconData icon;
-  final String   text;
-  final Color    color;
-  const _Meta(this.icon, this.text, {this.color = const Color(0xFF888888)});
-
+// ── VIDEO PREVIEW SCREEN ──────────────────────────────────────────────────────
+class _VideoPreviewScreen extends StatefulWidget {
+  final List<String> chunkPaths;
+  final String title;
+  const _VideoPreviewScreen({required this.chunkPaths, required this.title});
   @override
-  Widget build(BuildContext context) => Row(mainAxisSize: MainAxisSize.min, children: [
-    Icon(icon, size: 13, color: color),
-    const SizedBox(width: 4),
-    Text(text, style: TextStyle(color: color, fontSize: 12)),
-  ]);
+  State<_VideoPreviewScreen> createState() => _VideoPreviewScreenState();
 }
 
-class _Pill extends StatelessWidget {
-  final String label;
-  final int    count;
-  final Color  color;
-  const _Pill(this.label, this.count, this.color);
+class _VideoPreviewScreenState extends State<_VideoPreviewScreen> {
+  VideoPlayerController? _vpc;
+  int _chunk    = 0;
+  bool _isInit  = false;
+  bool _playing = false;
+  Duration _pos = Duration.zero;
+  Duration _dur = Duration.zero;
 
   @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-    decoration: BoxDecoration(
-      color: color.withOpacity(0.1),
-      borderRadius: BorderRadius.circular(20),
-      border: Border.all(color: color.withOpacity(0.3)),
-    ),
-    child: Text('$label: $count',
-        style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600)),
-  );
+  void initState() {
+    super.initState();
+    // IMPORTANT: keep portrait, don't force landscape
+    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+    _load(0);
+  }
+
+  @override
+  void dispose() {
+    _vpc?.removeListener(_update);
+    _vpc?.dispose();
+    // restore normal orientations on exit
+    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+    super.dispose();
+  }
+
+  Future<void> _load(int idx) async {
+    if (idx >= widget.chunkPaths.length) return;
+    setState(() { _isInit = false; _playing = false; });
+    _vpc?.removeListener(_update);
+    await _vpc?.dispose();
+
+    final f = File(widget.chunkPaths[idx]);
+    if (!await f.exists()) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Video file not found')));
+      return;
+    }
+
+    _vpc = VideoPlayerController.file(f);
+    await _vpc!.initialize();
+    _vpc!.addListener(_update);
+    if (mounted) setState(() { _isInit = true; _chunk = idx; _dur = _vpc!.value.duration; });
+  }
+
+  void _update() {
+    if (!mounted || _vpc == null) return;
+    final v = _vpc!.value;
+    setState(() { _pos = v.position; _dur = v.duration; _playing = v.isPlaying; });
+    if (v.position >= v.duration && v.duration > Duration.zero) {
+      if (_chunk < widget.chunkPaths.length - 1) {
+        _load(_chunk + 1).then((_) => _vpc?.play());
+      }
+    }
+  }
+
+  void _togglePlay() { _playing ? _vpc?.pause() : _vpc?.play(); }
+  void _seek(Duration d) {
+    final newSecs = (_pos + d).inSeconds.clamp(0, _dur.inSeconds);
+    _vpc?.seekTo(Duration(seconds: newSecs));
+  }
+  String _fmt(Duration d) =>
+      '${d.inMinutes.toString().padLeft(2,'0')}:${(d.inSeconds%60).toString().padLeft(2,'0')}';
+
+  @override
+  Widget build(BuildContext context) {
+    final multi = widget.chunkPaths.length > 1;
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black, foregroundColor: Colors.white,
+        title: Text(widget.title, style: const TextStyle(color: Colors.white, fontSize: 15)),
+        actions: [if (multi) Padding(
+          padding: const EdgeInsets.only(right: 14),
+          child: Center(child: Text('Block ${_chunk+1}/${widget.chunkPaths.length}',
+              style: const TextStyle(color: Colors.white54, fontSize: 12))))],
+      ),
+      body: Column(children: [
+        Expanded(child: _isInit && _vpc != null
+          ? GestureDetector(onTap: _togglePlay,
+              child: Center(child: AspectRatio(
+                aspectRatio: _vpc!.value.aspectRatio,
+                child: Stack(alignment: Alignment.center, children: [
+                  VideoPlayer(_vpc!),
+                  AnimatedOpacity(opacity: _playing ? 0.0 : 1.0,
+                    duration: const Duration(milliseconds: 200),
+                    child: Container(width: 64, height: 64,
+                      decoration: BoxDecoration(color: Colors.black54, shape: BoxShape.circle),
+                      child: const Icon(Icons.play_arrow, color: Colors.white, size: 36))),
+                ]))))
+          : const Center(child: CircularProgressIndicator(color: _green))),
+
+        if (_isInit) ...[
+          Padding(padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+            child: VideoProgressIndicator(_vpc!, allowScrubbing: true,
+              colors: const VideoProgressColors(
+                playedColor: _green, bufferedColor: Colors.white24,
+                backgroundColor: Colors.white12))),
+          Padding(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: Row(children: [
+              Text(_fmt(_pos), style: const TextStyle(color: Colors.white54, fontSize: 11)),
+              const Spacer(),
+              Text(_fmt(_dur), style: const TextStyle(color: Colors.white54, fontSize: 11)),
+            ])),
+        ],
+
+        Container(color: const Color(0xFF111111),
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
+          child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+            if (multi) _Btn(Icons.skip_previous_rounded, 'Prev',
+                _chunk > 0 ? () => _load(_chunk - 1) : null),
+            _Btn(Icons.replay_10_rounded, '-10s', () => _seek(const Duration(seconds: -10))),
+            GestureDetector(onTap: _isInit ? _togglePlay : null,
+              child: Container(width: 60, height: 60,
+                decoration: const BoxDecoration(color: _green, shape: BoxShape.circle),
+                child: Icon(_playing ? Icons.pause : Icons.play_arrow,
+                    color: Colors.white, size: 30))),
+            _Btn(Icons.forward_10_rounded, '+10s', () => _seek(const Duration(seconds: 10))),
+            if (multi) _Btn(Icons.skip_next_rounded, 'Next',
+                _chunk < widget.chunkPaths.length - 1 ? () => _load(_chunk + 1) : null),
+          ])),
+
+        if (multi) SizedBox(height: 48,
+          child: ListView.builder(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            itemCount: widget.chunkPaths.length,
+            itemBuilder: (ctx, i) => GestureDetector(onTap: () => _load(i),
+              child: Container(
+                margin: const EdgeInsets.only(right: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+                decoration: BoxDecoration(
+                  color: i == _chunk ? _green : Colors.white12,
+                  borderRadius: BorderRadius.circular(20)),
+                child: Text('Block ${i+1}', style: TextStyle(
+                  color: i == _chunk ? Colors.white : Colors.white54,
+                  fontSize: 12, fontWeight: FontWeight.w600)))))),
+
+        const SizedBox(height: 8),
+      ]),
+    );
+  }
+}
+
+class _Btn extends StatelessWidget {
+  final IconData icon; final String label; final VoidCallback? onTap;
+  const _Btn(this.icon, this.label, this.onTap);
+  @override
+  Widget build(BuildContext ctx) => GestureDetector(onTap: onTap,
+    child: Opacity(opacity: onTap == null ? 0.3 : 1.0,
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Icon(icon, color: Colors.white, size: 28),
+        const SizedBox(height: 2),
+        Text(label, style: const TextStyle(color: Colors.white54, fontSize: 10)),
+      ])));
+}
+
+class _Meta extends StatelessWidget {
+  final IconData icon; final String text;
+  const _Meta(this.icon, this.text);
+  @override
+  Widget build(BuildContext ctx) => Row(mainAxisSize: MainAxisSize.min, children: [
+    Icon(icon, size: 13, color: _sub),
+    const SizedBox(width: 4),
+    Text(text, style: const TextStyle(color: _sub, fontSize: 12)),
+  ]);
 }

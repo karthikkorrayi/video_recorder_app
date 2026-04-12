@@ -4,421 +4,379 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import '../models/session_model.dart';
 import '../services/upload_service.dart';
 import '../services/session_store.dart';
+import '../services/notification_service.dart';
 
+// ── Singleton upload manager — survives navigation ────────────────────────────
+class _UploadManager {
+  static final _UploadManager _i = _UploadManager._();
+  factory _UploadManager() => _i;
+  _UploadManager._();
+
+  final _service = UploadService();
+  final _notif   = NotificationService();
+  bool isRunning = false;
+  String? activeSessionId;
+
+  final _ctrl = StreamController<_UploadState>.broadcast();
+  Stream<_UploadState> get stream => _ctrl.stream;
+  _UploadState _state = const _UploadState();
+  _UploadState get current => _state;
+
+  void _emit(_UploadState s) { _state = s; _ctrl.add(s); }
+
+  Future<void> start(SessionModel session, SessionStore store) async {
+    if (isRunning && activeSessionId == session.id) return;
+    isRunning = true;
+    activeSessionId = session.id;
+    _emit(_UploadState(
+      statusText: 'Starting upload...',
+      totalBlocks: session.blockCount,
+      uploadedBlocks: List.from(session.uploadedBlocks),
+    ));
+
+    await store.updateStatus(session.id, 'uploading');
+
+    try {
+      final uploaded = await _service.uploadSession(
+        sessionId:       session.id,
+        chunkPaths:      session.localChunkPaths,
+        sessionTime:     session.createdAt,
+        alreadyUploaded: List.from(session.uploadedBlocks),
+        onProgress: (block, total, prog) {
+          final pct = (((block - 1 + prog) / total) * 100).round();
+          _notif.showUploadProgress(block: block, total: total, percentDone: pct);
+          _emit(_state.copyWith(
+              currentBlock: block, totalBlocks: total, blockProgress: prog));
+        },
+        onStatus: (s) => _emit(_state.copyWith(statusText: s)),
+      );
+
+      await store.updateUploadedBlocks(session.id, uploaded);
+      final done = uploaded.length >= session.blockCount;
+      if (done) {
+        _notif.showUploadComplete(session.blockCount);
+      } else {
+        _notif.showUploadFailed('${session.blockCount - uploaded.length} block(s) failed');
+      }
+      _emit(_UploadState(
+        isComplete: done, isError: !done,
+        uploadedBlocks: uploaded,
+        totalBlocks: session.blockCount,
+        currentBlock: done ? session.blockCount : uploaded.length,
+        blockProgress: 1.0,
+        statusText: done
+            ? 'Upload complete! All blocks synced to OneDrive.'
+            : 'Partial upload — ${session.blockCount - uploaded.length} block(s) remaining.',
+      ));
+    } catch (e) {
+      await store.updateStatus(session.id, 'pending');
+      _notif.showUploadFailed('Upload failed — tap to retry');
+      _emit(_state.copyWith(isError: true, statusText: 'Upload failed: $e'));
+    } finally {
+      isRunning = false;
+      activeSessionId = null;
+    }
+  }
+
+  void pause()  => _service.pause();
+  void resume() => _service.resume();
+  bool get isPaused => _service.isPaused;
+}
+
+class _UploadState {
+  final int currentBlock;
+  final int totalBlocks;
+  final double blockProgress;
+  final String statusText;
+  final bool isComplete;
+  final bool isError;
+  final bool hasNetwork;
+  final List<int> uploadedBlocks;
+
+  const _UploadState({
+    this.currentBlock  = 0,
+    this.totalBlocks   = 0,
+    this.blockProgress = 0,
+    this.statusText    = '',
+    this.isComplete    = false,
+    this.isError       = false,
+    this.hasNetwork    = true,
+    this.uploadedBlocks = const [],
+  });
+
+  _UploadState copyWith({
+    int? currentBlock, int? totalBlocks, double? blockProgress,
+    String? statusText, bool? isComplete, bool? isError,
+    bool? hasNetwork, List<int>? uploadedBlocks,
+  }) => _UploadState(
+    currentBlock:   currentBlock   ?? this.currentBlock,
+    totalBlocks:    totalBlocks    ?? this.totalBlocks,
+    blockProgress:  blockProgress  ?? this.blockProgress,
+    statusText:     statusText     ?? this.statusText,
+    isComplete:     isComplete     ?? this.isComplete,
+    isError:        isError        ?? this.isError,
+    hasNetwork:     hasNetwork     ?? this.hasNetwork,
+    uploadedBlocks: uploadedBlocks ?? this.uploadedBlocks,
+  );
+
+  double get overallProgress {
+    if (totalBlocks == 0) return 0.0;
+    if (isComplete) return 1.0;
+    final done = uploadedBlocks.length.toDouble();
+    if (currentBlock == 0) return done / totalBlocks;
+    return ((currentBlock - 1) + blockProgress) / totalBlocks;
+  }
+}
+
+// ── UI Screen ─────────────────────────────────────────────────────────────────
 class UploadProgressScreen extends StatefulWidget {
   final SessionModel session;
   const UploadProgressScreen({super.key, required this.session});
-
   @override
   State<UploadProgressScreen> createState() => _UploadProgressScreenState();
 }
 
 class _UploadProgressScreenState extends State<UploadProgressScreen> {
-  final _uploadService = UploadService();
-  final _store         = SessionStore();
-
-  // Progress state
-  int    _currentBlock  = 0;
-  int    _totalBlocks   = 0;
-  double _blockProgress = 0.0;
-  String _statusText    = 'Preparing upload...';
-  bool   _isUploading   = false;
-  bool   _isPaused      = false;
-  bool   _isComplete    = false;
-  bool   _hasError      = false;
-  bool   _hasNetwork    = true;
-  List<int> _uploadedBlocks = [];
-
-  StreamSubscription? _connectivitySub;
+  final _manager = _UploadManager();
+  final _store   = SessionStore();
+  late _UploadState _state;
+  StreamSubscription? _sub;
+  StreamSubscription? _connSub;
+  bool _hasNetwork = true;
 
   @override
   void initState() {
     super.initState();
-    _totalBlocks   = widget.session.blockCount;
-    _uploadedBlocks = List.from(widget.session.uploadedBlocks);
-    _currentBlock  = _uploadedBlocks.length;
-    _listenConnectivity();
-    _startUpload();
+    _state = _manager.current.totalBlocks > 0
+        ? _manager.current
+        : _UploadState(
+            totalBlocks:    widget.session.blockCount,
+            uploadedBlocks: List.from(widget.session.uploadedBlocks));
+
+    _sub = _manager.stream.listen((s) { if (mounted) setState(() => _state = s); });
+    _listenNetwork();
+
+    if (!_manager.isRunning) {
+      _manager.start(widget.session, _store);
+    }
   }
 
-  @override
-  void dispose() {
-    _connectivitySub?.cancel();
-    super.dispose();
-  }
-
-  void _listenConnectivity() {
-    _connectivitySub = Connectivity().onConnectivityChanged.listen((result) {
-      final hasNet = result != ConnectivityResult.none;
-      if (!hasNet && !_isPaused) {
-        _uploadService.pause();
-        setState(() {
-          _isPaused  = true;
-          _hasNetwork = false;
-          _statusText = 'No network — waiting for connection...';
-        });
-      } else if (hasNet && !_hasNetwork) {
-        setState(() => _hasNetwork = true);
-        _uploadService.resume();
-        setState(() {
-          _isPaused   = false;
-          _statusText = 'Reconnected — resuming upload...';
-        });
+  void _listenNetwork() {
+    _connSub = Connectivity().onConnectivityChanged.listen((r) {
+      final has = r != ConnectivityResult.none;
+      if (!has && _hasNetwork) {
+        _manager.pause();
+        if (mounted) setState(() => _hasNetwork = false);
+      } else if (has && !_hasNetwork) {
+        _manager.resume();
+        if (mounted) setState(() => _hasNetwork = true);
       }
     });
   }
 
-  Future<void> _startUpload() async {
-    if (_isUploading) return;
-    setState(() {
-      _isUploading = true;
-      _hasError    = false;
-      _statusText  = 'Starting upload...';
-    });
-
-    // Check backend reachability first
-    final reachable = await _uploadService.isBackendReachable();
-    if (!reachable) {
-      setState(() {
-        _isUploading = false;
-        _hasError    = true;
-        _statusText  = 'Cannot reach upload server. Check your internet connection.';
-      });
-      return;
-    }
-
-    await _store.updateStatus(widget.session.id, 'uploading');
-
-    try {
-      final uploaded = await _uploadService.uploadSession(
-        sessionId:       widget.session.id,
-        chunkPaths:      widget.session.localChunkPaths,
-        sessionTime:     widget.session.createdAt,
-        alreadyUploaded: _uploadedBlocks,
-        onProgress: (block, total, blockProg) {
-          if (mounted) setState(() {
-            _currentBlock  = block;
-            _totalBlocks   = total;
-            _blockProgress = blockProg;
-          });
-        },
-        onStatus: (status) {
-          if (mounted) setState(() => _statusText = status);
-        },
-      );
-
-      await _store.updateUploadedBlocks(widget.session.id, uploaded);
-
-      final isComplete = uploaded.length >= widget.session.blockCount;
-      setState(() {
-        _uploadedBlocks = uploaded;
-        _isUploading    = false;
-        _isComplete     = isComplete;
-        _statusText     = isComplete
-            ? 'Upload complete! All blocks synced to OneDrive.'
-            : 'Partial upload — ${widget.session.blockCount - uploaded.length} block(s) remaining.';
-      });
-    } catch (e) {
-      await _store.updateStatus(widget.session.id, 'pending');
-      if (mounted) setState(() {
-        _isUploading = false;
-        _hasError    = true;
-        _statusText  = 'Upload failed: ${e.toString()}';
-      });
-    }
-  }
-
-  void _togglePause() {
-    if (_isPaused) {
-      _uploadService.resume();
-      setState(() {
-        _isPaused   = false;
-        _statusText = 'Resuming...';
-      });
-    } else {
-      _uploadService.pause();
-      setState(() {
-        _isPaused   = true;
-        _statusText = 'Paused by user';
-      });
-    }
-  }
-
-  // Overall progress 0.0–1.0
-  double get _overallProgress {
-    if (_totalBlocks == 0) return 0.0;
-    final done = _uploadedBlocks.length.toDouble();
-    final curr = _isUploading && _currentBlock > 0
-        ? (_currentBlock - 1 + _blockProgress) / _totalBlocks
-        : done / _totalBlocks;
-    return curr.clamp(0.0, 1.0);
-  }
+  @override
+  void dispose() { _sub?.cancel(); _connSub?.cancel(); super.dispose(); }
 
   @override
   Widget build(BuildContext context) {
-    final pct = (_overallProgress * 100).toStringAsFixed(0);
+    final pct = (_state.overallProgress * 100).toStringAsFixed(0);
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0A0A0A),
+      backgroundColor: const Color(0xFFF4F6F8),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0A0A0A),
+        backgroundColor: Colors.white,
+        elevation: 0,
+        foregroundColor: const Color(0xFF1A1A1A),
         title: const Text('Uploading to OneDrive',
-            style: TextStyle(color: Colors.white, fontSize: 16)),
-        iconTheme: const IconThemeData(color: Colors.white),
-        leading: _isComplete
-            ? null
-            : IconButton(
-                icon: const Icon(Icons.arrow_back),
-                onPressed: () {
-                  _uploadService.pause();
-                  Navigator.pop(context);
-                },
-              ),
+            style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16,
+                color: Color(0xFF1A1A1A))),
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // ── Network banner ──────────────────────────────────────
-            if (!_hasNetwork)
-              Container(
+      // ── KEY FIX: SafeArea wraps entire body so nav bar never overlaps ──
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+
+              // Network warning
+              if (!_hasNetwork) Container(
                 width: double.infinity,
+                margin: const EdgeInsets.only(bottom: 14),
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                margin: const EdgeInsets.only(bottom: 20),
                 decoration: BoxDecoration(
-                  color: Colors.orange.withOpacity(0.15),
+                  color: Colors.orange.withOpacity(0.1),
                   borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.orange.shade700),
-                ),
-                child: Row(children: [
-                  const Icon(Icons.wifi_off, color: Colors.orange, size: 18),
-                  const SizedBox(width: 10),
-                  const Text('No internet — upload paused',
+                  border: Border.all(color: Colors.orange.shade400)),
+                child: const Row(children: [
+                  Icon(Icons.wifi_off, color: Colors.orange, size: 18),
+                  SizedBox(width: 10),
+                  Text('No network — upload paused',
                       style: TextStyle(color: Colors.orange, fontSize: 13)),
-                ]),
-              ),
+                ])),
 
-            // ── Session info ────────────────────────────────────────
-            Text('Session: ${widget.session.id.substring(0, 8).toUpperCase()}',
-                style: const TextStyle(color: Colors.white38, fontSize: 12)),
-            const SizedBox(height: 4),
-            Text('$_totalBlocks block${_totalBlocks != 1 ? 's' : ''} • '
-                '${(widget.session.durationSeconds / 60).toStringAsFixed(1)} min',
-                style: const TextStyle(color: Colors.white38, fontSize: 12)),
+              // Session info
+              Text('Session: ${widget.session.id.substring(0, 8).toUpperCase()}',
+                  style: const TextStyle(color: Color(0xFF888888), fontSize: 11)),
+              const SizedBox(height: 2),
+              Text('${_state.totalBlocks} block${_state.totalBlocks != 1 ? 's' : ''}'
+                  ' · ${(widget.session.durationSeconds / 60).toStringAsFixed(1)} min',
+                  style: const TextStyle(color: Color(0xFF888888), fontSize: 11)),
+              const SizedBox(height: 20),
 
-            const SizedBox(height: 32),
+              // Overall progress
+              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                const Text('Overall progress',
+                    style: TextStyle(color: Color(0xFF1A1A1A), fontSize: 14,
+                        fontWeight: FontWeight.w600)),
+                Text('$pct%', style: const TextStyle(
+                    color: Color(0xFF00C853), fontWeight: FontWeight.bold, fontSize: 14)),
+              ]),
+              const SizedBox(height: 8),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: LinearProgressIndicator(
+                  value: _state.overallProgress, minHeight: 10,
+                  backgroundColor: const Color(0xFFE8E8E8),
+                  valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF00C853)))),
+              const SizedBox(height: 20),
 
-            // ── Overall progress ────────────────────────────────────
-            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-              const Text('Overall progress',
-                  style: TextStyle(color: Colors.white70, fontSize: 14)),
-              Text('$pct%',
-                  style: const TextStyle(
-                      color: Color(0xFF00C853),
-                      fontWeight: FontWeight.bold,
-                      fontSize: 14)),
-            ]),
-            const SizedBox(height: 8),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(6),
-              child: LinearProgressIndicator(
-                value: _overallProgress,
-                minHeight: 10,
-                backgroundColor: Colors.white10,
-                valueColor: AlwaysStoppedAnimation<Color>(
-                  _isComplete ? const Color(0xFF00C853) : const Color(0xFF00C853),
-                ),
-              ),
-            ),
+              // Block list header
+              const Text('Blocks', style: TextStyle(
+                  color: Color(0xFF888888), fontSize: 12, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
 
-            const SizedBox(height: 28),
-
-            // ── Block list ──────────────────────────────────────────
-            const Text('Blocks', style: TextStyle(color: Colors.white54, fontSize: 13)),
-            const SizedBox(height: 10),
-            Expanded(
-              child: ListView.builder(
-                itemCount: _totalBlocks,
+              // Block list — Expanded so it fills remaining space
+              Expanded(child: ListView.builder(
+                itemCount: _state.totalBlocks,
                 itemBuilder: (ctx, i) {
-                  final isDone     = _uploadedBlocks.contains(i);
-                  final isCurrent  = _isUploading && (_currentBlock - 1) == i;
-                  final isPending  = !isDone && !isCurrent;
-
+                  final done    = _state.uploadedBlocks.contains(i);
+                  final current = !done && (_state.currentBlock - 1) == i &&
+                      !_state.isComplete && !_state.isError;
                   return Container(
                     margin: const EdgeInsets.only(bottom: 8),
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                     decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.05),
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(
-                        color: isCurrent
-                            ? const Color(0xFF00C853).withOpacity(0.5)
-                            : Colors.white10,
-                      ),
-                    ),
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: current
+                          ? const Color(0xFF00C853).withOpacity(0.5)
+                          : const Color(0xFFE8E8E8))),
                     child: Row(children: [
-                      // Block icon
-                      Container(
-                        width: 32, height: 32,
+                      // Icon
+                      Container(width: 32, height: 32,
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
-                          color: isDone
-                              ? const Color(0xFF00C853).withOpacity(0.15)
-                              : isCurrent
-                                  ? Colors.blue.withOpacity(0.15)
-                                  : Colors.white10,
-                        ),
-                        child: Center(
-                          child: isDone
-                              ? const Icon(Icons.check, color: Color(0xFF00C853), size: 16)
-                              : isCurrent
-                                  ? SizedBox(
-                                      width: 16, height: 16,
-                                      child: CircularProgressIndicator(
-                                        value: _blockProgress,
-                                        strokeWidth: 2,
-                                        color: Colors.blue,
-                                      ),
-                                    )
-                                  : Text('${i + 1}',
-                                      style: const TextStyle(
-                                          color: Colors.white38, fontSize: 12)),
-                        ),
-                      ),
+                          color: done
+                              ? const Color(0xFF00C853).withOpacity(0.1)
+                              : current ? Colors.blue.withOpacity(0.1)
+                              : const Color(0xFFF4F6F8)),
+                        child: Center(child: done
+                            ? const Icon(Icons.check, color: Color(0xFF00C853), size: 16)
+                            : current
+                                ? SizedBox(width: 16, height: 16,
+                                    child: CircularProgressIndicator(
+                                        value: _state.blockProgress > 0
+                                            ? _state.blockProgress : null,
+                                        strokeWidth: 2, color: Colors.blue))
+                                : Text('${i + 1}', style: const TextStyle(
+                                    color: Color(0xFF888888), fontSize: 12)))),
                       const SizedBox(width: 12),
-                      // Block label
-                      Expanded(
-                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                          Text('Block ${i + 1} of $_totalBlocks',
+                      // Labels
+                      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Block ${i + 1} of ${_state.totalBlocks}',
                               style: TextStyle(
-                                  color: isDone
-                                      ? Colors.white70
-                                      : isCurrent
-                                          ? Colors.white
-                                          : Colors.white38,
-                                  fontSize: 13,
-                                  fontWeight: isCurrent
-                                      ? FontWeight.w600
-                                      : FontWeight.normal)),
-                          if (isCurrent)
-                            Text('${(_blockProgress * 100).toStringAsFixed(0)}% uploaded',
-                                style: const TextStyle(color: Colors.blue, fontSize: 11)),
-                        ]),
-                      ),
+                                color: done || current
+                                    ? const Color(0xFF1A1A1A) : const Color(0xFFAAAAAA),
+                                fontSize: 13,
+                                fontWeight: current ? FontWeight.w600 : FontWeight.normal)),
+                          if (current) Text(
+                              '${(_state.blockProgress * 100).toStringAsFixed(0)}% uploaded',
+                              style: const TextStyle(color: Colors.blue, fontSize: 11)),
+                        ])),
                       // Status chip
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                         decoration: BoxDecoration(
-                          color: isDone
+                          color: done
                               ? const Color(0xFF00C853).withOpacity(0.1)
-                              : isCurrent
-                                  ? Colors.blue.withOpacity(0.1)
-                                  : Colors.white.withOpacity(0.05),
-                          borderRadius: BorderRadius.circular(20),
-                        ),
+                              : current ? Colors.blue.withOpacity(0.1)
+                              : const Color(0xFFF4F6F8),
+                          borderRadius: BorderRadius.circular(20)),
                         child: Text(
-                          isDone ? 'Synced' : isCurrent ? 'Uploading' : 'Pending',
-                          style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.w600,
-                              color: isDone
-                                  ? const Color(0xFF00C853)
-                                  : isCurrent
-                                      ? Colors.blue
-                                      : Colors.white30),
-                        ),
-                      ),
+                          done ? 'Synced' : current ? 'Uploading' : 'Pending',
+                          style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600,
+                            color: done ? const Color(0xFF00C853)
+                                : current ? Colors.blue : const Color(0xFFAAAAAA)))),
                     ]),
                   );
                 },
-              ),
-            ),
+              )),
 
-            const SizedBox(height: 16),
+              const SizedBox(height: 12),
 
-            // ── Status text ─────────────────────────────────────────
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: _isComplete
-                    ? const Color(0xFF00C853).withOpacity(0.08)
-                    : _hasError
-                        ? Colors.red.withOpacity(0.08)
-                        : Colors.white.withOpacity(0.05),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(
-                  color: _isComplete
-                      ? const Color(0xFF00C853).withOpacity(0.3)
-                      : _hasError
-                          ? Colors.red.withOpacity(0.3)
-                          : Colors.white10,
-                ),
-              ),
-              child: Text(_statusText,
-                  style: TextStyle(
-                      color: _isComplete
-                          ? const Color(0xFF00C853)
-                          : _hasError
-                              ? Colors.redAccent
-                              : Colors.white60,
-                      fontSize: 13)),
-            ),
-
-            const SizedBox(height: 16),
-
-            // ── Action buttons ──────────────────────────────────────
-            if (_isComplete)
-              SizedBox(
+              // Status text box
+              Container(
                 width: double.infinity,
-                child: ElevatedButton.icon(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: _state.isComplete
+                      ? const Color(0xFF00C853).withOpacity(0.08)
+                      : _state.isError ? Colors.red.withOpacity(0.08)
+                      : const Color(0xFFF4F6F8),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: _state.isComplete
+                      ? const Color(0xFF00C853).withOpacity(0.3)
+                      : _state.isError ? Colors.red.withOpacity(0.3)
+                      : const Color(0xFFE8E8E8))),
+                child: Text(_state.statusText.isEmpty ? 'Preparing...' : _state.statusText,
+                    style: TextStyle(fontSize: 13,
+                      color: _state.isComplete ? const Color(0xFF00C853)
+                          : _state.isError ? Colors.redAccent
+                          : const Color(0xFF555555)))),
+
+              const SizedBox(height: 12),
+
+              // Action button — always visible, never hidden by nav bar
+              if (_state.isComplete)
+                SizedBox(width: double.infinity, child: ElevatedButton.icon(
                   onPressed: () => Navigator.pop(context, true),
                   icon: const Icon(Icons.check_circle_outline),
                   label: const Text('Done'),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF00C853),
-                    foregroundColor: Colors.black,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 15),
                     shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12)),
-                  ),
-                ),
-              )
-            else if (_hasError)
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: _startUpload,
+                        borderRadius: BorderRadius.circular(12)))))
+              else if (_state.isError)
+                SizedBox(width: double.infinity, child: ElevatedButton.icon(
+                  onPressed: () => _manager.start(widget.session, _store),
                   icon: const Icon(Icons.refresh),
-                  label: const Text('Retry'),
+                  label: const Text('Retry Upload'),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.redAccent,
                     foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    padding: const EdgeInsets.symmetric(vertical: 15),
                     shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12)),
-                  ),
-                ),
-              )
-            else
-              Row(children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _hasNetwork ? _togglePause : null,
-                    icon: Icon(_isPaused ? Icons.play_arrow : Icons.pause),
-                    label: Text(_isPaused ? 'Resume' : 'Pause'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.white70,
-                      side: const BorderSide(color: Colors.white24),
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12)),
-                    ),
-                  ),
-                ),
-              ]),
-          ],
+                        borderRadius: BorderRadius.circular(12)))))
+              else
+                SizedBox(width: double.infinity, child: OutlinedButton.icon(
+                  onPressed: _hasNetwork
+                      ? () { _manager.isPaused ? _manager.resume() : _manager.pause();
+                             setState(() {}); }
+                      : null,
+                  icon: Icon(_manager.isPaused ? Icons.play_arrow : Icons.pause),
+                  label: Text(_manager.isPaused ? 'Resume Upload' : 'Pause Upload'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFF555555),
+                    side: const BorderSide(color: Color(0xFFCCCCCC)),
+                    padding: const EdgeInsets.symmetric(vertical: 15),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12))))),
+            ],
+          ),
         ),
       ),
     );
