@@ -5,6 +5,7 @@ import '../models/session_model.dart';
 import '../services/upload_service.dart';
 import '../services/session_store.dart';
 import '../services/notification_service.dart';
+import '../services/upload_resume_service.dart';
 
 // ── Singleton upload manager — survives navigation ────────────────────────────
 class _UploadManager {
@@ -12,8 +13,9 @@ class _UploadManager {
   factory _UploadManager() => _i;
   _UploadManager._();
 
-  final _service = UploadService();
-  final _notif   = NotificationService();
+  final _service  = UploadService();
+  final _notif    = NotificationService();
+  final _resume   = UploadResumeService();
   bool isRunning = false;
   String? activeSessionId;
 
@@ -36,6 +38,13 @@ class _UploadManager {
 
     await store.updateStatus(session.id, 'uploading');
 
+    // ── FIX 3: Persist upload state so it survives app kill ──────────────
+    await _resume.markUploading(
+      sessionId:     session.id,
+      totalBlocks:   session.blockCount,
+      uploadedBlocks: List.from(session.uploadedBlocks),
+    );
+
     try {
       final uploaded = await _service.uploadSession(
         sessionId:       session.id,
@@ -47,12 +56,16 @@ class _UploadManager {
           _notif.showUploadProgress(block: block, total: total, percentDone: pct);
           _emit(_state.copyWith(
               currentBlock: block, totalBlocks: total, blockProgress: prog));
+          // Update persisted state with latest completed blocks
+          _resume.updateProgress(session.id, _state.uploadedBlocks);
         },
         onStatus: (s) => _emit(_state.copyWith(statusText: s)),
       );
 
       await store.updateUploadedBlocks(session.id, uploaded);
       final done = uploaded.length >= session.blockCount;
+      // Clear persisted upload state now that we have a definitive result
+      await _resume.clearUpload();
       if (done) {
         _notif.showUploadComplete(session.blockCount);
       } else {
@@ -70,6 +83,7 @@ class _UploadManager {
       ));
     } catch (e) {
       await store.updateStatus(session.id, 'pending');
+      await _resume.clearUpload(); // clear so it doesn't keep showing as uploading
       _notif.showUploadFailed('Upload failed — tap to retry');
       _emit(_state.copyWith(isError: true, statusText: 'Upload failed: $e'));
     } finally {
@@ -132,6 +146,12 @@ class _UploadState {
 class UploadProgressScreen extends StatefulWidget {
   final SessionModel session;
   const UploadProgressScreen({super.key, required this.session});
+
+  // ── Public static accessors so HistoryScreen can listen ──────────────────
+  static Stream<_UploadState> get uploadStream => _UploadManager().stream;
+  static String? get activeSessionId => _UploadManager().activeSessionId;
+  static bool get isUploading => _UploadManager().isRunning;
+
   @override
   State<UploadProgressScreen> createState() => _UploadProgressScreenState();
 }

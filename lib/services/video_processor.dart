@@ -18,7 +18,7 @@ class VideoProcessor {
   final _attendance = AttendanceService();
   final _store      = SessionStore();
 
-  static const int blockSecs = 20 * 60;
+  static const int blockSecs = 5 * 60;  // 5 minutes per chunk
 
   void startBackgroundProcessing({
     required String rawVideoPath,

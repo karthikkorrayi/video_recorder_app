@@ -1,9 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:intl/intl.dart';
 import '../services/auth_service.dart';
-import '../services/attendance_service.dart';
 import '../services/session_store.dart';
 import '../services/user_service.dart';
+import '../models/session_model.dart';
 import 'camera_screen.dart';
 import 'history_screen.dart';
 
@@ -14,20 +15,6 @@ const _text    = Color(0xFF1A1A1A);
 const _textSub = Color(0xFF666666);
 const _border  = Color(0xFFE0E0E0);
 
-enum _AttFilter { today, yesterday, thisWeek, thisMonth, allTime }
-
-extension _Label on _AttFilter {
-  String get label {
-    switch (this) {
-      case _AttFilter.today:     return 'Today';
-      case _AttFilter.yesterday: return 'Yesterday';
-      case _AttFilter.thisWeek:  return 'This Week';
-      case _AttFilter.thisMonth: return 'This Month';
-      case _AttFilter.allTime:   return 'All Time';
-    }
-  }
-}
-
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
   @override
@@ -36,92 +23,136 @@ class DashboardScreen extends StatefulWidget {
 
 class _DashboardScreenState extends State<DashboardScreen> {
   final _auth       = AuthService();
-  final _attendance = AttendanceService();
   final _store      = SessionStore();
 
-  // Metrics
-  int _totalRecordings = 0; // local + synced
-  int _localCount      = 0;
-  int _syncedCount     = 0;
-  int _totalSecs       = 0; // sum of all session durations
-
-  // Attendance
-  List<AttendanceEntry> _allEntries      = [];
-  List<AttendanceEntry> _filteredEntries = [];
-  _AttFilter _filter    = _AttFilter.today;
-  bool _attExpanded     = false;
-
-  // Display name
+  // All raw data
+  List<SessionModel>    _allSessions = [];
   String _displayName = '';
+
+  // ── Selected date range — default is today ─────────────────────────────
+  late DateTime _rangeStart;
+  late DateTime _rangeEnd;
+  String _rangeLabel = 'Today';
 
   @override
   void initState() {
     super.initState();
+    // Default: today
+    final now = DateTime.now();
+    _rangeStart = DateTime(now.year, now.month, now.day);
+    _rangeEnd   = _rangeStart;
     _load();
   }
 
   Future<void> _load() async {
-    final user  = FirebaseAuth.instance.currentUser!;
-
-    // Load display name from Firestore
-    final name = await UserService().getDisplayName();
-
-    // Load all sessions from store (includes local + synced)
-    final allSessions = await _store.getAll();
-    final localSessions  = allSessions.where((s) => s.status != 'synced').toList();
-    final syncedSessions = allSessions.where((s) => s.status == 'synced').toList();
-    final totalSecs = allSessions.fold<int>(0, (sum, s) => sum + s.durationSeconds);
-
-    // Load attendance
-    final entries = await _attendance.getEntries();
-
+    final name       = await UserService().getDisplayName();
+    final sessions   = await _store.getAll();
     if (mounted) setState(() {
-      _displayName     = name;
-      _totalRecordings = allSessions.length;
-      _localCount      = localSessions.length;
-      _syncedCount     = syncedSessions.length;
-      _totalSecs       = totalSecs;
-      _allEntries      = entries;
-      _applyFilter();
+      _displayName = name;
+      _allSessions = sessions;
     });
   }
 
-  void _applyFilter() {
-    final now   = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
-
-    _filteredEntries = _allEntries.where((e) {
-      DateTime? d;
-      try { d = DateTime.parse(e.date); } catch (_) { return false; }
-      switch (_filter) {
-        case _AttFilter.today:
-          return d.isAtSameMomentAs(today) || (d.isAfter(today) && d.isBefore(today.add(const Duration(days: 1))));
-        case _AttFilter.yesterday:
-          final yest = today.subtract(const Duration(days: 1));
-          return d.isAtSameMomentAs(yest) || (d.isAfter(yest) && d.isBefore(today));
-        case _AttFilter.thisWeek:
-          final weekStart = today.subtract(Duration(days: today.weekday - 1));
-          return !d.isBefore(weekStart);
-        case _AttFilter.thisMonth:
-          return d.year == now.year && d.month == now.month;
-        case _AttFilter.allTime:
-          return true;
-      }
-    }).toList();
+  // ── Filtering helpers ───────────────────────────────────────────────────
+  bool _inRange(DateTime dt) {
+    final d = DateTime(dt.year, dt.month, dt.day);
+    return !d.isBefore(_rangeStart) && !d.isAfter(_rangeEnd);
   }
 
-  String _fmtSecs(int secs) {
+  List<SessionModel> get _filteredSessions =>
+      _allSessions.where((s) => _inRange(s.createdAt)).toList();
+
+
+  // Metrics for filtered range
+  int get _recordingCount  => _filteredSessions.length;
+  int get _localCount      => _filteredSessions.where((s) => s.status != 'synced').length;
+  int get _syncedCount     => _filteredSessions.where((s) => s.status == 'synced').length;
+  int get _totalSecs       => _filteredSessions.fold(0, (s, e) => s + e.durationSeconds);
+
+  String _fmt(int secs) {
     if (secs == 0) return '0s';
     if (secs < 60) return '${secs}s';
     final h = secs ~/ 3600;
     final m = (secs % 3600) ~/ 60;
     final s = secs % 60;
-    if (h > 0) return '${h}h ${m}m';
+    if (h > 0) return s > 0 ? '${h}h ${m}m' : '${h}h ${m}m';
     return s > 0 ? '${m}m ${s}s' : '${m}m';
   }
 
-  int get _filteredSessions => _filteredEntries.fold<int>(0, (s, e) => s + e.sessions);
-  int get _filteredSecs     => _filteredEntries.fold<int>(0, (s, e) => s + e.totalSeconds);
+  // ── Calendar picker ─────────────────────────────────────────────────────
+  Future<void> _openCalendar() async {
+    final now = DateTime.now();
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: now,
+      initialDateRange: DateTimeRange(start: _rangeStart, end: _rangeEnd),
+      builder: (ctx, child) => Theme(
+        data: Theme.of(ctx).copyWith(
+          colorScheme: const ColorScheme.light(primary: _green)),
+        child: child!),
+    );
+
+    if (picked != null) {
+      final s = picked.start;
+      final e = picked.end;
+      String label;
+      final today  = DateTime(now.year, now.month, now.day);
+      final yest   = today.subtract(const Duration(days: 1));
+      final startD = DateTime(s.year, s.month, s.day);
+      final endD   = DateTime(e.year, e.month, e.day);
+
+      if (startD == today && endD == today) {
+        label = 'Today';
+      } else if (startD == yest && endD == yest) {
+        label = 'Yesterday';
+      } else if (startD == endD) {
+        label = DateFormat('d MMM yyyy').format(s);
+      } else {
+        label = '${DateFormat('d MMM').format(s)} – ${DateFormat('d MMM yyyy').format(e)}';
+      }
+
+      setState(() {
+        _rangeStart = startD;
+        _rangeEnd   = endD;
+        _rangeLabel = label;
+      });
+    }
+  }
+
+  // Quick presets
+  void _setPreset(String preset) {
+    final now   = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    DateTime s, e;
+    switch (preset) {
+      case 'today':
+        s = today; e = today;
+        _rangeLabel = 'Today';
+        break;
+      case 'yesterday':
+        s = today.subtract(const Duration(days: 1));
+        e = s;
+        _rangeLabel = 'Yesterday';
+        break;
+      case 'week':
+        s = today.subtract(Duration(days: today.weekday - 1));
+        e = today;
+        _rangeLabel = 'This Week';
+        break;
+      case 'month':
+        s = DateTime(now.year, now.month, 1);
+        e = today;
+        _rangeLabel = 'This Month';
+        break;
+      case 'all':
+        s = DateTime(2020); e = today;
+        _rangeLabel = 'All Time';
+        break;
+      default: return;
+    }
+    setState(() { _rangeStart = s; _rangeEnd = e; });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -136,7 +167,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             padding: const EdgeInsets.all(18),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
 
-              // ── Header card ────────────────────────────────────────────
+              // ── Header ─────────────────────────────────────────────────
               Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(color: _card,
@@ -151,11 +182,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             fontWeight: FontWeight.w800)))),
                   const SizedBox(width: 12),
                   Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Text(
-                      _displayName.isEmpty ? 'Hello!' : 'Hello, $_displayName',
-                      style: const TextStyle(color: _text, fontSize: 18,
-                          fontWeight: FontWeight.w700),
-                    ),
+                    Text(_displayName.isEmpty ? 'Hello!' : 'Hello, $_displayName',
+                        style: const TextStyle(color: _text, fontSize: 18,
+                            fontWeight: FontWeight.w700)),
                     const Text('Omni Trade Networks',
                         style: TextStyle(color: _textSub, fontSize: 12)),
                   ])),
@@ -164,14 +193,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     onPressed: () async {
                       UserService().clearCache();
                       await _auth.signOut();
-                    },
-                  ),
+                    }),
                 ]),
               ),
 
               const SizedBox(height: 14),
 
-              // ── Start Recording button ─────────────────────────────────
+              // ── Start Recording ─────────────────────────────────────────
               GestureDetector(
                 onTap: () async {
                   await Navigator.push(context,
@@ -184,17 +212,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   decoration: BoxDecoration(
                     color: Colors.black,
                     borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: _green.withValues(alpha: 0.6), width: 1.5),
-                  ),
-                  child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    Container(width: 48, height: 48,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        border: Border.all(color: _green, width: 2),
-                      ),
-                      child: const Icon(Icons.videocam, color: _green, size: 24)),
-                    const SizedBox(width: 14),
-                    const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    border: Border.all(color: _green.withValues(alpha: 0.6), width: 1.5)),
+                  child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    CircleAvatar(backgroundColor: Colors.transparent,
+                      child: Icon(Icons.videocam, color: _green, size: 28)),
+                    SizedBox(width: 14),
+                    Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                       Text('Start Recording',
                           style: TextStyle(color: Colors.white, fontSize: 18,
                               fontWeight: FontWeight.w700)),
@@ -205,31 +228,83 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 ),
               ),
 
-              const SizedBox(height: 14),
+              const SizedBox(height: 16),
 
-              // ── Metrics row: Total | Local | Synced ───────────────────
+              // ── Date filter row ─────────────────────────────────────────
+              // Calendar icon + range label + quick presets
+              Container(
+                padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
+                decoration: BoxDecoration(color: _card,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: _border)),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: [
+                    // Calendar icon button
+                    GestureDetector(
+                      onTap: _openCalendar,
+                      child: Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: _green.withValues(alpha: 0.1),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: _green.withValues(alpha: 0.3))),
+                        child: const Icon(Icons.calendar_month,
+                            color: _green, size: 20)),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(child: GestureDetector(
+                      onTap: _openCalendar,
+                      child: Text(_rangeLabel,
+                          style: const TextStyle(color: _text, fontSize: 15,
+                              fontWeight: FontWeight.w700)),
+                    )),
+                    // Edit icon hint
+                    GestureDetector(
+                      onTap: _openCalendar,
+                      child: const Icon(Icons.edit_calendar_outlined,
+                          color: _textSub, size: 18)),
+                  ]),
+                  const SizedBox(height: 10),
+                  // Quick preset chips
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(children: [
+                      _Preset('Today',     () => _setPreset('today'),     _rangeLabel == 'Today'),
+                      _Preset('Yesterday', () => _setPreset('yesterday'), _rangeLabel == 'Yesterday'),
+                      _Preset('This Week', () => _setPreset('week'),      _rangeLabel == 'This Week'),
+                      _Preset('This Month',() => _setPreset('month'),     _rangeLabel == 'This Month'),
+                      _Preset('All Time',  () => _setPreset('all'),       _rangeLabel == 'All Time'),
+                    ]),
+                  ),
+                ]),
+              ),
+
+              const SizedBox(height: 12),
+
+              // ── Metrics (filtered by date range) ───────────────────────
               Row(children: [
                 _StatCard(
                   label: 'Recordings',
-                  value: '$_totalRecordings',
+                  value: '$_recordingCount',
+                  sub: _fmt(_totalSecs),
                   icon: Icons.video_library_outlined,
                   color: _green,
                 ),
                 const SizedBox(width: 10),
                 _StatCard(
                   label: 'Total Time',
-                  value: _fmtSecs(_totalSecs),
+                  value: _fmt(_totalSecs),
+                  sub: '$_recordingCount recording${_recordingCount != 1 ? 's' : ''}',
                   icon: Icons.timer_outlined,
                   color: Colors.blue,
                 ),
               ]),
-
               const SizedBox(height: 10),
-
               Row(children: [
                 _StatCard(
                   label: 'Local',
                   value: '$_localCount',
+                  sub: 'not yet uploaded',
                   icon: Icons.phone_android,
                   color: Colors.orange,
                 ),
@@ -237,6 +312,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 _StatCard(
                   label: 'Synced',
                   value: '$_syncedCount',
+                  sub: 'on OneDrive',
                   icon: Icons.cloud_done_outlined,
                   color: _green,
                 ),
@@ -244,7 +320,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
               const SizedBox(height: 14),
 
-              // ── My Recordings link ─────────────────────────────────────
+              // ── My Recordings link ──────────────────────────────────────
               GestureDetector(
                 onTap: () async {
                   await Navigator.push(context,
@@ -262,94 +338,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     const Expanded(child: Text('My Recordings',
                         style: TextStyle(color: _text, fontSize: 15,
                             fontWeight: FontWeight.w600))),
-                    Text('$_totalRecordings video${_totalRecordings != 1 ? 's' : ''}',
+                    Text('$_recordingCount video${_recordingCount != 1 ? 's' : ''}',
                         style: const TextStyle(color: _textSub, fontSize: 13)),
                     const SizedBox(width: 6),
                     const Icon(Icons.chevron_right, color: _textSub, size: 18),
                   ]),
                 ),
-              ),
-
-              const SizedBox(height: 14),
-
-              // ── Attendance card ────────────────────────────────────────
-              Container(
-                decoration: BoxDecoration(color: _card,
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: _border)),
-                child: Column(children: [
-                  // Header row
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 14, 12, 14),
-                    child: Row(children: [
-                      const Icon(Icons.calendar_month, color: _green, size: 20),
-                      const SizedBox(width: 10),
-                      const Text('Daily Record',
-                          style: TextStyle(color: _text, fontSize: 15,
-                              fontWeight: FontWeight.w600)),
-                      const Spacer(),
-                      // Filter dropdown
-                      GestureDetector(
-                        onTap: _showFilterSheet,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                          decoration: BoxDecoration(
-                            color: _green.withValues(alpha: 0.1),
-                            borderRadius: BorderRadius.circular(20),
-                            border: Border.all(color: _green.withValues(alpha: 0.4))),
-                          child: Row(mainAxisSize: MainAxisSize.min, children: [
-                            Text(_filter.label,
-                                style: const TextStyle(color: _green, fontSize: 12,
-                                    fontWeight: FontWeight.w600)),
-                            const SizedBox(width: 4),
-                            const Icon(Icons.keyboard_arrow_down, color: _green, size: 16),
-                          ]),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      GestureDetector(
-                        onTap: () => setState(() => _attExpanded = !_attExpanded),
-                        child: Icon(_attExpanded
-                            ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
-                            color: _textSub, size: 22)),
-                    ]),
-                  ),
-
-                  // Summary chips
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
-                    child: Row(children: [
-                      _Chip(Icons.repeat, '$_filteredSessions session${_filteredSessions != 1 ? 's' : ''}'),
-                      const SizedBox(width: 8),
-                      _Chip(Icons.timer, _fmtSecs(_filteredSecs)),
-                    ]),
-                  ),
-
-                  // Expanded day entries
-                  if (_attExpanded && _filteredEntries.isNotEmpty) ...[
-                    const Divider(height: 1, color: _border),
-                    ..._filteredEntries.map((e) => Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                      child: Row(children: [
-                        Text(e.date, style: const TextStyle(
-                            color: _text, fontSize: 13, fontWeight: FontWeight.w600)),
-                        const Spacer(),
-                        Text('${e.sessions} session${e.sessions != 1 ? 's' : ''}',
-                            style: const TextStyle(color: _textSub, fontSize: 12)),
-                        const SizedBox(width: 12),
-                        Text(_fmtSecs(e.totalSeconds),
-                            style: const TextStyle(color: _green, fontSize: 13,
-                                fontWeight: FontWeight.w600)),
-                      ]),
-                    )),
-                    const SizedBox(height: 4),
-                  ],
-                  if (_attExpanded && _filteredEntries.isEmpty)
-                    const Padding(
-                      padding: EdgeInsets.fromLTRB(16, 0, 16, 14),
-                      child: Text('No records for this period',
-                          style: TextStyle(color: _textSub, fontSize: 13))),
-                ]),
               ),
 
               const SizedBox(height: 24),
@@ -359,39 +353,41 @@ class _DashboardScreenState extends State<DashboardScreen> {
       ),
     );
   }
-
-  void _showFilterSheet() {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: _card,
-      shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (_) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 16),
-        child: Column(mainAxisSize: MainAxisSize.min,
-          children: _AttFilter.values.map((f) => ListTile(
-            leading: Icon(f == _filter ? Icons.radio_button_checked : Icons.radio_button_off,
-                color: f == _filter ? _green : _textSub),
-            title: Text(f.label,
-                style: TextStyle(
-                    color: f == _filter ? _green : _text,
-                    fontWeight: f == _filter ? FontWeight.w700 : FontWeight.w400)),
-            onTap: () {
-              setState(() { _filter = f; _applyFilter(); });
-              Navigator.pop(context);
-            },
-          )).toList()),
-      ),
-    );
-  }
 }
 
+// ── Preset chip ───────────────────────────────────────────────────────────────
+class _Preset extends StatelessWidget {
+  final String label;
+  final VoidCallback onTap;
+  final bool active;
+  const _Preset(this.label, this.onTap, this.active);
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+    onTap: onTap,
+    child: Container(
+      margin: const EdgeInsets.only(right: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+      decoration: BoxDecoration(
+        color: active ? _green : _surface,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: active ? _green : _border)),
+      child: Text(label,
+          style: TextStyle(
+              fontSize: 12, fontWeight: FontWeight.w600,
+              color: active ? Colors.white : _textSub)),
+    ),
+  );
+}
+
+// ── Stat card ─────────────────────────────────────────────────────────────────
 class _StatCard extends StatelessWidget {
   final String label, value;
+  final String? sub;
   final IconData icon;
   final Color color;
   const _StatCard({required this.label, required this.value,
-      required this.icon, required this.color});
+      required this.icon, required this.color, this.sub});
 
   @override
   Widget build(BuildContext context) => Expanded(child: Container(
@@ -400,33 +396,18 @@ class _StatCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(14),
         border: Border.all(color: _border)),
     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Icon(icon, color: color, size: 24),
+      Icon(icon, color: color, size: 22),
       const SizedBox(height: 8),
       Text(value, style: TextStyle(color: color, fontSize: 22,
           fontWeight: FontWeight.bold)),
       const SizedBox(height: 2),
-      Text(label, style: const TextStyle(color: _textSub, fontSize: 11)),
+      Text(label, style: const TextStyle(color: _textSub, fontSize: 11,
+          fontWeight: FontWeight.w600)),
+      if (sub != null) ...[
+        const SizedBox(height: 2),
+        Text(sub!, style: const TextStyle(color: _textSub, fontSize: 10),
+            overflow: TextOverflow.ellipsis),
+      ],
     ]),
   ));
-}
-
-class _Chip extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  const _Chip(this.icon, this.label);
-
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-    decoration: BoxDecoration(
-      color: _green.withValues(alpha: 0.08),
-      borderRadius: BorderRadius.circular(20),
-      border: Border.all(color: _green.withValues(alpha: 0.25))),
-    child: Row(mainAxisSize: MainAxisSize.min, children: [
-      Icon(icon, color: _green, size: 14),
-      const SizedBox(width: 6),
-      Text(label, style: const TextStyle(color: _green, fontSize: 12,
-          fontWeight: FontWeight.w600)),
-    ]),
-  );
 }

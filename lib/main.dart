@@ -6,6 +6,9 @@ import 'screens/login_screen.dart';
 import 'screens/dashboard_screen.dart';
 import 'services/local_video_storage.dart';
 import 'services/notification_service.dart';
+import 'services/upload_resume_service.dart';
+import 'services/session_store.dart';
+import 'screens/upload_progress_screen.dart';
 
 const kGreen     = Color(0xFF00C853);
 const kGreenDark = Color(0xFF00A045);
@@ -48,6 +51,30 @@ void main() async {
     await NotificationService().init();
   } catch (e) {
     debugPrint('=== NotificationService init failed: $e');
+  }
+
+  // ── Fix 3: Check for interrupted upload and auto-resume ──────────────────
+  try {
+    final pending = await UploadResumeService().getPendingUpload();
+    if (pending != null && pending.isIncomplete) {
+      debugPrint('=== Found interrupted upload: ${pending.sessionId} '
+          '(${pending.completedBlocks}/${pending.totalBlocks} done)');
+      // Mark the session back to partial/pending so user sees the Upload button
+      final store = SessionStore();
+      final session = await store.getById(pending.sessionId);
+      if (session != null && session.status == 'uploading') {
+        // Update to partial if some blocks done, else pending
+        final newStatus = pending.completedBlocks > 0 ? 'partial' : 'pending';
+        session.uploadedBlocks = pending.uploadedBlocks;
+        session.status = newStatus;
+        await store.save(session);
+        debugPrint('=== Reset interrupted upload to $newStatus');
+      }
+      // Clear the stale resume marker
+      await UploadResumeService().clearUpload();
+    }
+  } catch (e) {
+    debugPrint('=== Upload resume check failed: $e');
   }
 
   try {
