@@ -11,7 +11,7 @@ typedef ProgressCallback = void Function(int blockIndex, int totalBlocks, double
 typedef StatusCallback   = void Function(String status);
 
 class UploadService {
-  static const String _backendUrl = 'https://otn-upload-backend.onrender.com';
+  static const String _backendUrl = 'https://video-recorder-app-d7zk.onrender.com';
 
   final Dio _dio = Dio(BaseOptions(
     connectTimeout: const Duration(seconds: 60),
