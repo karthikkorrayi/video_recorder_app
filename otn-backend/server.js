@@ -1,193 +1,185 @@
-const express = require('express');
-const multer  = require('multer');
-const axios   = require('axios');
-const fs      = require('fs');
+const express  = require('express');
+const multer   = require('multer');
+const axios    = require('axios');
+const fs       = require('fs');
+const path     = require('path');
+const { spawn } = require('child_process');
 
 const app    = express();
-const upload = multer({
-  dest: '/tmp/uploads/',
-  limits: { fileSize: 4 * 1024 * 1024 * 1024 }, // 4GB max
-});
+const upload = multer({ dest: '/tmp/uploads/', limits: { fileSize: 4 * 1024 * 1024 * 1024 } });
 
-// ── CONFIG ────────────────────────────────────────────────────────────────────
 const CONFIG = {
   clientId:     process.env.MS_CLIENT_ID,
   clientSecret: process.env.MS_CLIENT_SECRET,
   refreshToken: process.env.MS_REFRESH_TOKEN,
   rootFolder:   process.env.ONEDRIVE_ROOT_FOLDER || 'OTN Recorder',
 };
-
 if (!CONFIG.clientId || !CONFIG.clientSecret || !CONFIG.refreshToken) {
-  console.error('ERROR: Missing env vars');
-  process.exit(1);
+  console.error('ERROR: Missing env vars'); process.exit(1);
 }
 
-let cachedToken         = null;
-let tokenExpiresAt      = 0;
-let currentRefreshToken = CONFIG.refreshToken;
+// session tracker: key=sessionName → {dateFolder,userFolder,totalChunks,chunks:[]}
+const sessions = new Map();
+let cachedToken = null, tokenExpiresAt = 0, currentRefreshToken = CONFIG.refreshToken;
 
-// ── TOKEN ─────────────────────────────────────────────────────────────────────
-async function getAccessToken() {
+async function getToken() {
   if (cachedToken && Date.now() < tokenExpiresAt - 60000) return cachedToken;
   const res = await axios.post(
     'https://login.microsoftonline.com/common/oauth2/v2.0/token',
-    new URLSearchParams({
-      client_id:     CONFIG.clientId,
-      client_secret: CONFIG.clientSecret,
-      refresh_token: currentRefreshToken,
-      grant_type:    'refresh_token',
-      scope:         'Files.ReadWrite offline_access User.Read',
-    }).toString(),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-  );
-  cachedToken         = res.data.access_token;
-  tokenExpiresAt      = Date.now() + res.data.expires_in * 1000;
+    new URLSearchParams({ client_id: CONFIG.clientId, client_secret: CONFIG.clientSecret,
+      refresh_token: currentRefreshToken, grant_type: 'refresh_token',
+      scope: 'Files.ReadWrite offline_access User.Read' }).toString(),
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+  cachedToken = res.data.access_token;
+  tokenExpiresAt = Date.now() + res.data.expires_in * 1000;
   if (res.data.refresh_token) currentRefreshToken = res.data.refresh_token;
-  console.log('✓ Token refreshed');
   return cachedToken;
 }
 
-// ── FOLDER HELPERS ────────────────────────────────────────────────────────────
-async function ensureFolder(token, parentId, folderName) {
+async function ensureFolder(token, parentId, name) {
   const base = 'https://graph.microsoft.com/v1.0/me/drive';
   try {
-    const res = await axios.get(
-      `${base}/items/${parentId}/children?$filter=name eq '${encodeURIComponent(folderName)}'&$select=id,name`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    if (res.data.value?.length > 0) return res.data.value[0].id;
+    const r = await axios.get(`${base}/items/${parentId}/children?$filter=name eq '${encodeURIComponent(name)}'&$select=id`,
+      { headers: { Authorization: `Bearer ${token}` } });
+    if (r.data.value?.length > 0) return r.data.value[0].id;
   } catch (_) {}
-  const res = await axios.post(
-    `${base}/items/${parentId}/children`,
-    { name: folderName, folder: {}, '@microsoft.graph.conflictBehavior': 'rename' },
-    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
-  );
-  return res.data.id;
+  const r = await axios.post(`${base}/items/${parentId}/children`,
+    { name, folder: {}, '@microsoft.graph.conflictBehavior': 'rename' },
+    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
+  return r.data.id;
 }
 
-async function getRootFolderId(token) {
+async function getRootId(token) {
   const base = 'https://graph.microsoft.com/v1.0/me/drive';
   try {
-    const res = await axios.get(
-      `${base}/root/children?$filter=name eq '${encodeURIComponent(CONFIG.rootFolder)}'&$select=id,name`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    if (res.data.value?.length > 0) return res.data.value[0].id;
+    const r = await axios.get(`${base}/root/children?$filter=name eq '${encodeURIComponent(CONFIG.rootFolder)}'&$select=id`,
+      { headers: { Authorization: `Bearer ${token}` } });
+    if (r.data.value?.length > 0) return r.data.value[0].id;
   } catch (_) {}
-  const res = await axios.post(
-    `${base}/root/children`,
+  const r = await axios.post(`${base}/root/children`,
     { name: CONFIG.rootFolder, folder: {}, '@microsoft.graph.conflictBehavior': 'rename' },
-    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
-  );
-  return res.data.id;
+    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
+  return r.data.id;
 }
 
-// ── STREAMING UPLOAD ──────────────────────────────────────────────────────────
-// Streams file in 20MB slices — peak RAM = 20MB regardless of file size.
-// Phone already merged chunks before sending, so this receives one clean file.
-const CHUNK_SIZE = 20 * 1024 * 1024;
-
-async function uploadFileStreaming(token, parentId, fileName, filePath, fileSize) {
+const CHUNK = 20 * 1024 * 1024;
+async function uploadStream(token, parentId, fileName, filePath, fileSize) {
   const base = 'https://graph.microsoft.com/v1.0/me/drive';
-  console.log(`  Uploading: ${fileName} (${(fileSize/1024/1024).toFixed(1)}MB)`);
-
-  const sessionRes = await axios.post(
-    `${base}/items/${parentId}:/${encodeURIComponent(fileName)}:/createUploadSession`,
+  const sess = await axios.post(`${base}/items/${parentId}:/${encodeURIComponent(fileName)}:/createUploadSession`,
     { item: { '@microsoft.graph.conflictBehavior': 'replace', name: fileName } },
-    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
-  );
-  const uploadUrl   = sessionRes.data.uploadUrl;
-  let   offset      = 0;
-  let   chunkNum    = 0;
-  const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
-
+    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
+  const url = sess.data.uploadUrl;
+  let offset = 0;
   while (offset < fileSize) {
-    const chunkEnd  = Math.min(offset + CHUNK_SIZE, fileSize);
-    const chunkSize = chunkEnd - offset;
-    chunkNum++;
-
-    const chunk = await readChunk(filePath, offset, chunkSize);
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    const end = Math.min(offset + CHUNK, fileSize);
+    const buf = await readChunk(filePath, offset, end - offset);
+    for (let a = 1; a <= 3; a++) {
       try {
-        await axios.put(uploadUrl, chunk, {
-          headers: {
-            'Content-Range':  `bytes ${offset}-${chunkEnd - 1}/${fileSize}`,
-            'Content-Length': chunkSize,
-            'Content-Type':   'application/octet-stream',
-          },
-          maxBodyLength:    Infinity,
-          maxContentLength: Infinity,
-          timeout:          300000,
-        });
+        await axios.put(url, buf, { headers: {
+          'Content-Range': `bytes ${offset}-${end-1}/${fileSize}`,
+          'Content-Length': end - offset, 'Content-Type': 'application/octet-stream'
+        }, maxBodyLength: Infinity, maxContentLength: Infinity, timeout: 300000 });
         break;
-      } catch (err) {
-        if (attempt === 3) throw err;
-        await sleep(3000 * attempt);
-      }
+      } catch (e) { if (a === 3) throw e; await sleep(3000 * a); }
     }
-
-    offset = chunkEnd;
-    const pct = Math.round((offset / fileSize) * 100);
-    if (chunkNum % 3 === 0 || pct === 100) {
-      console.log(`  ${pct}% (chunk ${chunkNum}/${totalChunks})`);
-    }
+    offset = end;
+    const pct = Math.round(offset / fileSize * 100);
+    if (pct % 20 === 0) console.log(`  ${pct}%`);
   }
-  console.log(`  ✓ Done: ${fileName}`);
 }
 
-function readChunk(filePath, position, length) {
-  return new Promise((resolve, reject) => {
+function readChunk(filePath, pos, len) {
+  return new Promise((res, rej) => {
     const chunks = [];
-    const stream = fs.createReadStream(filePath, { start: position, end: position + length - 1 });
-    stream.on('data', c => chunks.push(c));
-    stream.on('end',  ()  => resolve(Buffer.concat(chunks)));
-    stream.on('error', e  => reject(e));
+    fs.createReadStream(filePath, { start: pos, end: pos + len - 1 })
+      .on('data', c => chunks.push(c)).on('end', () => res(Buffer.concat(chunks))).on('error', rej);
   });
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── ROUTES ────────────────────────────────────────────────────────────────────
-app.get('/',       (_, res) => res.json({ service: 'OTN Upload Backend', status: 'ok' }));
-app.get('/health', (_, res) => res.json({ status: 'ok', service: 'OTN Upload Backend' }));
+// FFmpeg merge — lossless concat
+function mergeChunks(paths, output) {
+  return new Promise((res, rej) => {
+    const list = output + '.txt';
+    fs.writeFileSync(list, paths.map(p => `file '${p}'`).join('\n'));
+    const proc = spawn('ffmpeg', ['-f','concat','-safe','0','-i',list,'-c','copy','-movflags','+faststart','-y',output]);
+    let err = '';
+    proc.stderr.on('data', d => err += d);
+    proc.on('close', code => {
+      try { fs.unlinkSync(list); } catch (_) {}
+      code === 0 ? res() : rej(new Error(`FFmpeg failed: ${err.slice(-300)}`));
+    });
+    proc.on('error', e => rej(new Error(`FFmpeg not found: ${e.message}`)));
+  });
+}
+
+async function processSession(key, s) {
+  s.chunks.sort((a, b) => a.index - b.index);
+  const mergedPath = `/tmp/merged_${Date.now()}_${s.sessionName}.mp4`;
+  const chunkPaths = s.chunks.map(c => c.path);
+  console.log(`\n▶ Merging ${s.chunks.length} chunks → ${s.sessionName}.mp4`);
+  try {
+    if (s.chunks.length > 1) {
+      await mergeChunks(chunkPaths, mergedPath);
+    } else {
+      fs.copyFileSync(chunkPaths[0], mergedPath);
+    }
+    const size = fs.statSync(mergedPath).size;
+    console.log(`  Merged: ${(size/1024/1024).toFixed(1)}MB`);
+
+    const token  = await getToken();
+    const rootId = await getRootId(token);
+    const dateId = await ensureFolder(token, rootId, s.dateFolder);
+    const userId = await ensureFolder(token, dateId, s.userFolder);
+
+    // Upload as clean session name (no chunk suffix)
+    const finalName = `${s.sessionName}.mp4`;
+    await uploadStream(token, userId, finalName, mergedPath, size);
+    console.log(`✓ ${CONFIG.rootFolder}/${s.dateFolder}/${s.userFolder}/${finalName}`);
+
+    for (const p of chunkPaths) try { fs.unlinkSync(p); } catch (_) {}
+    try { fs.unlinkSync(mergedPath); } catch (_) {}
+    sessions.delete(key);
+  } catch (e) {
+    console.error('✗ processSession error:', e.message);
+    for (const p of chunkPaths) try { fs.unlinkSync(p); } catch (_) {}
+    try { if (fs.existsSync(mergedPath)) fs.unlinkSync(mergedPath); } catch (_) {}
+    sessions.delete(key);
+  }
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+app.get('/',       (_, r) => r.json({ service: 'OTN Upload Backend', status: 'ok' }));
+app.get('/health', (_, r) => r.json({ status: 'ok' }));
 
 app.post('/upload', upload.single('video'), async (req, res) => {
-  const { dateFolder, userFolder, fileName } = req.body;
-
+  const { dateFolder, userFolder, fileName, sessionName, totalChunks, chunkIndex } = req.body;
   if (!req.file || !dateFolder || !userFolder || !fileName) {
     return res.status(400).json({ error: 'Missing fields' });
   }
 
-  const filePath = req.file.path;
-  const fileSize = req.file.size;
+  const total = parseInt(totalChunks, 10) || 1;
+  const index = parseInt(chunkIndex, 10)  || 1;
+  const sName = sessionName || fileName.replace(/\.mp4$/, '');
+  const key   = `${dateFolder}/${userFolder}/${sName}`;
 
-  console.log(`\n→ ${dateFolder}/${userFolder}/${fileName} (${(fileSize/1024/1024).toFixed(1)}MB)`);
+  console.log(`→ chunk ${index}/${total}: ${fileName} (${(req.file.size/1024/1024).toFixed(1)}MB)`);
 
-  try {
-    const token  = await getAccessToken();
-    const rootId = await getRootFolderId(token);
-    const dateId = await ensureFolder(token, rootId, dateFolder);
-    const userId = await ensureFolder(token, dateId, userFolder);
+  // Respond immediately
+  res.json({ success: true, received: index, total, pending: index < total });
 
-    await uploadFileStreaming(token, userId, fileName, filePath, fileSize);
+  // Register chunk
+  if (!sessions.has(key)) {
+    sessions.set(key, { dateFolder, userFolder, sessionName: sName, total, chunks: [] });
+  }
+  sessions.get(key).chunks.push({ index, path: req.file.path });
 
-    try { fs.unlinkSync(filePath); } catch (_) {}
-
-    const filePath2 = `${CONFIG.rootFolder}/${dateFolder}/${userFolder}/${fileName}`;
-    console.log(`✓ ${filePath2}\n`);
-    res.json({ success: true, path: filePath2 });
-
-  } catch (err) {
-    try { fs.unlinkSync(filePath); } catch (_) {}
-    const detail = err.response?.data || err.message;
-    console.error('✗ Error:', detail);
-    res.status(500).json({ error: 'Upload failed', detail: String(detail) });
+  // When all chunks received — merge and upload
+  if (sessions.get(key).chunks.length >= total) {
+    setImmediate(() => processSession(key, sessions.get(key)));
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`OTN Upload Backend on port ${PORT}`);
-  console.log(`Mode: phone-side merge → single file upload`);
-});
+app.listen(PORT, () => console.log(`OTN Backend on port ${PORT} | chunk→merge→OneDrive mode`));

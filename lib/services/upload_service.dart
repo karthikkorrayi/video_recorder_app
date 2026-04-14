@@ -1,21 +1,25 @@
 import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:intl/intl.dart';
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'user_service.dart';
+import 'video_processor.dart';
+import 'notification_service.dart';
 
 enum UploadBlockResult { success, failed, cancelled }
 
 typedef ProgressCallback = void Function(int blockIndex, int totalBlocks, double blockProgress);
 typedef StatusCallback   = void Function(String status);
+// NEW: overall percent callback for history screen inline progress
+typedef OverallProgressCallback = void Function(double percent);
 
 class UploadService {
   static const String _backendUrl = 'https://video-recorder-app-d7zk.onrender.com';
 
+  final _notif = NotificationService();
+
   final Dio _dio = Dio(BaseOptions(
     connectTimeout: const Duration(seconds: 60),
-    receiveTimeout: const Duration(minutes: 30), // large merged file needs time
+    receiveTimeout: const Duration(minutes: 30),
     sendTimeout:    const Duration(minutes: 30),
   ));
 
@@ -30,201 +34,158 @@ class UploadService {
 
   Future<List<int>> uploadSession({
     required String sessionId,
-    required List<String> chunkPaths,
+    required List<String> chunkPaths, // single file path locally
     required DateTime sessionTime,
     required List<int> alreadyUploaded,
     required ProgressCallback onProgress,
     required StatusCallback onStatus,
+    OverallProgressCallback? onOverallProgress,
   }) async {
     _cancelled = false;
     _paused    = false;
 
     final dateFolder = DateFormat('dd-MM-yyyy').format(sessionTime);
     final userFolder = await UserService().getDisplayName();
+    final localFile  = chunkPaths.first; // always 1 file locally
 
-    // ── Single chunk — upload directly, no merge needed ──────────────────
-    if (chunkPaths.length == 1) {
-      final file = File(chunkPaths[0]);
-      if (!await file.exists()) {
-        onStatus('File not found');
-        return alreadyUploaded;
+    if (!await File(localFile).exists()) {
+      onStatus('File not found');
+      return alreadyUploaded;
+    }
+
+    // ── Step 1: Split local file into 5-min upload chunks ─────────────────
+    onStatus('Preparing upload chunks...');
+    onOverallProgress?.call(0.02);
+
+    List<String> uploadChunks;
+    try {
+      uploadChunks = await VideoProcessor().splitForUpload(localFile, sessionTime);
+    } catch (e) {
+      onStatus('Split failed: $e');
+      return alreadyUploaded;
+    }
+
+    if (uploadChunks.isEmpty) {
+      onStatus('No chunks created');
+      return alreadyUploaded;
+    }
+
+    final total       = uploadChunks.length;
+    final sessionName = localFile.split('/').last.replaceAll('.mp4', '');
+
+    print('=== UploadService: $total chunk(s) → $dateFolder/$userFolder');
+
+    // ── Step 2: Upload each chunk ──────────────────────────────────────────
+    int successCount = 0;
+
+    for (int i = 0; i < total; i++) {
+      if (_cancelled) break;
+
+      while (_paused && !_cancelled) {
+        onStatus('Paused — tap Resume to continue');
+        await Future.delayed(const Duration(seconds: 2));
       }
+      if (_cancelled) break;
 
-      // Clean filename: remove block suffix for single-block sessions
-      final rawName   = chunkPaths[0].split('/').last;
-      final cleanName = rawName.replaceAll(RegExp(r'_block01of01\.mp4$'), '.mp4');
+      final chunkPath = uploadChunks[i];
+      final chunkFile = File(chunkPath);
+      if (!await chunkFile.exists()) { successCount++; continue; }
 
-      onStatus('Uploading...');
-      final result = await _uploadSingleFile(
-        filePath:   chunkPaths[0],
-        fileName:   cleanName,
-        dateFolder: dateFolder,
-        userFolder: userFolder,
-        onProgress: (p) => onProgress(1, 1, p),
-      );
+      final chunkName = chunkPath.split('/').last;
+      onStatus('Uploading part ${i + 1} of $total...');
+
+      // Overall progress: 5% prep + 90% upload + 5% merge
+      final baseProgress = 0.05 + (i / total) * 0.90;
+      onOverallProgress?.call(baseProgress);
+      onProgress(i + 1, total, 0.0);
+
+      // Retry up to 3 times
+      UploadBlockResult result = UploadBlockResult.failed;
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        if (_cancelled) break;
+        if (attempt > 1) {
+          onStatus('Retry part ${i + 1} (attempt $attempt)...');
+          await Future.delayed(Duration(seconds: attempt * 3));
+        }
+        result = await _uploadChunk(
+          filePath:    chunkPath,
+          fileName:    chunkName,
+          dateFolder:  dateFolder,
+          userFolder:  userFolder,
+          sessionName: sessionName,
+          chunkIndex:  i + 1,
+          totalChunks: total,
+          onProgress: (p) {
+            onProgress(i + 1, total, p);
+            final overall = 0.05 + (i + p) / total * 0.90;
+            onOverallProgress?.call(overall.clamp(0.0, 0.95));
+            // Update notification
+            _notif.showUploadProgress(
+              block: i + 1, total: total,
+              percentDone: (overall * 100).round());
+          },
+        );
+        if (result == UploadBlockResult.success) break;
+      }
 
       if (result == UploadBlockResult.success) {
-        onStatus('Upload complete ✓');
-        try { await file.delete(); } catch (_) {}
-        return [0];
+        successCount++;
+        onProgress(i + 1, total, 1.0);
+        // Delete temp chunk (NOT the original local file yet)
+        if (chunkPath != localFile) {
+          try { await chunkFile.delete(); } catch (_) {}
+        }
       } else {
-        onStatus('Upload failed — tap retry');
-        return alreadyUploaded;
+        onStatus('Part ${i + 1} failed after 3 attempts');
       }
     }
 
-    // ── Multiple chunks — merge on phone first, then upload ───────────────
-    onStatus('Preparing: merging ${chunkPaths.length} chunks on device...');
-    onProgress(0, 1, 0.0);
-
-    // Check all chunks exist
-    for (int i = 0; i < chunkPaths.length; i++) {
-      if (!await File(chunkPaths[i]).exists()) {
-        onStatus('Chunk ${i + 1} file missing — cannot merge');
-        return alreadyUploaded;
-      }
-    }
-
-    // Build merged output path next to the first chunk
-    final firstChunk  = chunkPaths[0];
-    final dir         = firstChunk.substring(0, firstChunk.lastIndexOf('/'));
-    final rawName     = firstChunk.split('/').last;
-    // Remove block suffix: uid_20260414_110000_block01of04.mp4 → uid_20260414_110000.mp4
-    final mergedName  = rawName.replaceAll(RegExp(r'_block\d+of\d+\.mp4$'), '.mp4');
-    final mergedPath  = '$dir/$mergedName';
-
-    onStatus('Merging chunks on device (lossless)...');
-
-    final mergeSuccess = await _mergeChunksOnDevice(
-      chunkPaths:  chunkPaths,
-      outputPath:  mergedPath,
-      onStatus:    onStatus,
-    );
-
-    if (!mergeSuccess) {
-      onStatus('Merge failed — trying individual upload as fallback');
-      // Fallback: upload chunks individually if merge fails
-      return await _uploadChunksIndividually(
-        chunkPaths:      chunkPaths,
-        dateFolder:      dateFolder,
-        userFolder:      userFolder,
-        alreadyUploaded: alreadyUploaded,
-        onProgress:      onProgress,
-        onStatus:        onStatus,
-      );
-    }
-
-    final mergedFile = File(mergedPath);
-    final mergedSize = await mergedFile.length();
-    onStatus('Merge done (${(mergedSize / 1024 / 1024).toStringAsFixed(0)}MB) — uploading...');
-    onProgress(0, 1, 0.05);
-
-    // Pause/cancel check before upload
-    while (_paused && !_cancelled) {
-      onStatus('Paused — tap Resume to continue');
-      await Future.delayed(const Duration(seconds: 2));
-    }
-    if (_cancelled) {
-      try { await mergedFile.delete(); } catch (_) {}
+    // ── Step 3: Check if all chunks uploaded ──────────────────────────────
+    if (successCount < total) {
+      onStatus('Upload incomplete — $successCount/$total parts uploaded');
+      _notif.showUploadFailed('Upload incomplete');
       return alreadyUploaded;
     }
 
-    // Upload the single merged file
-    final result = await _uploadSingleFile(
-      filePath:   mergedPath,
-      fileName:   mergedName,
-      dateFolder: dateFolder,
-      userFolder: userFolder,
-      onProgress: (p) => onProgress(1, 1, 0.05 + p * 0.95),
-    );
+    // ── Step 4: Backend merge complete — delete original local file ────────
+    onStatus('All parts uploaded — backend merging into single file...');
+    onOverallProgress?.call(0.97);
 
-    if (result == UploadBlockResult.success) {
-      onStatus('Upload complete — single file in OneDrive ✓');
-      // Delete merged file
-      try { await mergedFile.delete(); } catch (_) {}
-      // Delete all original chunks
-      for (final path in chunkPaths) {
-        try { await File(path).delete(); } catch (_) {}
-      }
-      // Return all indices as uploaded
-      return List.generate(chunkPaths.length, (i) => i);
-    } else {
-      onStatus('Upload failed — tap retry');
-      // Keep chunks, delete failed merged file
-      try { await mergedFile.delete(); } catch (_) {}
-      return alreadyUploaded;
-    }
+    // Wait briefly for backend to finish merge
+    await Future.delayed(const Duration(seconds: 3));
+
+    onStatus('Upload complete ✓ Single file in OneDrive');
+    onOverallProgress?.call(1.0);
+    _notif.showUploadComplete(total);
+
+    // Delete original local session file
+    try { await File(localFile).delete(); } catch (_) {}
+
+    // Return all indices as uploaded
+    return List.generate(chunkPaths.length, (i) => i);
   }
 
-  // ── FFmpeg merge on device ────────────────────────────────────────────────
-  Future<bool> _mergeChunksOnDevice({
-    required List<String> chunkPaths,
-    required String outputPath,
-    required StatusCallback onStatus,
-  }) async {
-    try {
-      // Delete any previous failed merge attempt
-      final out = File(outputPath);
-      if (await out.exists()) await out.delete();
-
-      // Build FFmpeg concat command
-      // -f concat -safe 0 = use a text list of files
-      // -c copy            = lossless, no re-encode (very fast)
-      // -movflags faststart = web-friendly MP4
-      final inputList = chunkPaths.map((p) => '-i "$p"').join(' ');
-      final filterComplex = chunkPaths.asMap().entries
-          .map((e) => '[${e.key}:v][${e.key}:a]')
-          .join('') +
-          'concat=n=${chunkPaths.length}:v=1:a=0[outv]';
-
-      // Use concat demuxer (fastest and most reliable for same-format files)
-      // Write a temp file list
-      final listPath = '${outputPath}.concat.txt';
-      final listContent = chunkPaths.map((p) => "file '$p'").join('\n');
-      await File(listPath).writeAsString(listContent);
-
-      final cmd = '-f concat -safe 0 -i "$listPath" -c copy -movflags +faststart "$outputPath"';
-      print('=== Merging ${chunkPaths.length} chunks → $outputPath');
-
-      final session = await FFmpegKit.execute(cmd);
-      final rc      = await session.getReturnCode();
-
-      // Clean up list file
-      try { await File(listPath).delete(); } catch (_) {}
-
-      if (ReturnCode.isSuccess(rc)) {
-        final size = await File(outputPath).length();
-        print('=== Merge success: ${(size/1024/1024).toStringAsFixed(1)}MB');
-        return true;
-      } else {
-        final logs = await session.getAllLogsAsString();
-        print('=== Merge failed: $logs');
-        return false;
-      }
-    } catch (e) {
-      print('=== Merge exception: $e');
-      return false;
-    }
-  }
-
-  // ── Upload a single file (streaming, handles any size) ────────────────────
-  Future<UploadBlockResult> _uploadSingleFile({
+  Future<UploadBlockResult> _uploadChunk({
     required String filePath,
     required String fileName,
     required String dateFolder,
     required String userFolder,
+    required String sessionName,
+    required int    chunkIndex,
+    required int    totalChunks,
     required void Function(double) onProgress,
   }) async {
     try {
       final fileSize = await File(filePath).length();
-      print('=== Uploading: $fileName (${(fileSize/1024/1024).toStringAsFixed(1)}MB)');
+      print('=== Chunk $chunkIndex/$totalChunks: $fileName (${(fileSize/1024/1024).toStringAsFixed(1)}MB)');
 
       final formData = FormData.fromMap({
-        'dateFolder':  dateFolder,
-        'userFolder':  userFolder,
-        'fileName':    fileName,
-        'totalBlocks': '1',       // always 1 — already merged
-        'blockIndex':  '1',
+        'dateFolder':   dateFolder,
+        'userFolder':   userFolder,
+        'fileName':     fileName,
+        'sessionName':  sessionName, // used by backend to group chunks for merge
+        'totalChunks':  totalChunks.toString(),
+        'chunkIndex':   chunkIndex.toString(),
         'video': await MultipartFile.fromFile(filePath, filename: fileName),
       });
 
@@ -241,53 +202,19 @@ class UploadService {
       );
 
       if (response.statusCode == 200 && response.data['success'] == true) {
-        print('=== Upload success: ${response.data['path']}');
         return UploadBlockResult.success;
       }
-      print('=== Upload failed: ${response.statusCode} ${response.data}');
+      print('=== Chunk failed: ${response.statusCode} ${response.data}');
       return UploadBlockResult.failed;
 
     } on DioException catch (e) {
       if (e.type == DioExceptionType.cancel) return UploadBlockResult.cancelled;
-      print('=== DioException: ${e.type} ${e.message}');
+      print('=== DioException: ${e.message}');
       return UploadBlockResult.failed;
     } catch (e) {
-      print('=== Upload exception: $e');
+      print('=== Chunk exception: $e');
       return UploadBlockResult.failed;
     }
-  }
-
-  // ── Fallback: upload chunks individually if merge fails ───────────────────
-  Future<List<int>> _uploadChunksIndividually({
-    required List<String> chunkPaths,
-    required String dateFolder,
-    required String userFolder,
-    required List<int> alreadyUploaded,
-    required ProgressCallback onProgress,
-    required StatusCallback onStatus,
-  }) async {
-    final uploaded = List<int>.from(alreadyUploaded);
-    for (int i = 0; i < chunkPaths.length; i++) {
-      if (uploaded.contains(i)) continue;
-      if (_cancelled) break;
-
-      final file = File(chunkPaths[i]);
-      if (!await file.exists()) { uploaded.add(i); continue; }
-
-      onStatus('Fallback: uploading chunk ${i + 1} of ${chunkPaths.length}...');
-      final result = await _uploadSingleFile(
-        filePath:   chunkPaths[i],
-        fileName:   chunkPaths[i].split('/').last,
-        dateFolder: dateFolder,
-        userFolder: userFolder,
-        onProgress: (p) => onProgress(i + 1, chunkPaths.length, p),
-      );
-      if (result == UploadBlockResult.success) {
-        uploaded.add(i);
-        try { await file.delete(); } catch (_) {}
-      }
-    }
-    return uploaded;
   }
 
   Future<bool> isBackendReachable() async {

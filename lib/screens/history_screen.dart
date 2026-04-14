@@ -61,15 +61,21 @@ class _HistoryScreenState extends State<HistoryScreen>
     super.dispose();
   }
 
+  // Track per-session upload percent for inline display
+  final Map<String, double> _uploadPercents = {};
+
   void _listenUpload() {
     _uploadSub = UploadProgressScreen.uploadStream.listen((state) {
       if (mounted) {
+        final sid = UploadProgressScreen.activeSessionId;
         setState(() {
-          _uploadingSessionId = state.isComplete || state.isError
-              ? null
-              : UploadProgressScreen.activeSessionId;
+          _uploadingSessionId = (state.isComplete || state.isError) ? null : sid;
+          if (sid != null && !state.isComplete && !state.isError) {
+            _uploadPercents[sid] = state.overallProgress;
+          } else if (sid != null) {
+            _uploadPercents.remove(sid);
+          }
         });
-        // Refresh list when upload completes
         if (state.isComplete || state.isError) _load();
       }
     });
@@ -160,8 +166,9 @@ class _LocalTab extends StatelessWidget {
   final List<SessionModel> sessions;
   final Future<void> Function() onRefresh;
   final String? uploadingSessionId;
+  final Map<String, double> uploadPercents;
   const _LocalTab({required this.sessions, required this.onRefresh,
-      this.uploadingSessionId});
+      this.uploadingSessionId, this.uploadPercents = const {}});
 
   @override
   Widget build(BuildContext context) {
@@ -185,6 +192,7 @@ class _LocalTab extends StatelessWidget {
         session: sessions[i],
         onRefresh: onRefresh,
         isCurrentlyUploading: sessions[i].id == uploadingSessionId,
+        uploadPercent: uploadPercents[sessions[i].id],
       ),
     );
   }
@@ -194,8 +202,9 @@ class _LocalCard extends StatelessWidget {
   final SessionModel session;
   final Future<void> Function() onRefresh;
   final bool isCurrentlyUploading;
+  final double? uploadPercent;
   const _LocalCard({required this.session, required this.onRefresh,
-      this.isCurrentlyUploading = false});
+      this.isCurrentlyUploading = false, this.uploadPercent});
 
   String get _date => DateFormat('dd MMM yyyy, hh:mm a').format(session.createdAt);
   String get _dur {
@@ -279,6 +288,21 @@ class _LocalCard extends StatelessWidget {
             _Meta(Icons.video_file_outlined,
                 '${session.blockCount} block${session.blockCount != 1 ? 's' : ''}'),
           ]),
+          // Inline upload progress bar
+          if (isCurrentlyUploading && uploadPercent != null) ...[
+            const SizedBox(height: 8),
+            Row(children: [
+              Expanded(child: ClipRRect(borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: uploadPercent,
+                  minHeight: 5, backgroundColor: const Color(0xFFE8E8E8),
+                  valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF00C853))))),
+              const SizedBox(width: 8),
+              Text('${(uploadPercent! * 100).toStringAsFixed(0)}%',
+                  style: const TextStyle(color: Color(0xFF00C853), fontSize: 11,
+                      fontWeight: FontWeight.w700)),
+            ]),
+          ],
           if (session.isPartial) ...[
             const SizedBox(height: 8),
             ClipRRect(borderRadius: BorderRadius.circular(4),
