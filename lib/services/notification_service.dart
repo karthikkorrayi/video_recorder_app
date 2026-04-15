@@ -1,8 +1,5 @@
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
-/// Simple notification service for upload progress.
-/// Shows a progress notification while uploading, updates it block by block,
-/// and shows a completion/failure notification when done.
 class NotificationService {
   static final NotificationService _i = NotificationService._();
   factory NotificationService() => _i;
@@ -28,24 +25,27 @@ class NotificationService {
       const InitializationSettings(android: android, iOS: ios),
     );
 
-    // Create the Android notification channel
+    final androidPlugin = _plugin
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>();
+
+    // ── Request notification permission (Android 13+ requires this) ──────
+    // This shows the system dialog asking user to allow notifications.
+    // Without this, notifications are silently dropped on Android 13+.
+    await androidPlugin?.requestNotificationsPermission();
+
+    // Create notification channel
     const channel = AndroidNotificationChannel(
       'otn_upload',
       _channelName,
       description: 'Shows upload progress to OneDrive',
-      importance: Importance.low, // low = no sound, no popup
+      importance: Importance.low,
     );
-
-    final androidPlugin = _plugin
-        .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>();
     await androidPlugin?.createNotificationChannel(channel);
 
     _initialized = true;
   }
 
-  /// Show or update upload progress notification.
-  /// [block] and [total] are 1-based.
   Future<void> showUploadProgress({
     required int block,
     required int total,
@@ -55,31 +55,30 @@ class NotificationService {
     await _plugin.show(
       _uploadChannelId,
       'Uploading to OneDrive',
-      'Block $block of $total — $percentDone%',
+      'Part $block of $total — $percentDone%',
       NotificationDetails(
         android: AndroidNotificationDetails(
           'otn_upload', _channelName,
           channelDescription: 'Upload progress',
           importance: Importance.low,
           priority: Priority.low,
-          ongoing: true,          // can't be dismissed while uploading
+          ongoing: true,
           showProgress: true,
           maxProgress: 100,
           progress: percentDone,
-          onlyAlertOnce: true,    // don't vibrate on every update
+          onlyAlertOnce: true,
         ),
       ),
     );
   }
 
-  /// Show upload complete notification.
-  Future<void> showUploadComplete(int totalBlocks) async {
+  Future<void> showUploadComplete(int totalParts) async {
     if (!_initialized) return;
-    await _plugin.cancel(_uploadChannelId); // remove progress notification
+    await _plugin.cancel(_uploadChannelId);
     await _plugin.show(
       _uploadChannelId + 1,
       'Upload Complete ✓',
-      '$totalBlocks block${totalBlocks != 1 ? 's' : ''} synced to OneDrive',
+      'Video synced to OneDrive ($totalParts part${totalParts != 1 ? 's' : ''} merged)',
       const NotificationDetails(
         android: AndroidNotificationDetails(
           'otn_upload', _channelName,
@@ -90,7 +89,6 @@ class NotificationService {
     );
   }
 
-  /// Show upload failed notification.
   Future<void> showUploadFailed(String reason) async {
     if (!_initialized) return;
     await _plugin.cancel(_uploadChannelId);
@@ -108,7 +106,6 @@ class NotificationService {
     );
   }
 
-  /// Cancel the upload progress notification (e.g. when user cancels).
   Future<void> cancelUploadNotification() async {
     await _plugin.cancel(_uploadChannelId);
   }

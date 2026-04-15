@@ -56,10 +56,10 @@ class _UploadManager {
           _notif.showUploadProgress(block: block, total: total, percentDone: pct);
           _emit(_state.copyWith(
               currentBlock: block, totalBlocks: total, blockProgress: prog));
-          // Update persisted state with latest completed blocks
           _resume.updateProgress(session.id, _state.uploadedBlocks);
         },
         onStatus: (s) => _emit(_state.copyWith(statusText: s)),
+        onOverallProgress: (p) => _emit(_state.copyWith(overallPercent: p)),
       );
 
       await store.updateUploadedBlocks(session.id, uploaded);
@@ -77,6 +77,7 @@ class _UploadManager {
         totalBlocks: session.blockCount,
         currentBlock: done ? session.blockCount : uploaded.length,
         blockProgress: 1.0,
+        overallPercent: done ? 1.0 : 0.0,
         statusText: done
             ? 'Upload complete! All blocks synced to OneDrive.'
             : 'Partial upload — ${session.blockCount - uploaded.length} block(s) remaining.',
@@ -101,6 +102,7 @@ class _UploadState {
   final int currentBlock;
   final int totalBlocks;
   final double blockProgress;
+  final double overallPercent;  // 0.0–1.0, set directly by onOverallProgress
   final String statusText;
   final bool isComplete;
   final bool isError;
@@ -111,6 +113,7 @@ class _UploadState {
     this.currentBlock  = 0,
     this.totalBlocks   = 0,
     this.blockProgress = 0,
+    this.overallPercent = 0,
     this.statusText    = '',
     this.isComplete    = false,
     this.isError       = false,
@@ -120,12 +123,13 @@ class _UploadState {
 
   _UploadState copyWith({
     int? currentBlock, int? totalBlocks, double? blockProgress,
-    String? statusText, bool? isComplete, bool? isError,
-    bool? hasNetwork, List<int>? uploadedBlocks,
+    double? overallPercent, String? statusText, bool? isComplete,
+    bool? isError, bool? hasNetwork, List<int>? uploadedBlocks,
   }) => _UploadState(
     currentBlock:   currentBlock   ?? this.currentBlock,
     totalBlocks:    totalBlocks    ?? this.totalBlocks,
     blockProgress:  blockProgress  ?? this.blockProgress,
+    overallPercent: overallPercent ?? this.overallPercent,
     statusText:     statusText     ?? this.statusText,
     isComplete:     isComplete     ?? this.isComplete,
     isError:        isError        ?? this.isError,
@@ -133,9 +137,11 @@ class _UploadState {
     uploadedBlocks: uploadedBlocks ?? this.uploadedBlocks,
   );
 
+  // overallProgress: use overallPercent if set, else compute from blocks
   double get overallProgress {
-    if (totalBlocks == 0) return 0.0;
     if (isComplete) return 1.0;
+    if (overallPercent > 0) return overallPercent.clamp(0.0, 1.0);
+    if (totalBlocks == 0) return 0.0;
     final done = uploadedBlocks.length.toDouble();
     if (currentBlock == 0) return done / totalBlocks;
     return ((currentBlock - 1) + blockProgress) / totalBlocks;
@@ -239,7 +245,7 @@ class _UploadProgressScreenState extends State<UploadProgressScreen> {
               Text('Session: ${widget.session.id.substring(0, 8).toUpperCase()}',
                   style: const TextStyle(color: Color(0xFF888888), fontSize: 11)),
               const SizedBox(height: 2),
-              Text('${_state.totalBlocks} block${_state.totalBlocks != 1 ? 's' : ''}'
+              Text('${_state.totalBlocks} part${_state.totalBlocks != 1 ? 's' : ''}'
                   ' · ${(widget.session.durationSeconds / 60).toStringAsFixed(1)} min',
                   style: const TextStyle(color: Color(0xFF888888), fontSize: 11)),
               const SizedBox(height: 20),
@@ -256,13 +262,22 @@ class _UploadProgressScreenState extends State<UploadProgressScreen> {
               ClipRRect(
                 borderRadius: BorderRadius.circular(6),
                 child: LinearProgressIndicator(
-                  value: _state.overallProgress, minHeight: 10,
+                  // Show indeterminate (animated) when at 0% so it doesn't look frozen
+                  value: _state.overallProgress > 0.0 ? _state.overallProgress : null,
+                  minHeight: 10,
                   backgroundColor: const Color(0xFFE8E8E8),
                   valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF00C853)))),
+              const SizedBox(height: 8),
+              // Status text — shows current step (waking server, splitting, uploading...)
+              if (_state.statusText.isNotEmpty)
+                Text(_state.statusText,
+                    style: const TextStyle(
+                        color: Color(0xFF888888), fontSize: 12),
+                    maxLines: 2, overflow: TextOverflow.ellipsis),
               const SizedBox(height: 20),
 
-              // Block list header
-              const Text('Blocks', style: TextStyle(
+              // Part list header
+              const Text('Upload Parts', style: TextStyle(
                   color: Color(0xFF888888), fontSize: 12, fontWeight: FontWeight.w600)),
               const SizedBox(height: 8),
 
@@ -305,15 +320,25 @@ class _UploadProgressScreenState extends State<UploadProgressScreen> {
                       // Labels
                       Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('Block ${i + 1} of ${_state.totalBlocks}',
+                          Text('Part ${i + 1} of ${_state.totalBlocks}',
                               style: TextStyle(
                                 color: done || current
                                     ? const Color(0xFF1A1A1A) : const Color(0xFFAAAAAA),
                                 fontSize: 13,
                                 fontWeight: current ? FontWeight.w600 : FontWeight.normal)),
-                          if (current) Text(
-                              '${(_state.blockProgress * 100).toStringAsFixed(0)}% uploaded',
-                              style: const TextStyle(color: Colors.blue, fontSize: 11)),
+                          if (current) ...[
+                            const SizedBox(height: 4),
+                            ClipRRect(borderRadius: BorderRadius.circular(3),
+                              child: LinearProgressIndicator(
+                                value: _state.blockProgress > 0 ? _state.blockProgress : null,
+                                minHeight: 4,
+                                backgroundColor: const Color(0xFFE0E0E0),
+                                valueColor: const AlwaysStoppedAnimation<Color>(Colors.blue))),
+                            const SizedBox(height: 2),
+                            Text('${(_state.blockProgress * 100).toStringAsFixed(0)}% this part'
+                                ' · overall ${(_state.overallProgress * 100).toStringAsFixed(0)}%',
+                                style: const TextStyle(color: Colors.blue, fontSize: 10)),
+                          ],
                         ])),
                       // Status chip
                       Container(

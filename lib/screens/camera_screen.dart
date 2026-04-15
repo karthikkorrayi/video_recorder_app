@@ -615,17 +615,22 @@ class _CtrlTile extends StatelessWidget {
     final fg = active ? activeColor : const Color(0xFF444444);
     return GestureDetector(onTap: onTap,
       child: Opacity(opacity: onTap == null ? 0.35 : 1.0,
-        child: Container(width: double.infinity,
+        child: Container(
+          width:  double.infinity,
+          height: double.infinity,   // fill Expanded height completely
           decoration: BoxDecoration(
             color: active ? activeColor.withValues(alpha: 0.08) : Colors.white,
             borderRadius: BorderRadius.circular(12),
             border: Border.all(
                 color: active ? activeColor.withValues(alpha: 0.5) : const Color(0xFFE0E0E0),
                 width: 1.2)),
-          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            Icon(icon, color: fg, size: 18), const SizedBox(width: 7),
-            Flexible(child: Text(label, overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: fg, fontSize: 12, fontWeight: FontWeight.w600))),
+          child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+            Icon(icon, color: fg, size: 22),
+            const SizedBox(height: 5),
+            Padding(padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: Text(label, overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: fg, fontSize: 11, fontWeight: FontWeight.w600))),
           ]))));
   }
 }

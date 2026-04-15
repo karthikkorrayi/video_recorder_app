@@ -1,27 +1,19 @@
 import 'dart:io';
-import 'package:dio/dio.dart';
 import 'package:intl/intl.dart';
 import 'user_service.dart';
 import 'video_processor.dart';
 import 'notification_service.dart';
+import 'onedrive_service.dart';
 
-enum UploadBlockResult { success, failed, cancelled }
-
-typedef ProgressCallback = void Function(int blockIndex, int totalBlocks, double blockProgress);
-typedef StatusCallback   = void Function(String status);
-// NEW: overall percent callback for history screen inline progress
+typedef ProgressCallback        = void Function(int blockIndex, int totalBlocks, double blockProgress);
+typedef StatusCallback          = void Function(String status);
 typedef OverallProgressCallback = void Function(double percent);
 
 class UploadService {
-  static const String _backendUrl = 'https://video-recorder-app-d7zk.onrender.com';
+  static const String _rootFolder = 'OTN Recorder';
 
-  final _notif = NotificationService();
-
-  final Dio _dio = Dio(BaseOptions(
-    connectTimeout: const Duration(seconds: 60),
-    receiveTimeout: const Duration(minutes: 30),
-    sendTimeout:    const Duration(minutes: 30),
-  ));
+  final _notif    = NotificationService();
+  final _onedrive = OneDriveService();
 
   bool _cancelled = false;
   bool _paused    = false;
@@ -34,7 +26,7 @@ class UploadService {
 
   Future<List<int>> uploadSession({
     required String sessionId,
-    required List<String> chunkPaths, // single file path locally
+    required List<String> chunkPaths,   // single local file
     required DateTime sessionTime,
     required List<int> alreadyUploaded,
     required ProgressCallback onProgress,
@@ -46,15 +38,15 @@ class UploadService {
 
     final dateFolder = DateFormat('dd-MM-yyyy').format(sessionTime);
     final userFolder = await UserService().getDisplayName();
-    final localFile  = chunkPaths.first; // always 1 file locally
+    final localFile  = chunkPaths.first;
 
     if (!await File(localFile).exists()) {
-      onStatus('File not found');
+      onStatus('Local file not found');
       return alreadyUploaded;
     }
 
-    // ── Step 1: Split local file into 5-min upload chunks ─────────────────
-    onStatus('Preparing upload chunks...');
+    // ── Step 1: Split into 5-min upload chunks ────────────────────────────
+    onStatus('Splitting into upload chunks...');
     onOverallProgress?.call(0.02);
 
     List<String> uploadChunks;
@@ -66,16 +58,15 @@ class UploadService {
     }
 
     if (uploadChunks.isEmpty) {
-      onStatus('No chunks created');
+      onStatus('No chunks to upload');
       return alreadyUploaded;
     }
 
     final total       = uploadChunks.length;
     final sessionName = localFile.split('/').last.replaceAll('.mp4', '');
+    print('=== UploadService: $total chunk(s) → direct to OneDrive');
 
-    print('=== UploadService: $total chunk(s) → $dateFolder/$userFolder');
-
-    // ── Step 2: Upload each chunk ──────────────────────────────────────────
+    // ── Step 2: Upload each chunk directly phone → OneDrive ───────────────
     int successCount = 0;
 
     for (int i = 0; i < total; i++) {
@@ -88,140 +79,81 @@ class UploadService {
       if (_cancelled) break;
 
       final chunkPath = uploadChunks[i];
-      final chunkFile = File(chunkPath);
-      if (!await chunkFile.exists()) { successCount++; continue; }
+      if (!await File(chunkPath).exists()) { successCount++; continue; }
 
-      final chunkName = chunkPath.split('/').last;
-      onStatus('Uploading part ${i + 1} of $total...');
+      // Chunk file name: sessionName_chunk01of04.mp4
+      final chunkFile = chunkPath.split('/').last;
+      final chunkNum  = i + 1;
 
-      // Overall progress: 5% prep + 90% upload + 5% merge
+      // For single chunk, use clean name without suffix
+      final uploadName = total == 1
+          ? '$sessionName.mp4'
+          : '${sessionName}_part${chunkNum.toString().padLeft(2,'0')}of'
+            '${total.toString().padLeft(2,'0')}.mp4';
+
+      onStatus(total > 1
+          ? 'Uploading part $chunkNum of $total...'
+          : 'Uploading...');
+
       final baseProgress = 0.05 + (i / total) * 0.90;
       onOverallProgress?.call(baseProgress);
-      onProgress(i + 1, total, 0.0);
+      onProgress(chunkNum, total, 0.0);
 
-      // Retry up to 3 times
-      UploadBlockResult result = UploadBlockResult.failed;
+      bool success = false;
       for (int attempt = 1; attempt <= 3; attempt++) {
         if (_cancelled) break;
         if (attempt > 1) {
-          onStatus('Retry part ${i + 1} (attempt $attempt)...');
+          onStatus('Retry part $chunkNum (attempt $attempt)...');
           await Future.delayed(Duration(seconds: attempt * 3));
         }
-        result = await _uploadChunk(
-          filePath:    chunkPath,
-          fileName:    chunkName,
-          dateFolder:  dateFolder,
-          userFolder:  userFolder,
-          sessionName: sessionName,
-          chunkIndex:  i + 1,
-          totalChunks: total,
-          onProgress: (p) {
-            onProgress(i + 1, total, p);
-            final overall = 0.05 + (i + p) / total * 0.90;
-            onOverallProgress?.call(overall.clamp(0.0, 0.95));
-            // Update notification
-            _notif.showUploadProgress(
-              block: i + 1, total: total,
-              percentDone: (overall * 100).round());
-          },
-        );
-        if (result == UploadBlockResult.success) break;
+        try {
+          await _onedrive.uploadFile(
+            filePath:   chunkPath,
+            fileName:   uploadName,
+            dateFolder: dateFolder,
+            userFolder: userFolder,
+            rootFolder: _rootFolder,
+            onProgress: (p) {
+              onProgress(chunkNum, total, p);
+              final overall = 0.05 + (i + p) / total * 0.90;
+              onOverallProgress?.call(overall.clamp(0.0, 0.95));
+              _notif.showUploadProgress(
+                block: chunkNum, total: total,
+                percentDone: (overall * 100).round());
+            },
+            onStatus: (s) => onStatus(s),
+          );
+          success = true;
+          break;
+        } catch (e) {
+          print('=== Chunk $chunkNum attempt $attempt failed: $e');
+          if (attempt == 3) onStatus('Part $chunkNum failed: $e');
+        }
       }
 
-      if (result == UploadBlockResult.success) {
+      if (success) {
         successCount++;
-        onProgress(i + 1, total, 1.0);
-        // Delete temp chunk (NOT the original local file yet)
+        onProgress(chunkNum, total, 1.0);
+        // Delete temp chunk (not the original file)
         if (chunkPath != localFile) {
-          try { await chunkFile.delete(); } catch (_) {}
+          try { await File(chunkPath).delete(); } catch (_) {}
         }
-      } else {
-        onStatus('Part ${i + 1} failed after 3 attempts');
       }
     }
 
-    // ── Step 3: Check if all chunks uploaded ──────────────────────────────
     if (successCount < total) {
-      onStatus('Upload incomplete — $successCount/$total parts uploaded');
+      onStatus('Incomplete — $successCount/$total parts uploaded');
       _notif.showUploadFailed('Upload incomplete');
       return alreadyUploaded;
     }
 
-    // ── Step 4: Backend merge complete — delete original local file ────────
-    onStatus('All parts uploaded — backend merging into single file...');
-    onOverallProgress?.call(0.97);
-
-    // Wait briefly for backend to finish merge
-    await Future.delayed(const Duration(seconds: 3));
-
-    onStatus('Upload complete ✓ Single file in OneDrive');
+    // ── Step 3: All parts uploaded — delete local session file ────────────
+    onStatus('Upload complete ✓ ${total > 1 ? "$total parts in OneDrive" : "File in OneDrive"}');
     onOverallProgress?.call(1.0);
     _notif.showUploadComplete(total);
 
-    // Delete original local session file
     try { await File(localFile).delete(); } catch (_) {}
 
-    // Return all indices as uploaded
     return List.generate(chunkPaths.length, (i) => i);
-  }
-
-  Future<UploadBlockResult> _uploadChunk({
-    required String filePath,
-    required String fileName,
-    required String dateFolder,
-    required String userFolder,
-    required String sessionName,
-    required int    chunkIndex,
-    required int    totalChunks,
-    required void Function(double) onProgress,
-  }) async {
-    try {
-      final fileSize = await File(filePath).length();
-      print('=== Chunk $chunkIndex/$totalChunks: $fileName (${(fileSize/1024/1024).toStringAsFixed(1)}MB)');
-
-      final formData = FormData.fromMap({
-        'dateFolder':   dateFolder,
-        'userFolder':   userFolder,
-        'fileName':     fileName,
-        'sessionName':  sessionName, // used by backend to group chunks for merge
-        'totalChunks':  totalChunks.toString(),
-        'chunkIndex':   chunkIndex.toString(),
-        'video': await MultipartFile.fromFile(filePath, filename: fileName),
-      });
-
-      final response = await _dio.post(
-        '$_backendUrl/upload',
-        data: formData,
-        onSendProgress: (sent, total) {
-          if (total > 0) onProgress(sent / total);
-        },
-        options: Options(
-          validateStatus: (s) => s != null && s < 600,
-          headers: {'Accept': 'application/json'},
-        ),
-      );
-
-      if (response.statusCode == 200 && response.data['success'] == true) {
-        return UploadBlockResult.success;
-      }
-      print('=== Chunk failed: ${response.statusCode} ${response.data}');
-      return UploadBlockResult.failed;
-
-    } on DioException catch (e) {
-      if (e.type == DioExceptionType.cancel) return UploadBlockResult.cancelled;
-      print('=== DioException: ${e.message}');
-      return UploadBlockResult.failed;
-    } catch (e) {
-      print('=== Chunk exception: $e');
-      return UploadBlockResult.failed;
-    }
-  }
-
-  Future<bool> isBackendReachable() async {
-    try {
-      final res = await _dio.get('$_backendUrl/health',
-          options: Options(receiveTimeout: const Duration(seconds: 30)));
-      return res.statusCode == 200;
-    } catch (_) { return false; }
   }
 }

@@ -71,7 +71,7 @@ class _HistoryScreenState extends State<HistoryScreen>
         setState(() {
           _uploadingSessionId = (state.isComplete || state.isError) ? null : sid;
           if (sid != null && !state.isComplete && !state.isError) {
-            _uploadPercents[sid] = state.overallProgress;
+            _uploadPercents[sid] = state.overallPercent;
           } else if (sid != null) {
             _uploadPercents.remove(sid);
           }
