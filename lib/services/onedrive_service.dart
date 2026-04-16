@@ -1,13 +1,13 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:dio/dio.dart';
 
-/// Uploads files directly from phone to OneDrive using Microsoft Graph API.
-/// The phone splits chunks locally, uploads each directly — no backend involved.
-/// Backend is only needed to get/refresh the access token.
+/// Uploads files directly from phone to cloud storage using Microsoft Graph API.
+/// Backend is only needed for token refresh — no file data passes through it.
 class OneDriveService {
-  static const String _backendUrl = 'https://otn-upload-backend.onrender.com';
+  static const String _backendUrl = 'https://video-recorder-app-d7zk.onrender.com';
   static const String _graphBase  = 'https://graph.microsoft.com/v1.0/me/drive';
-  static const int    _graphChunk = 10 * 1024 * 1024; // 10MB per Graph API chunk
+  static const int    _graphChunk = 10 * 1024 * 1024; // 10MB per slice
 
   final Dio _dio = Dio(BaseOptions(
     connectTimeout: const Duration(seconds: 30),
@@ -15,29 +15,27 @@ class OneDriveService {
     sendTimeout:    const Duration(minutes: 10),
   ));
 
-  String? _accessToken;
+  String?   _accessToken;
   DateTime? _tokenExpiry;
 
-  // ── Get token from backend (lightweight — no file data involved) ──────────
+  // ── Token ─────────────────────────────────────────────────────────────────
   Future<String> _getToken() async {
     if (_accessToken != null &&
         _tokenExpiry != null &&
         DateTime.now().isBefore(_tokenExpiry!.subtract(const Duration(minutes: 2)))) {
       return _accessToken!;
     }
+    print('=== Getting token from backend...');
     try {
-      print('=== Getting token from backend...');
       final res = await _dio.get(
         '$_backendUrl/token',
         options: Options(
-          receiveTimeout: const Duration(seconds: 75), // covers Render cold start
+          receiveTimeout: const Duration(seconds: 75),
           validateStatus: (s) => s != null && s < 600,
         ),
       );
       if (res.statusCode == 404) {
-        throw Exception(
-          'Backend not updated yet. Please push the new server.js to Render '
-          'and wait for it to deploy. The /token endpoint is missing.');
+        throw Exception('Backend /token not found — push new server.js to Render');
       }
       if (res.statusCode != 200) {
         throw Exception('Backend returned ${res.statusCode}: ${res.data}');
@@ -52,46 +50,44 @@ class OneDriveService {
     }
   }
 
-  // ── Ensure folder exists, return its item ID ──────────────────────────────
+  // ── Folder helpers ────────────────────────────────────────────────────────
   Future<String> _ensureFolder(String token, String parentId, String name) async {
     try {
-      final res = await _dio.get(
+      final r = await _dio.get(
         '$_graphBase/items/$parentId/children'
         '?\$filter=name eq \'${Uri.encodeComponent(name)}\'&\$select=id',
-        options: Options(headers: {'Authorization': 'Bearer $token'}));
-      final items = res.data['value'] as List?;
+        options: Options(headers: {'Authorization': 'Bearer $token'},
+            validateStatus: (s) => s != null && s < 600));
+      final items = r.data['value'] as List?;
       if (items != null && items.isNotEmpty) return items[0]['id'] as String;
     } catch (_) {}
-    final res = await _dio.post(
+    final r = await _dio.post(
       '$_graphBase/items/$parentId/children',
       data: {'name': name, 'folder': {}, '@microsoft.graph.conflictBehavior': 'rename'},
       options: Options(headers: {
-        'Authorization': 'Bearer $token',
-        'Content-Type': 'application/json'}));
-    return res.data['id'] as String;
+        'Authorization': 'Bearer $token', 'Content-Type': 'application/json'}));
+    return r.data['id'] as String;
   }
 
   Future<String> _getRootFolderId(String token, String rootName) async {
     try {
-      final res = await _dio.get(
+      final r = await _dio.get(
         '$_graphBase/root/children'
         '?\$filter=name eq \'${Uri.encodeComponent(rootName)}\'&\$select=id',
-        options: Options(headers: {'Authorization': 'Bearer $token'}));
-      final items = res.data['value'] as List?;
+        options: Options(headers: {'Authorization': 'Bearer $token'},
+            validateStatus: (s) => s != null && s < 600));
+      final items = r.data['value'] as List?;
       if (items != null && items.isNotEmpty) return items[0]['id'] as String;
     } catch (_) {}
-    final res = await _dio.post(
+    final r = await _dio.post(
       '$_graphBase/root/children',
       data: {'name': rootName, 'folder': {}, '@microsoft.graph.conflictBehavior': 'rename'},
       options: Options(headers: {
-        'Authorization': 'Bearer $token',
-        'Content-Type': 'application/json'}));
-    return res.data['id'] as String;
+        'Authorization': 'Bearer $token', 'Content-Type': 'application/json'}));
+    return r.data['id'] as String;
   }
 
-  // ── Upload single file directly from phone to OneDrive ────────────────────
-  // Uses Graph API resumable upload session — handles files of any size.
-  // Only 10MB slices are in RAM at any point.
+  // ── Upload single file ─────────────────────────────────────────────────────
   Future<void> uploadFile({
     required String filePath,
     required String fileName,
@@ -100,39 +96,44 @@ class OneDriveService {
     required String rootFolder,
     required void Function(double) onProgress,
     required void Function(String) onStatus,
-    bool Function()? isPaused,   // called before each chunk to check pause
+    bool Function()? isPaused,
     bool Function()? isCancelled,
   }) async {
     onStatus('Getting access token...');
     final token  = await _getToken();
 
-    onStatus('Preparing OneDrive folder...');
+    onStatus('Preparing cloud folder...');
     final rootId = await _getRootFolderId(token, rootFolder);
     final dateId = await _ensureFolder(token, rootId, dateFolder);
     final userId = await _ensureFolder(token, dateId, userFolder);
 
-    final file     = File(filePath);
-    final fileSize = await file.length();
+    final fileSize = await File(filePath).length();
+    print('=== Uploading: $fileName (${(fileSize/1024/1024).toStringAsFixed(1)}MB)');
 
+    // Step 1: Create upload session
     onStatus('Creating upload session...');
-    print('=== OneDrive direct upload: $fileName (${(fileSize/1024/1024).toStringAsFixed(1)}MB)');
-
-    // Create upload session
     final sessionRes = await _dio.post(
       '$_graphBase/items/$userId:/${Uri.encodeComponent(fileName)}:/createUploadSession',
       data: {'item': {'@microsoft.graph.conflictBehavior': 'replace', 'name': fileName}},
       options: Options(headers: {
         'Authorization': 'Bearer $token',
-        'Content-Type': 'application/json'}));
+        'Content-Type':  'application/json',
+      }, validateStatus: (s) => s != null && s < 600));
+
+    if (sessionRes.statusCode != 200) {
+      throw Exception('Failed to create upload session: ${sessionRes.statusCode} ${sessionRes.data}');
+    }
     final uploadUrl = sessionRes.data['uploadUrl'] as String;
 
-    // Stream upload in 10MB chunks directly from phone storage
-    int    offset     = 0;
-    int    chunkNum   = 0;
-    final  totalChunks = (fileSize / _graphChunk).ceil();
+    // Step 2: Upload in 10MB slices
+    // KEY FIX: send raw Uint8List bytes — NOT Stream.fromIterable()
+    // Dio + Graph API requires known content-length which streams don't provide reliably
+    int   offset     = 0;
+    int   chunkNum   = 0;
+    final totalChunks = (fileSize / _graphChunk).ceil();
 
     while (offset < fileSize) {
-      // ── Pause check — waits here until resumed ───────────────────────────
+      // Pause/cancel check
       while (isPaused != null && isPaused()) {
         if (isCancelled != null && isCancelled()) return;
         await Future.delayed(const Duration(milliseconds: 500));
@@ -143,24 +144,33 @@ class OneDriveService {
       final chunkSize = end - offset;
       chunkNum++;
 
-      // Read only this slice from disk — peak RAM = 10MB
+      // Read slice from disk — peak RAM = 10MB
       final chunk = await _readChunk(filePath, offset, chunkSize);
 
       // Retry each slice up to 3 times
       for (int attempt = 1; attempt <= 3; attempt++) {
         try {
-          await _dio.put(uploadUrl, data: Stream.fromIterable([chunk]),
+          final res = await _dio.put(
+            uploadUrl,
+            data: chunk, // ← raw Uint8List, not Stream
             options: Options(
               headers: {
                 'Content-Range':  'bytes $offset-${end - 1}/$fileSize',
                 'Content-Length': '$chunkSize',
                 'Content-Type':   'application/octet-stream',
               },
-              receiveTimeout: const Duration(minutes: 5),
-              sendTimeout:    const Duration(minutes: 5),
-            ));
+              receiveTimeout:  const Duration(minutes: 5),
+              sendTimeout:     const Duration(minutes: 5),
+              // 200 = intermediate chunk accepted
+              // 201/202 = final chunk, file created
+              // 308 = Resume Incomplete (Graph uses this for intermediate chunks)
+              validateStatus: (s) => s != null && (s == 200 || s == 201 || s == 202 || s == 308),
+            ),
+          );
+          print('=== Chunk $chunkNum/$totalChunks → ${res.statusCode}');
           break;
         } catch (e) {
+          print('=== Chunk $chunkNum attempt $attempt failed: $e');
           if (attempt == 3) rethrow;
           await Future.delayed(Duration(seconds: attempt * 3));
         }
@@ -169,19 +179,18 @@ class OneDriveService {
       offset = end;
       final pct = offset / fileSize;
       onProgress(pct);
-      if (chunkNum % 3 == 0 || pct >= 1.0) {
-        onStatus('Uploading... ${(pct * 100).toStringAsFixed(0)}%');
-      }
+      onStatus('Uploading... ${(pct * 100).toStringAsFixed(0)}%');
     }
 
-    print('=== OneDrive: upload complete — $fileName');
+    print('=== Upload complete: $fileName');
   }
 
-  Future<List<int>> _readChunk(String filePath, int start, int length) async {
+  // Read a slice of a file into memory
+  Future<Uint8List> _readChunk(String filePath, int start, int length) async {
     final raf   = await File(filePath).open();
     await raf.setPosition(start);
     final bytes = await raf.read(length);
     await raf.close();
-    return bytes;
+    return Uint8List.fromList(bytes);
   }
 }

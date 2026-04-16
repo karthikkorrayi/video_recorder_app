@@ -3,7 +3,7 @@ import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit_config.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:path_provider/path_provider.dart'; // for getTemporaryDirectory
 import 'package:intl/intl.dart';
 import 'package:uuid/uuid.dart';
 import 'attendance_service.dart';
@@ -228,7 +228,11 @@ class VideoProcessor {
       return [filePath];
     }
 
-    final dir      = filePath.substring(0, filePath.lastIndexOf('/'));
+    // Save chunks to app cache — NOT the media folder
+    // This prevents them from appearing in the device photo gallery
+    final cacheDir = await getTemporaryDirectory();
+    final chunksDir = Directory('${cacheDir.path}/otn_upload_chunks');
+    await chunksDir.create(recursive: true);
     final baseName = filePath.split('/').last.replaceAll('.mp4', '');
     final chunks   = <String>[];
 
@@ -240,7 +244,7 @@ class VideoProcessor {
       final dur       = remaining < chunkSecs ? remaining : chunkSecs.toDouble();
       final n         = (i + 1).toString().padLeft(2, '0');
       final m         = totalChunks.toString().padLeft(2, '0');
-      final chunkPath = '$dir/${baseName}_chunk${n}of$m.mp4';
+      final chunkPath = '${chunksDir.path}/${baseName}_chunk${n}of$m.mp4';
 
       final ok = await _runFFmpeg(
           '-ss $startSec -i "$filePath" -t $dur '
