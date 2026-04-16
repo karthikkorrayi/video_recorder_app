@@ -15,7 +15,7 @@ class CameraScreen extends StatefulWidget {
   State<CameraScreen> createState() => _CameraScreenState();
 }
 
-class _CameraScreenState extends State<CameraScreen> {
+class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver {
   CameraController? _ctrl;
   _S _state = _S.init;
   bool _torchOn       = false;
@@ -71,12 +71,51 @@ class _CameraScreenState extends State<CameraScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this); // watch app lifecycle
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     WakelockPlus.enable();
     _beep.init();
     _initCamera();
+  }
+
+  // ── Called when user presses Home or Recent apps button ──────────────────
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.paused && _isRecording) {
+      // App going to background during recording — save immediately
+      _saveAndStopSilently();
+    } else if (state == AppLifecycleState.resumed) {
+      // App came back to foreground — restore immersive mode
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
+  }
+
+  /// Save recording silently when app is backgrounded — no dialog, no delay.
+  Future<void> _saveAndStopSilently() async {
+    if (!_isRecording) return;
+    _ticker?.cancel();
+    _alertTimer?.cancel();
+    try {
+      final endTime = DateTime.now();
+      final file    = await _ctrl!.stopVideoRecording();
+      VideoProcessor().startBackgroundProcessing(
+        rawVideoPath: file.path,
+        sessionTime:  _sessionStart ?? endTime,
+        recordingEnd: endTime,
+      );
+      if (mounted) {
+        setState(() {
+          _state          = _S.saved;
+          _displayElapsed = Duration.zero;
+          _sessionStart   = null;
+        });
+      }
+    } catch (e) {
+      print('=== saveAndStopSilently: $e');
+    }
   }
 
   Future<void> _initCamera() async {
@@ -201,7 +240,7 @@ class _CameraScreenState extends State<CameraScreen> {
     });
   }
 
-  // ── 20-min session complete ───────────────────────────────────────────────
+  // ── 20-min session complete — auto-restart with 5-sec countdown ─────────
   Future<void> _endSession() async {
     if (!_isRecording) return;
     setState(() => _state = _S.stopping);
@@ -210,7 +249,6 @@ class _CameraScreenState extends State<CameraScreen> {
       final file    = await _ctrl!.stopVideoRecording();
       _savedCount++;
 
-      // Save as ONE complete session file (no splitting here)
       VideoProcessor().startBackgroundProcessing(
         rawVideoPath: file.path,
         sessionTime:  _sessionStart!,
@@ -218,17 +256,20 @@ class _CameraScreenState extends State<CameraScreen> {
       );
 
       if (!mounted) return;
-      // Show session-end prompt — auto-detect hands for next session
       setState(() {
         _state          = _S.sessionEnd;
         _displayElapsed = Duration.zero;
         _sessionStart   = null;
       });
 
-      if (_autoDetect) {
-        await Future.delayed(const Duration(seconds: 1));
-        if (mounted && _isSessionEnd) _startStream();
-      }
+      // Auto-restart: show session-end overlay for 2 seconds, then countdown
+      await Future.delayed(const Duration(seconds: 2));
+      if (!mounted || !_isSessionEnd) return;
+
+      // Start next session automatically (same as _manualStart but no stream toggle)
+      await _stopStream();
+      if (mounted && _isSessionEnd) _doCountdown();
+
     } catch (e) {
       print('=== endSession: $e');
       if (mounted) setState(() { _state = _S.detecting; _displayElapsed = Duration.zero; });
@@ -259,7 +300,42 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  void _goHome() {
+  Future<void> _goHome() async {
+    if (_isRecording) {
+      final confirm = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => AlertDialog(
+          title: const Text('Exit recording?'),
+          content: const Text(
+              'Recording is in progress. The current session will be saved and you will return to the dashboard.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Keep Recording')),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red,
+                  foregroundColor: Colors.white),
+              child: const Text('Save & Exit')),
+          ],
+        ),
+      );
+      if (confirm != true) return;
+      // Save current recording before exiting
+      _ticker?.cancel();
+      _alertTimer?.cancel();
+      try {
+        final endTime = DateTime.now();
+        final file    = await _ctrl!.stopVideoRecording();
+        VideoProcessor().startBackgroundProcessing(
+          rawVideoPath: file.path,
+          sessionTime:  _sessionStart ?? endTime,
+          recordingEnd: endTime,
+        );
+      } catch (_) {}
+    }
+    if (!mounted) return;
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     Navigator.popUntil(context, (r) => r.isFirst);
@@ -276,6 +352,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _ticker?.cancel();
     _alertTimer?.cancel();
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
@@ -294,7 +371,13 @@ class _CameraScreenState extends State<CameraScreen> {
           body: Center(child: CircularProgressIndicator(color: _green)));
     }
 
-    return Scaffold(
+    return PopScope(
+      canPop: false, // always intercept — we decide below
+      onPopInvokedWithResult: (didPop, _) async {
+        if (didPop) return;
+        await _goHome();
+      },
+      child: Scaffold(
       backgroundColor: Colors.black,
       body: Row(children: [
         // ── LEFT: Camera preview ──────────────────────────────────────────
@@ -566,10 +649,10 @@ class _CameraScreenState extends State<CameraScreen> {
                     ]),
                     Spacer(),
                     Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                      Text('Session = 20 min', style: TextStyle(fontSize: 11,
+                      Text('20 min session', style: TextStyle(fontSize: 11,
                           fontWeight: FontWeight.w700, color: _text)),
                       SizedBox(height: 1),
-                      Text('Saves as 1 file', style: TextStyle(fontSize: 9, color: _sub)),
+                      Text('Cloud synced', style: TextStyle(fontSize: 9, color: _sub)),
                     ]),
                   ])),
                 const SizedBox(height: 8),
@@ -578,7 +661,7 @@ class _CameraScreenState extends State<CameraScreen> {
           ])),
         )),
       ]),
-    );
+    ));
   }
 
   Widget _pill(String text, Color bg, Color fg) => Container(

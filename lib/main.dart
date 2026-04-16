@@ -7,6 +7,7 @@ import 'screens/dashboard_screen.dart';
 import 'services/local_video_storage.dart';
 import 'services/notification_service.dart';
 import 'services/upload_resume_service.dart';
+import 'services/backend_keepalive.dart';
 import 'services/session_store.dart';
 import 'screens/upload_progress_screen.dart';
 
@@ -83,7 +84,10 @@ void main() async {
     debugPrint('=== Storage permission request failed: $e');
   }
 
-  // ── 5. Run the app ────────────────────────────────────────────────────────
+  // ── 5. Start backend keep-alive (prevents Render cold start) ────────────
+  BackendKeepAlive().start();
+
+  // ── 6. Run the app ────────────────────────────────────────────────────────
   runApp(const OTNApp());
 }
 

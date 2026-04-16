@@ -286,7 +286,7 @@ class _LocalCard extends StatelessWidget {
             _Meta(Icons.timer_outlined, _dur),
             const SizedBox(width: 14),
             _Meta(Icons.video_file_outlined,
-                '${session.blockCount} block${session.blockCount != 1 ? 's' : ''}'),
+                session.blockCount == 1 ? '1 file' : '${session.blockCount} parts'),
           ]),
           // Inline upload progress bar
           if (isCurrentlyUploading && uploadPercent != null) ...[
@@ -465,7 +465,7 @@ class _SyncedCard extends StatelessWidget {
             _Meta(Icons.timer_outlined, _dur),
             const SizedBox(width: 14),
             _Meta(Icons.cloud_done_outlined,
-                '${session.blockCount} block${session.blockCount != 1 ? 's' : ''}'),
+                session.blockCount == 1 ? '1 file' : '${session.blockCount} parts'),
           ]),
           const SizedBox(height: 12),
           Container(width: double.infinity,
@@ -477,7 +477,7 @@ class _SyncedCard extends StatelessWidget {
             child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
               Icon(Icons.cloud_done, size: 14, color: _green),
               SizedBox(width: 6),
-              Text('Uploaded to OneDrive — local copy removed',
+              Text('Synced to cloud — local copy removed',
                   style: TextStyle(color: _green, fontSize: 12,
                       fontWeight: FontWeight.w500)),
             ])),

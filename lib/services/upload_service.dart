@@ -64,9 +64,9 @@ class UploadService {
 
     final total       = uploadChunks.length;
     final sessionName = localFile.split('/').last.replaceAll('.mp4', '');
-    print('=== UploadService: $total chunk(s) → direct to OneDrive');
+    print('=== UploadService: $total chunk(s) → direct to Cloud Storage');
 
-    // ── Step 2: Upload each chunk directly phone → OneDrive ───────────────
+    // ── Step 2: Upload each chunk directly phone → Cloud Storage ───────────────
     int successCount = 0;
 
     for (int i = 0; i < total; i++) {
@@ -82,7 +82,6 @@ class UploadService {
       if (!await File(chunkPath).exists()) { successCount++; continue; }
 
       // Chunk file name: sessionName_chunk01of04.mp4
-      final chunkFile = chunkPath.split('/').last;
       final chunkNum  = i + 1;
 
       // For single chunk, use clean name without suffix
@@ -108,11 +107,13 @@ class UploadService {
         }
         try {
           await _onedrive.uploadFile(
-            filePath:   chunkPath,
-            fileName:   uploadName,
-            dateFolder: dateFolder,
-            userFolder: userFolder,
-            rootFolder: _rootFolder,
+            filePath:    chunkPath,
+            fileName:    uploadName,
+            dateFolder:  dateFolder,
+            userFolder:  userFolder,
+            rootFolder:  _rootFolder,
+            isPaused:    () => _paused,
+            isCancelled: () => _cancelled,
             onProgress: (p) {
               onProgress(chunkNum, total, p);
               final overall = 0.05 + (i + p) / total * 0.90;
@@ -148,7 +149,7 @@ class UploadService {
     }
 
     // ── Step 3: All parts uploaded — delete local session file ────────────
-    onStatus('Upload complete ✓ ${total > 1 ? "$total parts in OneDrive" : "File in OneDrive"}');
+    onStatus('Upload complete ✓ ${total > 1 ? "$total parts in Cloud Storage" : "File in Cloud Storage"}');
     onOverallProgress?.call(1.0);
     _notif.showUploadComplete(total);
 

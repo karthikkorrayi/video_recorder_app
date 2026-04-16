@@ -5,7 +5,7 @@ import 'package:dio/dio.dart';
 /// The phone splits chunks locally, uploads each directly — no backend involved.
 /// Backend is only needed to get/refresh the access token.
 class OneDriveService {
-  static const String _backendUrl = 'https://video-recorder-app-d7zk.onrender.com';
+  static const String _backendUrl = 'https://otn-upload-backend.onrender.com';
   static const String _graphBase  = 'https://graph.microsoft.com/v1.0/me/drive';
   static const int    _graphChunk = 10 * 1024 * 1024; // 10MB per Graph API chunk
 
@@ -26,15 +26,29 @@ class OneDriveService {
       return _accessToken!;
     }
     try {
-      final res = await _dio.get('$_backendUrl/token',
-          options: Options(receiveTimeout: const Duration(seconds: 40)));
+      print('=== Getting token from backend...');
+      final res = await _dio.get(
+        '$_backendUrl/token',
+        options: Options(
+          receiveTimeout: const Duration(seconds: 75), // covers Render cold start
+          validateStatus: (s) => s != null && s < 600,
+        ),
+      );
+      if (res.statusCode == 404) {
+        throw Exception(
+          'Backend not updated yet. Please push the new server.js to Render '
+          'and wait for it to deploy. The /token endpoint is missing.');
+      }
+      if (res.statusCode != 200) {
+        throw Exception('Backend returned ${res.statusCode}: ${res.data}');
+      }
       _accessToken = res.data['access_token'] as String;
       final expiresIn = res.data['expires_in'] as int? ?? 3600;
       _tokenExpiry = DateTime.now().add(Duration(seconds: expiresIn));
-      print('=== OneDrive: token refreshed');
+      print('=== Token refreshed OK');
       return _accessToken!;
     } catch (e) {
-      throw Exception('Failed to get token from backend: $e');
+      throw Exception('Failed to get token: $e');
     }
   }
 
@@ -86,6 +100,8 @@ class OneDriveService {
     required String rootFolder,
     required void Function(double) onProgress,
     required void Function(String) onStatus,
+    bool Function()? isPaused,   // called before each chunk to check pause
+    bool Function()? isCancelled,
   }) async {
     onStatus('Getting access token...');
     final token  = await _getToken();
@@ -116,6 +132,13 @@ class OneDriveService {
     final  totalChunks = (fileSize / _graphChunk).ceil();
 
     while (offset < fileSize) {
+      // ── Pause check — waits here until resumed ───────────────────────────
+      while (isPaused != null && isPaused()) {
+        if (isCancelled != null && isCancelled()) return;
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
+      if (isCancelled != null && isCancelled()) return;
+
       final end       = (offset + _graphChunk).clamp(0, fileSize);
       final chunkSize = end - offset;
       chunkNum++;

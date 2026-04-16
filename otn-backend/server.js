@@ -4,22 +4,21 @@ const axios   = require('axios');
 const app = express();
 app.use(express.json());
 
-// ── CONFIG ────────────────────────────────────────────────────────────────────
 const CONFIG = {
   clientId:     process.env.MS_CLIENT_ID,
   clientSecret: process.env.MS_CLIENT_SECRET,
   refreshToken: process.env.MS_REFRESH_TOKEN,
 };
 if (!CONFIG.clientId || !CONFIG.clientSecret || !CONFIG.refreshToken) {
-  console.error('ERROR: Missing env vars MS_CLIENT_ID / MS_CLIENT_SECRET / MS_REFRESH_TOKEN');
-  process.exit(1);
+  console.error('ERROR: Missing env vars'); process.exit(1);
 }
 
 let cachedToken         = null;
 let tokenExpiresAt      = 0;
 let currentRefreshToken = CONFIG.refreshToken;
+let requestCount        = 0;
+const startTime         = Date.now();
 
-// ── TOKEN REFRESH ─────────────────────────────────────────────────────────────
 async function getToken() {
   if (cachedToken && Date.now() < tokenExpiresAt - 60000) return cachedToken;
   const res = await axios.post(
@@ -31,7 +30,7 @@ async function getToken() {
       grant_type:    'refresh_token',
       scope:         'Files.ReadWrite offline_access User.Read',
     }).toString(),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 }
   );
   cachedToken         = res.data.access_token;
   tokenExpiresAt      = Date.now() + res.data.expires_in * 1000;
@@ -40,30 +39,37 @@ async function getToken() {
   return cachedToken;
 }
 
-// ── ROUTES ────────────────────────────────────────────────────────────────────
-app.get('/',       (_, res) => res.json({ service: 'OTN Token Backend', status: 'ok' }));
-app.get('/health', (_, res) => res.json({ status: 'ok' }));
+// ── Routes ────────────────────────────────────────────────────────────────────
+app.get('/', (_, res) => res.json({
+  service:  'OTN Token Backend',
+  status:   'ok',
+  uptime:   Math.floor((Date.now() - startTime) / 1000) + 's',
+  requests: requestCount,
+}));
 
-// GET /token — phone calls this to get a fresh OneDrive access token.
-// Returns the token so the phone can upload directly to OneDrive.
-// No file data passes through this server at all.
+// Health check — used by phone keep-alive ping every 10 min
+app.get('/health', (_, res) => {
+  res.json({ status: 'ok', uptime: Math.floor((Date.now() - startTime) / 1000) + 's' });
+});
+
+// Token endpoint — phone calls this before every upload
 app.get('/token', async (req, res) => {
+  requestCount++;
   try {
     const token = await getToken();
     res.json({
       access_token: token,
       expires_in:   Math.floor((tokenExpiresAt - Date.now()) / 1000),
     });
-    console.log('Token served to phone');
+    console.log(`[${new Date().toISOString()}] Token served (#${requestCount})`);
   } catch (err) {
     console.error('Token error:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Failed to get token', detail: err.message });
+    res.status(500).json({ error: 'Token refresh failed', detail: err.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`OTN Token Backend on port ${PORT}`);
-  console.log('Mode: token-only — files upload directly phone → OneDrive');
-  console.log('RAM usage: ~10MB (no file handling)');
+  console.log('RAM usage: ~10MB | No file handling | Token-only mode');
 });
