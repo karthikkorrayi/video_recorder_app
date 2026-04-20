@@ -19,6 +19,7 @@ class _UploadManager {
   final _resume   = UploadResumeService();
   bool isRunning = false;
   String? activeSessionId;
+  bool _isPaused = false;
 
   final _ctrl = StreamController<_UploadState>.broadcast();
   Stream<_UploadState> get stream => _ctrl.stream;
@@ -98,9 +99,9 @@ class _UploadManager {
     }
   }
 
-  void pause()  => _service.pause();
-  void resume() => _service.resume();
-  bool get isPaused => _service.isPaused;
+  void pause()  { _isPaused = true; _service.pause(); }
+  void resume() { _isPaused = false; _service.resume(); }
+  bool get isPaused => _isPaused;
 }
 
 class _UploadState {

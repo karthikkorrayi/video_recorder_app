@@ -1,9 +1,8 @@
 import 'dart:io';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit_config.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:path_provider/path_provider.dart'; // for getTemporaryDirectory
+import 'package:path_provider/path_provider.dart';
 import 'package:intl/intl.dart';
 import 'package:uuid/uuid.dart';
 import 'attendance_service.dart';
@@ -19,8 +18,8 @@ class VideoProcessor {
   final _attendance = AttendanceService();
   final _store      = SessionStore();
 
-  // Chunk size for upload splitting only (not during recording)
-  static const int chunkSecs = 5 * 60; // 5 min
+  // Upload chunk size — only used at upload time, not during recording
+  static const int chunkSecs = 5 * 60;
 
   void startBackgroundProcessing({
     required String rawVideoPath,
@@ -31,7 +30,7 @@ class VideoProcessor {
       rawVideoPath: rawVideoPath,
       sessionTime:  sessionTime,
       recordingEnd: recordingEnd,
-    )).catchError((e) => print('=== VideoProcessor error: $e'));
+    )).catchError((e) => print('=== VideoProcessor bg error: $e'));
   }
 
   Future<void> _process({
@@ -46,86 +45,76 @@ class VideoProcessor {
     final sessionId  = const Uuid().v4();
     final folderName = await UserService().getDisplayName();
 
-    print('=== VideoProcessor: processing for $folderName');
-    print('=== VideoProcessor: raw file = $rawVideoPath');
+    print('=== VP: processing for $folderName');
 
-    // ── Verify raw file exists and has content ────────────────────────────
     final rawFile = File(rawVideoPath);
     if (!await rawFile.exists()) {
-      print('=== VideoProcessor: raw file not found!');
-      return;
+      print('=== VP: raw file missing'); return;
     }
     final rawSize = await rawFile.length();
-    print('=== VideoProcessor: raw size = ${(rawSize/1024/1024).toStringAsFixed(1)}MB');
-    if (rawSize < 1024) {
-      print('=== VideoProcessor: raw file too small, skipping');
-      return;
-    }
+    print('=== VP: raw = ${(rawSize/1024/1024).toStringAsFixed(1)}MB');
+    if (rawSize < 1024) { print('=== VP: raw too small'); return; }
 
     try {
-      // ── Build output directory ────────────────────────────────────────
-      final dir = await _sessionDir(sessionTime, folderName);
-      print('=== VideoProcessor: output dir = ${dir.path}');
+      // ── Step 1: Build output path ─────────────────────────────────────
+      final dir     = await _sessionDir(sessionTime, folderName);
+      final safeUid = _sanitize(userId.length > 12 ? userId.substring(0,12) : userId);
+      final dateStr = DateFormat('yyyyMMdd').format(sessionTime);
+      final timeStr = DateFormat('HHmmss').format(sessionTime);
+      final fileName    = '${safeUid}_${dateStr}_$timeStr.mp4';
+      final outputPath  = '${dir.path}/$fileName';
+      // Temp path in cache — process here first, then move
+      final tmpDir      = await getTemporaryDirectory();
+      final tmpPath     = '${tmpDir.path}/otn_tmp_$timeStr.mp4';
 
-      // ── Build filename ────────────────────────────────────────────────
-      final safeUid  = _sanitize(userId.length > 12
-          ? userId.substring(0, 12) : userId);
-      final dateStr  = DateFormat('yyyyMMdd').format(sessionTime);
-      final timeStr  = DateFormat('HHmmss').format(sessionTime);
-      final fileName = '${safeUid}_${dateStr}_$timeStr.mp4';
-      final outputPath = '${dir.path}/$fileName';
+      print('=== VP: output → $fileName');
 
-      print('=== VideoProcessor: saving → $fileName');
+      // ── Step 2: Process to temp path first ───────────────────────────
+      // -c copy = lossless, no re-encode
+      // -movflags +faststart = move moov atom to front so file is playable
+      // Writing to temp first ensures we never leave a partial file in media dir
+      final ok = await _runFFmpeg(
+        '-i "$rawVideoPath" -c copy -movflags +faststart -y "$tmpPath"');
 
-      // ── Copy raw → organised path (lossless, no re-encode) ────────────
-      final rc = await _runFFmpeg(
-          '-i "$rawVideoPath" -c copy -movflags +faststart -y "$outputPath"');
-
-      if (!rc) {
-        print('=== VideoProcessor: FFmpeg copy failed — trying direct file copy');
-        // Fallback: direct file copy if FFmpeg fails
-        try {
-          await rawFile.copy(outputPath);
-          print('=== VideoProcessor: direct copy succeeded');
-        } catch (copyErr) {
-          print('=== VideoProcessor: direct copy also failed: $copyErr');
-          return;
-        }
+      if (!ok || !await File(tmpPath).exists() || await File(tmpPath).length() < 1024) {
+        print('=== VP: FFmpeg failed, trying direct copy as fallback');
+        // Direct copy — file won't have faststart but is still valid
+        await rawFile.copy(tmpPath);
       }
 
-      // ── Verify output ─────────────────────────────────────────────────
-      final outFile = File(outputPath);
-      if (!await outFile.exists()) {
-        print('=== VideoProcessor: output file not created');
+      final tmpSize = await File(tmpPath).length();
+      print('=== VP: tmp = ${(tmpSize/1024/1024).toStringAsFixed(1)}MB');
+
+      if (tmpSize < 1024) {
+        print('=== VP: output too small, aborting');
+        try { await File(tmpPath).delete(); } catch (_) {}
         return;
       }
-      final outSize = await outFile.length();
+
+      // ── Step 3: Move from temp to final media location ───────────────
+      await File(tmpPath).copy(outputPath);
+      try { await File(tmpPath).delete(); } catch (_) {}
+
+      final outSize = await File(outputPath).length();
       if (outSize < 1024) {
-        print('=== VideoProcessor: output too small ($outSize bytes)');
-        await outFile.delete();
+        print('=== VP: final file missing');
         return;
       }
-      print('=== VideoProcessor: output OK — ${(outSize/1024/1024).toStringAsFixed(1)}MB');
+      print('=== VP: ✓ final = ${(outSize/1024/1024).toStringAsFixed(1)}MB');
 
-      // ── Probe duration ────────────────────────────────────────────────
-      // Use actual recording time difference as primary source — much more reliable
-      // than probing the file, which can fail on freshly written videos
-      final recordedDuration = recordingEnd.difference(sessionTime);
-      var durationSec = recordedDuration.inSeconds;
-      if (durationSec <= 0) {
-        // Fallback: probe the output file
-        durationSec = (await _probeDurationSec(outputPath)).toInt();
-      }
-      print('=== VideoProcessor: duration = ${durationSec}s');
+      // ── Step 4: Duration ──────────────────────────────────────────────
+      // Use recording time difference — more reliable than FFmpeg probe
+      // for freshly written files
+      final durationSec = recordingEnd.difference(sessionTime).inSeconds
+          .clamp(1, 24 * 3600);
+      print('=== VP: duration = ${durationSec}s');
 
-      // ── Clean up raw file ─────────────────────────────────────────────
+      // ── Step 5: Cleanup ───────────────────────────────────────────────
       try { await rawFile.delete(); } catch (_) {}
 
-      // ── Record attendance ─────────────────────────────────────────────
+      // ── Step 6: Attendance + Store ────────────────────────────────────
       await _attendance.recordSession(durationSec);
-
-      // ── Save session to store ─────────────────────────────────────────
-      final model = SessionModel(
+      await _store.save(SessionModel(
         id:              sessionId,
         userId:          userId,
         createdAt:       sessionTime,
@@ -134,55 +123,43 @@ class VideoProcessor {
         status:          'pending',
         localChunkPaths: [outputPath],
         uploadedBlocks:  [],
-      );
-      await _store.save(model);
-      print('=== VideoProcessor: ✓ saved → $fileName (${durationSec}s)');
+      ));
+      print('=== VP: ✓ saved → $fileName (${durationSec}s)');
 
     } catch (e) {
-      print('=== VideoProcessor error: $e');
+      print('=== VP error: $e');
     }
   }
 
-  /// Returns the session directory, creating it if needed.
-  /// Path: <external>/Android/media/com.otn.videorecorder/OTN/VideoRecorder/YYYY-MM-DD/DisplayName/
+  /// Returns the session directory under Android/media (visible in Files app)
   Future<Directory> _sessionDir(DateTime t, String displayName) async {
     Directory? base;
-
-    // Try external media dir first (accessible in Files app)
     try {
       final dirs = await getExternalStorageDirectories();
       if (dirs != null && dirs.isNotEmpty) {
-        // Go up to Android/media/com.otn.videorecorder/
-        String p = dirs.first.path;
-        // dirs.first is usually .../Android/data/com.otn.videorecorder/files
-        // We want .../Android/media/com.otn.videorecorder/OTN/VideoRecorder
-        p = p.replaceFirst('/Android/data/', '/Android/media/');
-        p = p.replaceFirst('/files', '');
+        String p = dirs.first.path
+            .replaceFirst('/Android/data/', '/Android/media/')
+            .replaceFirst('/files', '');
         base = Directory('$p/OTN/VideoRecorder');
       }
     } catch (_) {}
+    base ??= Directory(
+        '${(await getApplicationDocumentsDirectory()).path}/OTN/VideoRecorder');
 
-    // Fallback to app documents dir
-    if (base == null) {
-      final docs = await getApplicationDocumentsDirectory();
-      base = Directory('${docs.path}/OTN/VideoRecorder');
-    }
-
-    final dateStr    = DateFormat('yyyy-MM-dd').format(t);
-    final safeName   = _sanitize(displayName);
-    final dir = Directory('${base.path}/$dateStr/$safeName');
+    final dateStr  = DateFormat('yyyy-MM-dd').format(t);
+    final safeName = _sanitize(displayName);
+    final dir      = Directory('${base.path}/$dateStr/$safeName');
     await dir.create(recursive: true);
     return dir;
   }
 
-  /// Run an FFmpeg command, return true if successful.
   Future<bool> _runFFmpeg(String cmd) async {
     try {
       final session = await FFmpegKit.execute(cmd);
       final rc      = await session.getReturnCode();
       if (!ReturnCode.isSuccess(rc)) {
         final logs = await session.getAllLogsAsString();
-        print('=== FFmpeg failed: ${logs?.substring(0, logs.length.clamp(0, 300))}');
+        print('=== FFmpeg failed: ${logs?.substring(0, logs.length.clamp(0,200))}');
         return false;
       }
       return true;
@@ -192,7 +169,6 @@ class VideoProcessor {
     }
   }
 
-  /// Probe video duration using FFmpeg.
   Future<double> _probeDurationSec(String path) async {
     try {
       final session = await FFmpegKit.execute('-i "$path" -f null -');
@@ -203,40 +179,27 @@ class VideoProcessor {
              + int.parse(match.group(2)!) * 60.0
              + double.parse(match.group(3)!);
       }
-    } catch (e) {
-      print('=== probeDuration error: $e');
-    }
+    } catch (_) {}
     return 0.0;
   }
 
-  /// Split a local session file into 5-min chunks for upload.
-  /// Returns list of chunk paths in order. Called only at upload time.
+  /// Split into upload chunks — saved to cache dir (not media/gallery)
   Future<List<String>> splitForUpload(String filePath, DateTime sessionTime) async {
     final file = File(filePath);
     if (!await file.exists()) {
-      print('=== splitForUpload: file not found: $filePath');
-      return [];
+      print('=== splitForUpload: not found: $filePath'); return [];
     }
-
     final durationSec = await _probeDurationSec(filePath);
     final totalChunks = durationSec > 0
-        ? (durationSec / chunkSecs).ceil().clamp(1, 999)
-        : 1;
+        ? (durationSec / chunkSecs).ceil().clamp(1, 999) : 1;
 
-    if (totalChunks == 1) {
-      print('=== splitForUpload: single chunk, no split needed');
-      return [filePath];
-    }
+    if (totalChunks == 1) return [filePath];
 
-    // Save chunks to app cache — NOT the media folder
-    // This prevents them from appearing in the device photo gallery
-    final cacheDir = await getTemporaryDirectory();
-    final chunksDir = Directory('${cacheDir.path}/otn_upload_chunks');
+    final tmpDir   = await getTemporaryDirectory();
+    final chunksDir = Directory('${tmpDir.path}/otn_upload_chunks');
     await chunksDir.create(recursive: true);
     final baseName = filePath.split('/').last.replaceAll('.mp4', '');
     final chunks   = <String>[];
-
-    print('=== splitForUpload: ${durationSec.toStringAsFixed(1)}s → $totalChunks chunks');
 
     for (int i = 0; i < totalChunks; i++) {
       final startSec  = i * chunkSecs;
@@ -247,21 +210,14 @@ class VideoProcessor {
       final chunkPath = '${chunksDir.path}/${baseName}_chunk${n}of$m.mp4';
 
       final ok = await _runFFmpeg(
-          '-ss $startSec -i "$filePath" -t $dur '
-          '-c copy -avoid_negative_ts make_zero -movflags +faststart '
-          '-y "$chunkPath"');
+        '-ss $startSec -i "$filePath" -t $dur '
+        '-c copy -avoid_negative_ts make_zero -movflags +faststart '
+        '-y "$chunkPath"');
 
-      if (ok) {
-        final f = File(chunkPath);
-        if (await f.exists() && await f.length() > 512) {
-          chunks.add(chunkPath);
-          print('=== Chunk ${i+1} ✓');
-        }
-      } else {
-        print('=== Chunk ${i+1} failed');
+      if (ok && await File(chunkPath).exists() && await File(chunkPath).length() > 512) {
+        chunks.add(chunkPath);
       }
     }
-
     return chunks;
   }
 

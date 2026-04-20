@@ -5,20 +5,14 @@ import 'package:flutter/foundation.dart';
 
 /// Uploads files directly from phone to cloud storage using Microsoft Graph API.
 /// Backend only needed for token refresh — no file data passes through it.
-///
-/// Adaptive chunk sizing: measures real upload speed per slice and adjusts
-/// between 20MB (slow network) and 40MB (fast network) for next slice.
-/// Peak phone RAM = current chunk size (20–40MB) regardless of file size.
 class OneDriveService {
   static const String _backendUrl = 'https://video-recorder-app-d7zk.onrender.com';
   static const String _graphBase  = 'https://graph.microsoft.com/v1.0/me/drive';
 
-  // Adaptive chunk range — Graph API requires multiples of 320KB
-  static const int _minChunk  = 20 * 1024 * 1024; // 20MB — slow network
-  static const int _maxChunk  = 40 * 1024 * 1024; // 40MB — fast network
-  static const int _chunkStep = 320 * 1024;        // 320KB step
-
-  // Current chunk size — resets to min at start of each upload, adapts per slice
+  // Adaptive chunk sizing: 20MB–40MB based on measured network speed
+  static const int _minChunk  = 20 * 1024 * 1024;
+  static const int _maxChunk  = 40 * 1024 * 1024;
+  static const int _chunkStep =       320 * 1024; // Graph API requires 320KB multiples
   int _currentChunk = _minChunk;
 
   final Dio _dio = Dio(BaseOptions(
@@ -35,17 +29,16 @@ class OneDriveService {
     final mbps = bytesPerSec / 1024 / 1024;
     int target;
     if (mbps >= 10) {
-      target = _maxChunk;            // fast  → 40MB
+      target = _maxChunk;
     } else if (mbps >= 5) {
-      target = 30 * 1024 * 1024;    // medium→ 30MB
+      target = 30 * 1024 * 1024;
     } else {
-      target = _minChunk;            // slow  → 20MB
+      target = _minChunk;
     }
-    // Snap to nearest 320KB multiple and clamp to range
     target = ((target / _chunkStep).round() * _chunkStep).clamp(_minChunk, _maxChunk);
     if (target != _currentChunk) {
       _currentChunk = target;
-      debugPrint('=== Adaptive: ${mbps.toStringAsFixed(1)} Mbps → ${(_currentChunk / 1024 / 1024).toStringAsFixed(0)}MB slices');
+      debugPrint('=== Adaptive: ${mbps.toStringAsFixed(1)} Mbps → ${(_currentChunk~/1024~/1024)}MB');
     }
   }
 
@@ -56,7 +49,6 @@ class OneDriveService {
         DateTime.now().isBefore(_tokenExpiry!.subtract(const Duration(minutes: 2)))) {
       return _accessToken!;
     }
-    debugPrint('=== Getting token from backend...');
     final res = await _dio.get(
       '$_backendUrl/token',
       options: Options(
@@ -64,66 +56,93 @@ class OneDriveService {
         validateStatus: (s) => s != null && s < 600,
       ),
     );
-    if (res.statusCode == 404) {
-      throw Exception('Backend /token not found — push new server.js to Render');
-    }
     if (res.statusCode != 200) {
-      throw Exception('Backend returned ${res.statusCode}: ${res.data}');
+      throw Exception('Token failed: ${res.statusCode} — push new server.js to Render');
     }
     _accessToken = res.data['access_token'] as String;
     final expiresIn = res.data['expires_in'] as int? ?? 3600;
     _tokenExpiry = DateTime.now().add(Duration(seconds: expiresIn));
-    debugPrint('=== Token refreshed OK');
+    debugPrint('=== Token refreshed');
     return _accessToken!;
   }
 
-  // ── Folder helpers ────────────────────────────────────────────────────────
-  Future<String> _ensureFolder(String token, String parentId, String name) async {
+  // ── Folder helpers — fixed to avoid duplicate folders ─────────────────────
+  // Uses conflictBehavior:fail + catches 409 instead of $filter query.
+  // $filter had eventual consistency issues causing duplicate folder creation
+  // when multiple users upload simultaneously.
+  Future<String> _getOrCreateFolder(String token, String parentId, String name) async {
+    // First try to find existing folder by listing children
     try {
       final r = await _dio.get(
-        '$_graphBase/items/$parentId/children'
-        '?\$filter=name eq \'${Uri.encodeComponent(name)}\'&\$select=id',
+        '$_graphBase/items/$parentId/children?\$select=id,name&\$top=200',
         options: Options(
           headers: {'Authorization': 'Bearer $token'},
           validateStatus: (s) => s != null && s < 600,
         ),
       );
-      final items = r.data['value'] as List?;
-      if (items != null && items.isNotEmpty) return items[0]['id'] as String;
+      if (r.statusCode == 200) {
+        final items = r.data['value'] as List? ?? [];
+        for (final item in items) {
+          if ((item['name'] as String?)?.toLowerCase() == name.toLowerCase()) {
+            return item['id'] as String;
+          }
+        }
+      }
     } catch (_) {}
-    final r = await _dio.post(
-      '$_graphBase/items/$parentId/children',
-      data: {'name': name, 'folder': {}, '@microsoft.graph.conflictBehavior': 'rename'},
-      options: Options(headers: {
-        'Authorization': 'Bearer $token',
-        'Content-Type':  'application/json',
-      }),
-    );
-    return r.data['id'] as String;
+
+    // Not found — create it
+    try {
+      final r = await _dio.post(
+        '$_graphBase/items/$parentId/children',
+        data: {
+          'name':   name,
+          'folder': {},
+          '@microsoft.graph.conflictBehavior': 'fail', // fail if exists → catch 409
+        },
+        options: Options(
+          headers: {
+            'Authorization': 'Bearer $token',
+            'Content-Type':  'application/json',
+          },
+          validateStatus: (s) => s != null && s < 600,
+        ),
+      );
+      if (r.statusCode == 201) return r.data['id'] as String;
+
+      // 409 conflict = folder was created by another request simultaneously
+      if (r.statusCode == 409) {
+        // Re-fetch to get the ID
+        final r2 = await _dio.get(
+          '$_graphBase/items/$parentId/children?\$select=id,name&\$top=200',
+          options: Options(
+            headers: {'Authorization': 'Bearer $token'},
+            validateStatus: (s) => s != null && s < 600,
+          ),
+        );
+        final items = r2.data['value'] as List? ?? [];
+        for (final item in items) {
+          if ((item['name'] as String?)?.toLowerCase() == name.toLowerCase()) {
+            return item['id'] as String;
+          }
+        }
+      }
+      throw Exception('Could not get/create folder "$name": ${r.statusCode}');
+    } catch (e) {
+      throw Exception('Folder error "$name": $e');
+    }
   }
 
   Future<String> _getRootFolderId(String token, String rootName) async {
-    try {
-      final r = await _dio.get(
-        '$_graphBase/root/children'
-        '?\$filter=name eq \'${Uri.encodeComponent(rootName)}\'&\$select=id',
-        options: Options(
-          headers: {'Authorization': 'Bearer $token'},
-          validateStatus: (s) => s != null && s < 600,
-        ),
-      );
-      final items = r.data['value'] as List?;
-      if (items != null && items.isNotEmpty) return items[0]['id'] as String;
-    } catch (_) {}
-    final r = await _dio.post(
-      '$_graphBase/root/children',
-      data: {'name': rootName, 'folder': {}, '@microsoft.graph.conflictBehavior': 'rename'},
-      options: Options(headers: {
-        'Authorization': 'Bearer $token',
-        'Content-Type':  'application/json',
-      }),
+    // Get root's ID first, then use _getOrCreateFolder
+    final rootRes = await _dio.get(
+      '$_graphBase/root?\$select=id',
+      options: Options(
+        headers: {'Authorization': 'Bearer $token'},
+        validateStatus: (s) => s != null && s < 600,
+      ),
     );
-    return r.data['id'] as String;
+    final rootId = rootRes.data['id'] as String;
+    return _getOrCreateFolder(token, rootId, rootName);
   }
 
   // ── Upload single file ────────────────────────────────────────────────────
@@ -139,20 +158,103 @@ class OneDriveService {
     bool Function()? isCancelled,
   }) async {
     onStatus('Getting access token...');
-    final token  = await _getToken();
+    final token = await _getToken();
 
+    // Build folder structure — no duplicate folders
     onStatus('Preparing cloud folder...');
-    final rootId = await _getRootFolderId(token, rootFolder);
-    final dateId = await _ensureFolder(token, rootId, dateFolder);
-    final userId = await _ensureFolder(token, dateId, userFolder);
+    final otnId  = await _getRootFolderId(token, rootFolder);
+    final dateId = await _getOrCreateFolder(token, otnId,  dateFolder);
+    final userId = await _getOrCreateFolder(token, dateId, userFolder);
 
     final fileSize = await File(filePath).length();
-    debugPrint('=== Uploading: $fileName (${(fileSize / 1024 / 1024).toStringAsFixed(1)}MB)');
+    final fileSizeMB = (fileSize / 1024 / 1024).toStringAsFixed(1);
+    debugPrint('=== Uploading: $fileName ($fileSizeMB MB)');
 
-    // Step 1: Create upload session
-    onStatus('Creating upload session...');
-    final sessionRes = await _dio.post(
-      '$_graphBase/items/$userId:/${Uri.encodeComponent(fileName)}:/createUploadSession',
+    // Create upload session — valid for 24h, renewed automatically if expired
+    onStatus('Starting upload ($fileSizeMB MB)...');
+    String uploadUrl = await _createUploadSession(token, userId, fileName);
+
+    _currentChunk = _minChunk;
+    int offset   = 0;
+    int chunkNum = 0;
+    final sessionCreated = DateTime.now();
+
+    while (offset < fileSize) {
+      // Pause/cancel
+      while (isPaused != null && isPaused()) {
+        if (isCancelled != null && isCancelled()) return;
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
+      if (isCancelled != null && isCancelled()) return;
+
+      // Renew upload session if it's been open >20 minutes
+      // Graph API sessions expire after 24h but connections can drop
+      if (DateTime.now().difference(sessionCreated).inMinutes > 20 && offset > 0) {
+        debugPrint('=== Renewing upload session...');
+        try {
+          uploadUrl = await _createUploadSession(token, userId, fileName);
+        } catch (_) {
+          // If renewal fails, continue with existing URL
+        }
+      }
+
+      final end       = (offset + _currentChunk).clamp(0, fileSize);
+      final chunkSize = end - offset;
+      chunkNum++;
+
+      final chunk      = await _readChunk(filePath, offset, chunkSize);
+      final sliceStart = DateTime.now();
+
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        try {
+          final res = await _dio.put(
+            uploadUrl,
+            data: chunk,
+            options: Options(
+              headers: {
+                'Content-Range':  'bytes $offset-${end - 1}/$fileSize',
+                'Content-Length': '$chunkSize',
+                'Content-Type':   'application/octet-stream',
+              },
+              receiveTimeout: const Duration(minutes: 8),
+              sendTimeout:    const Duration(minutes: 8),
+              validateStatus: (s) =>
+                  s != null && (s == 200 || s == 201 || s == 202 || s == 308),
+            ),
+          );
+
+          // Measure speed and adapt
+          final elapsedMs = DateTime.now().difference(sliceStart).inMilliseconds;
+          if (elapsedMs > 0) {
+            _adaptChunkSize(chunkSize / (elapsedMs / 1000));
+          }
+          debugPrint('=== Slice $chunkNum → ${res.statusCode} | '
+              '${(chunkSize~/1024~/1024)}MB in ${elapsedMs}ms');
+          break;
+        } catch (e) {
+          debugPrint('=== Slice $chunkNum attempt $attempt: $e');
+          if (attempt == 3) rethrow;
+          _currentChunk = _minChunk; // back to safe size on retry
+          await Future.delayed(Duration(seconds: attempt * 5));
+        }
+      }
+
+      offset = end;
+      final pct = offset / fileSize;
+      onProgress(pct);
+      onStatus(
+        'Uploading ${(pct * 100).toStringAsFixed(0)}%'
+        ' · ${(_currentChunk ~/ 1024 ~/ 1024)}MB slices',
+      );
+    }
+
+    debugPrint('=== Upload complete: $fileName');
+  }
+
+  Future<String> _createUploadSession(
+      String token, String parentId, String fileName) async {
+    final res = await _dio.post(
+      '$_graphBase/items/$parentId:/${Uri.encodeComponent(fileName)}:/createUploadSession',
       data: {'item': {'@microsoft.graph.conflictBehavior': 'replace', 'name': fileName}},
       options: Options(
         headers: {
@@ -162,87 +264,12 @@ class OneDriveService {
         validateStatus: (s) => s != null && s < 600,
       ),
     );
-    if (sessionRes.statusCode != 200) {
-      throw Exception('Failed to create upload session: ${sessionRes.statusCode}');
+    if (res.statusCode != 200) {
+      throw Exception('Upload session failed: ${res.statusCode} ${res.data}');
     }
-    final uploadUrl = sessionRes.data['uploadUrl'] as String;
-
-    // Step 2: Upload with adaptive chunk sizing
-    _currentChunk = _minChunk; // reset to 20MB at start
-    int offset   = 0;
-    int chunkNum = 0;
-
-    while (offset < fileSize) {
-      // Pause/cancel check
-      while (isPaused != null && isPaused()) {
-        if (isCancelled != null && isCancelled()) return;
-        await Future.delayed(const Duration(milliseconds: 500));
-      }
-      if (isCancelled != null && isCancelled()) return;
-
-      final end       = (offset + _currentChunk).clamp(0, fileSize);
-      final chunkSize = end - offset;
-      chunkNum++;
-
-      // Read slice from disk — peak RAM = _currentChunk (20–40MB)
-      final chunk = await _readChunk(filePath, offset, chunkSize);
-
-      final sliceStart = DateTime.now();
-
-      // Retry each slice up to 3 times
-      for (int attempt = 1; attempt <= 3; attempt++) {
-        try {
-          final res = await _dio.put(
-            uploadUrl,
-            data: chunk, // raw Uint8List — Dio sends with correct Content-Length
-            options: Options(
-              headers: {
-                'Content-Range':  'bytes $offset-${end - 1}/$fileSize',
-                'Content-Length': '$chunkSize',
-                'Content-Type':   'application/octet-stream',
-              },
-              receiveTimeout: const Duration(minutes: 5),
-              sendTimeout:    const Duration(minutes: 5),
-              // 200/308 = intermediate chunk OK
-              // 201/202 = final chunk — file created in cloud
-              validateStatus: (s) =>
-                  s != null && (s == 200 || s == 201 || s == 202 || s == 308),
-            ),
-          );
-
-          // Measure speed → adapt chunk size for next slice
-          final elapsedMs = DateTime.now().difference(sliceStart).inMilliseconds;
-          if (elapsedMs > 0) {
-            final bytesPerSec = chunkSize / (elapsedMs / 1000);
-            _adaptChunkSize(bytesPerSec);
-          }
-
-          final mbps = (chunkSize / 1024 / 1024 / (elapsedMs / 1000)).toStringAsFixed(1);
-          debugPrint('=== Slice $chunkNum → ${res.statusCode} | '
-              '${(chunkSize / 1024 / 1024).toStringAsFixed(0)}MB '
-              'in ${elapsedMs}ms ($mbps Mbps) | '
-              'next: ${(_currentChunk / 1024 / 1024).toStringAsFixed(0)}MB');
-          break;
-        } catch (e) {
-          debugPrint('=== Slice $chunkNum attempt $attempt failed: $e');
-          if (attempt == 3) rethrow;
-          // On retry: drop back to minimum (network may be unstable)
-          _currentChunk = _minChunk;
-          await Future.delayed(Duration(seconds: attempt * 3));
-        }
-      }
-
-      offset = end;
-      final pct = offset / fileSize;
-      onProgress(pct);
-      onStatus('Uploading... ${(pct * 100).toStringAsFixed(0)}%'
-          ' · ${(_currentChunk / 1024 / 1024).toStringAsFixed(0)}MB slices');
-    }
-
-    debugPrint('=== Upload complete: $fileName');
+    return res.data['uploadUrl'] as String;
   }
 
-  // Read a slice of a file into memory (peak RAM = slice size)
   Future<Uint8List> _readChunk(String filePath, int start, int length) async {
     final raf   = await File(filePath).open();
     await raf.setPosition(start);
