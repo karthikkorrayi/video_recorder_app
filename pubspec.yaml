@@ -12,7 +12,7 @@ dependencies:
 
   # Camera & playback
   camera: ^0.10.6
-  video_player: ^2.8.6
+  video_player: ^2.8.3
   video_compress: ^3.1.2
   ffmpeg_kit_flutter_new: ^4.1.0
 
@@ -39,6 +39,8 @@ dependencies:
 
 dev_dependencies:
   flutter_test:
+    sdk: flutter
+  integration_test:
     sdk: flutter
   flutter_lints: ^3.0.0
   flutter_launcher_icons: ^0.14.3

@@ -12,7 +12,7 @@ class BackendKeepAlive {
   factory BackendKeepAlive() => _i;
   BackendKeepAlive._();
 
-  static const String _backendUrl = 'https://otn-upload-backend.onrender.com';
+  static const String _backendUrl = 'https://video-recorder-app-d7zk.onrender.com';
   static const Duration _interval = Duration(minutes: 10);
 
   final _dio = Dio(BaseOptions(

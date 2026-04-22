@@ -1,19 +1,25 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
-/// Fetches and caches the user's display name from Firestore.
-/// Admin can update names in Firestore → app picks up on next load.
-/// No app update required.
+/// Single source of truth for resolving the current user's display name.
+///
+/// Priority:
+///   1. Firestore: users/{uid}/displayName
+///   2. Firestore: user_names/{email}/name
+///   3. Fallback: email prefix (e.g. "test" from test@otn.in)
+///
+/// Result is cached in memory for the session lifetime.
+/// Call [clearCache] on logout.
 class UserService {
-  static final UserService _i = UserService._();
-  factory UserService() => _i;
-  UserService._();
+  static final UserService _instance = UserService._internal();
+  factory UserService() => _instance;
+  UserService._internal();
 
-  final _db = FirebaseFirestore.instance;
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
   String? _cachedName;
 
-  /// Returns the display name for the current user.
-  /// Checks Firestore 'users' collection first, falls back to email prefix.
+  /// Returns the display name for the current logged-in user.
+  /// Used for: dashboard greeting, OneDrive folder name, sync verification.
   Future<String> getDisplayName() async {
     if (_cachedName != null) return _cachedName!;
 
@@ -21,51 +27,49 @@ class UserService {
     if (user == null) return 'User';
 
     try {
-      // Check per-user doc: users/{uid}/displayName
+      // 1. Check users/{uid} doc
       final doc = await _db.collection('users').doc(user.uid).get();
       if (doc.exists && doc.data()?['displayName'] != null) {
         _cachedName = doc.data()!['displayName'] as String;
         return _cachedName!;
       }
 
-      // Fallback: check email-based lookup in 'user_names' collection
+      // 2. Check user_names/{email} doc
       final email = user.email ?? '';
-      final nameDoc = await _db.collection('user_names').doc(email).get();
-      if (nameDoc.exists && nameDoc.data()?['name'] != null) {
-        _cachedName = nameDoc.data()!['name'] as String;
-        return _cachedName!;
+      if (email.isNotEmpty) {
+        final nameDoc =
+            await _db.collection('user_names').doc(email).get();
+        if (nameDoc.exists && nameDoc.data()?['name'] != null) {
+          _cachedName = nameDoc.data()!['name'] as String;
+          return _cachedName!;
+        }
       }
     } catch (e) {
-      print('=== UserService: Firestore lookup failed: $e');
+      // Firestore unavailable — fall through to email prefix
     }
 
-    // Final fallback: email prefix
+    // 3. Fallback: email prefix
     final email = user.email ?? 'User';
     _cachedName = email.split('@').first;
     return _cachedName!;
   }
 
-  /// Returns the OneDrive folder name for the current user.
-  /// Same as display name — used when uploading.
-  Future<String> getOneDriveFolderName() async => getDisplayName();
+  /// Same as [getDisplayName] — alias used for OneDrive folder name.
+  Future<String> getOneDriveFolderName() => getDisplayName();
 
-  /// Call this when user logs out to clear cache.
+  /// Clear cache on logout so next user gets fresh lookup.
   void clearCache() => _cachedName = null;
 
-  /// Admin utility: set a user's display name in Firestore.
-  /// Run from Firebase console or a small admin script.
-  /// Structure: users/{uid} → {displayName: "Full Name", email: "..."}
-  static Future<void> setDisplayName(String uid, String name, String email) async {
-    await FirebaseFirestore.instance.collection('users').doc(uid).set({
-      'displayName': name,
-      'email': email,
-      'updatedAt': FieldValue.serverTimestamp(),
-    }, SetOptions(merge: true));
-
-    // Also index by email for easy lookup
-    await FirebaseFirestore.instance.collection('user_names').doc(email).set({
-      'name': name,
-      'uid': uid,
-    }, SetOptions(merge: true));
+  /// Admin utility — sets displayName in Firestore for a user.
+  /// Call this from your admin panel or Firebase console script.
+  static Future<void> setDisplayName(
+      String uid, String name, String email) async {
+    final db = FirebaseFirestore.instance;
+    await db.collection('users').doc(uid).set(
+        {'displayName': name, 'email': email},
+        SetOptions(merge: true));
+    await db.collection('user_names').doc(email).set(
+        {'name': name, 'uid': uid},
+        SetOptions(merge: true));
   }
 }

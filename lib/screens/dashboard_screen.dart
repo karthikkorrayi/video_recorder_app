@@ -1,413 +1,672 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:intl/intl.dart';
-import '../services/auth_service.dart';
+import '../services/chunk_upload_queue.dart';
+import '../services/cloud_cache_service.dart';
 import '../services/session_store.dart';
+import '../services/onedrive_service.dart';
 import '../services/user_service.dart';
-import '../models/session_model.dart';
-import 'camera_screen.dart';
 import 'history_screen.dart';
-
-const _green   = Color(0xFF00C853);
-const _surface = Color(0xFFF4F6F8);
-const _card    = Color(0xFFFFFFFF);
-const _text    = Color(0xFF1A1A1A);
-const _textSub = Color(0xFF666666);
-const _border  = Color(0xFFE0E0E0);
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
+
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  final _auth       = AuthService();
-  final _store      = SessionStore();
+  static const _green  = Color(0xFF00C853);
+  static const _blue   = Colors.blue;
+  static const _orange = Colors.orange;
+  static const _red    = Colors.redAccent;
 
-  // All raw data
-  List<SessionModel>    _allSessions = [];
-  String _displayName = '';
+  final _queue = ChunkUploadQueue();
+  final _cache = CloudCacheService();
 
-  // ── Selected date range — default is today ─────────────────────────────
-  late DateTime _rangeStart;
-  late DateTime _rangeEnd;
-  String _rangeLabel = 'Today';
+  DateFilter _filter = DateFilter.today;
+  String _userDisplayName = '';
+  Timer? _syncTimer;
 
   @override
   void initState() {
     super.initState();
-    // Default: today
-    final now = DateTime.now();
-    _rangeStart = DateTime(now.year, now.month, now.day);
-    _rangeEnd   = _rangeStart;
-    _load();
+    _init();
   }
 
-  Future<void> _load() async {
-    final name       = await UserService().getDisplayName();
-    final sessions   = await _store.getAll();
-    if (mounted) setState(() {
-      _displayName = name;
-      _allSessions = sessions;
+  Future<void> _init() async {
+    _userDisplayName = await UserService().getDisplayName();
+    OneDriveService.startBackgroundSync();
+    _cache.syncIfStale();
+
+    // Sync every 5 minutes
+    _syncTimer = Timer.periodic(const Duration(minutes: 5), (_) {
+      _cache.syncNow();
     });
+
+    if (mounted) setState(() {});
   }
 
-  // ── Filtering helpers ───────────────────────────────────────────────────
-  bool _inRange(DateTime dt) {
-    final d = DateTime(dt.year, dt.month, dt.day);
-    return !d.isBefore(_rangeStart) && !d.isAfter(_rangeEnd);
+  @override
+  void dispose() {
+    _syncTimer?.cancel();
+    super.dispose();
   }
 
-  List<SessionModel> get _filteredSessions =>
-      _allSessions.where((s) => _inRange(s.createdAt)).toList();
-
-
-  // Metrics for filtered range
-  int get _recordingCount  => _filteredSessions.length;
-  int get _localCount      => _filteredSessions.where((s) => s.status != 'synced').length;
-  int get _syncedCount     => _filteredSessions.where((s) => s.status == 'synced').length;
-  int get _totalSecs       => _filteredSessions.fold(0, (s, e) => s + e.durationSeconds);
-
-  String _fmt(int secs) {
-    if (secs == 0) return '0s';
-    if (secs < 60) return '${secs}s';
-    final h = secs ~/ 3600;
-    final m = (secs % 3600) ~/ 60;
-    final s = secs % 60;
-    if (h > 0) return s > 0 ? '${h}h ${m}m' : '${h}h ${m}m';
-    return s > 0 ? '${m}m ${s}s' : '${m}m';
+  Future<void> _manualRefresh() async {
+    await _cache.syncNow();
+    if (mounted) setState(() {});
   }
 
-  // ── Calendar picker ─────────────────────────────────────────────────────
-  Future<void> _openCalendar() async {
-    final now = DateTime.now();
-    final picked = await showDateRangePicker(
-      context: context,
-      firstDate: DateTime(2020),
-      lastDate: now,
-      initialDateRange: DateTimeRange(start: _rangeStart, end: _rangeEnd),
-      builder: (ctx, child) => Theme(
-        data: Theme.of(ctx).copyWith(
-          colorScheme: const ColorScheme.light(primary: _green)),
-        child: child!),
-    );
+  void _applyFilter(DateFilter f) => setState(() => _filter = f);
 
-    if (picked != null) {
-      final s = picked.start;
-      final e = picked.end;
-      String label;
-      final today  = DateTime(now.year, now.month, now.day);
-      final yest   = today.subtract(const Duration(days: 1));
-      final startD = DateTime(s.year, s.month, s.day);
-      final endD   = DateTime(e.year, e.month, e.day);
+  // ── Cloud metrics from CloudCacheService ──────────────────────────────────
 
-      if (startD == today && endD == today) {
-        label = 'Today';
-      } else if (startD == yest && endD == yest) {
-        label = 'Yesterday';
-      } else if (startD == endD) {
-        label = DateFormat('d MMM yyyy').format(s);
-      } else {
-        label = '${DateFormat('d MMM').format(s)} – ${DateFormat('d MMM yyyy').format(e)}';
-      }
-
-      setState(() {
-        _rangeStart = startD;
-        _rangeEnd   = endD;
-        _rangeLabel = label;
-      });
-    }
-  }
-
-  // Quick presets
-  void _setPreset(String preset) {
+  /// Files matching selected filter
+  List<Map<String, dynamic>> get _filteredFiles {
+    final files = _cache.files;
     final now   = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
-    DateTime s, e;
-    switch (preset) {
-      case 'today':
-        s = today; e = today;
-        _rangeLabel = 'Today';
-        break;
-      case 'yesterday':
-        s = today.subtract(const Duration(days: 1));
-        e = s;
-        _rangeLabel = 'Yesterday';
-        break;
-      case 'week':
-        s = today.subtract(Duration(days: today.weekday - 1));
-        e = today;
-        _rangeLabel = 'This Week';
-        break;
-      case 'month':
-        s = DateTime(now.year, now.month, 1);
-        e = today;
-        _rangeLabel = 'This Month';
-        break;
-      case 'all':
-        s = DateTime(2020); e = today;
-        _rangeLabel = 'All Time';
-        break;
-      default: return;
-    }
-    setState(() { _rangeStart = s; _rangeEnd = e; });
+
+    return files.where((f) {
+      final folder = f['dateFolder'] as String? ?? '';
+      final dt     = _parseFolderDate(folder);
+      if (dt == null) return false;
+      final d = DateTime(dt.year, dt.month, dt.day);
+      switch (_filter.type) {
+        case FilterType.today:
+          return d == DateTime(now.year, now.month, now.day);
+        case FilterType.yesterday:
+          final y = DateTime(now.year, now.month, now.day)
+              .subtract(const Duration(days: 1));
+          return d == y;
+        case FilterType.thisWeek:
+          final start = DateTime(now.year, now.month, now.day)
+              .subtract(Duration(days: now.weekday - 1));
+          return !d.isBefore(start) &&
+              d.isBefore(DateTime(now.year, now.month, now.day + 1));
+        case FilterType.thisMonth:
+          return dt.year == now.year && dt.month == now.month;
+        case FilterType.custom:
+          if (_filter.from == null || _filter.to == null) return false;
+          return !d.isBefore(_filter.from!) && !d.isAfter(_filter.to!);
+      }
+    }).toList();
   }
+
+  /// Unique sessions in the filtered files (grouped by sessionFolder)
+  int get _filteredSessionCount {
+    final keys = <String>{};
+    for (final f in _filteredFiles) {
+      keys.add(f['sessionFolder'] as String? ??
+          f['dateFolder'] as String? ?? '');
+    }
+    return keys.length;
+  }
+
+  /// Total recorded minutes from filtered files (parsed from filename)
+  int get _filteredTotalMins {
+    int total = 0;
+    for (final f in _filteredFiles) {
+      total += _parseFileDurationMins(f['name'] as String? ?? '');
+    }
+    return total;
+  }
+
+  /// This month totals from ALL cloud files
+  List<Map<String, dynamic>> get _monthFiles {
+    final now = DateTime.now();
+    return _cache.files.where((f) {
+      final folder = f['dateFolder'] as String? ?? '';
+      final dt     = _parseFolderDate(folder);
+      return dt != null && dt.year == now.year && dt.month == now.month;
+    }).toList();
+  }
+
+  int get _monthTotalMins {
+    return _monthFiles.fold(
+        0, (s, f) => s + _parseFileDurationMins(f['name'] as String? ?? ''));
+  }
+
+  int get _monthSessionCount {
+    final keys = <String>{};
+    for (final f in _monthFiles) {
+      keys.add(f['sessionFolder'] as String? ?? '');
+    }
+    return keys.length;
+  }
+
+  int get _syncedForFilter => _filteredFiles.length;
+
+  String _fmtMins(int mins) =>
+      mins < 60 ? '${mins}m' : '${mins ~/ 60}h ${mins % 60}m';
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: _surface,
+      backgroundColor: const Color(0xFFF5F5F5),
       body: SafeArea(
         child: RefreshIndicator(
-          onRefresh: _load,
           color: _green,
+          onRefresh: _manualRefresh,
           child: SingleChildScrollView(
             physics: const AlwaysScrollableScrollPhysics(),
-            padding: const EdgeInsets.all(18),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-
-              // ── Header ─────────────────────────────────────────────────
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(color: _card,
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: _border)),
-                child: Row(children: [
-                  Container(width: 46, height: 46,
-                    decoration: BoxDecoration(color: Colors.black,
-                        borderRadius: BorderRadius.circular(12)),
-                    child: const Center(child: Text('OTN',
-                        style: TextStyle(color: _green, fontSize: 11,
-                            fontWeight: FontWeight.w800)))),
-                  const SizedBox(width: 12),
-                  Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Text(_displayName.isEmpty ? 'Hello!' : 'Hello, $_displayName',
-                        style: const TextStyle(color: _text, fontSize: 18,
-                            fontWeight: FontWeight.w700)),
-                    const Text('Omni Trade Networks',
-                        style: TextStyle(color: _textSub, fontSize: 12)),
-                  ])),
-                  IconButton(
-                    icon: const Icon(Icons.logout, color: _textSub),
-                    onPressed: () async {
-                      UserService().clearCache();
-                      await _auth.signOut();
-                    }),
-                ]),
-              ),
-
-              const SizedBox(height: 14),
-
-              // ── Start Recording ─────────────────────────────────────────
-              GestureDetector(
-                onTap: () async {
-                  await Navigator.push(context,
-                      MaterialPageRoute(builder: (_) => const CameraScreen()));
-                  _load();
-                },
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.symmetric(vertical: 22),
-                  decoration: BoxDecoration(
-                    color: Colors.black,
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: _green.withValues(alpha: 0.6), width: 1.5)),
-                  child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    CircleAvatar(backgroundColor: Colors.transparent,
-                      child: Icon(Icons.videocam, color: _green, size: 28)),
-                    SizedBox(width: 14),
-                    Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text('Start Recording',
-                          style: TextStyle(color: Colors.white, fontSize: 18,
-                              fontWeight: FontWeight.w700)),
-                      Text('Tap to open camera',
-                          style: TextStyle(color: Colors.white54, fontSize: 12)),
-                    ]),
-                  ]),
-                ),
-              ),
-
-              const SizedBox(height: 16),
-
-              // ── Date filter row ─────────────────────────────────────────
-              // Calendar icon + range label + quick presets
-              Container(
-                padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
-                decoration: BoxDecoration(color: _card,
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: _border)),
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Row(children: [
-                    // Calendar icon button
-                    GestureDetector(
-                      onTap: _openCalendar,
-                      child: Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: _green.withValues(alpha: 0.1),
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(color: _green.withValues(alpha: 0.3))),
-                        child: const Icon(Icons.calendar_month,
-                            color: _green, size: 20)),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(child: GestureDetector(
-                      onTap: _openCalendar,
-                      child: Text(_rangeLabel,
-                          style: const TextStyle(color: _text, fontSize: 15,
-                              fontWeight: FontWeight.w700)),
-                    )),
-                    // Edit icon hint
-                    GestureDetector(
-                      onTap: _openCalendar,
-                      child: const Icon(Icons.edit_calendar_outlined,
-                          color: _textSub, size: 18)),
-                  ]),
-                  const SizedBox(height: 10),
-                  // Quick preset chips
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(children: [
-                      _Preset('Today',     () => _setPreset('today'),     _rangeLabel == 'Today'),
-                      _Preset('Yesterday', () => _setPreset('yesterday'), _rangeLabel == 'Yesterday'),
-                      _Preset('This Week', () => _setPreset('week'),      _rangeLabel == 'This Week'),
-                      _Preset('This Month',() => _setPreset('month'),     _rangeLabel == 'This Month'),
-                      _Preset('All Time',  () => _setPreset('all'),       _rangeLabel == 'All Time'),
-                    ]),
-                  ),
-                ]),
-              ),
-
-              const SizedBox(height: 12),
-
-              // ── Metrics (filtered by date range) ───────────────────────
-              Row(children: [
-                _StatCard(
-                  label: 'Recordings',
-                  value: '$_recordingCount',
-                  sub: _fmt(_totalSecs),
-                  icon: Icons.video_library_outlined,
-                  color: _green,
-                ),
-                const SizedBox(width: 10),
-                _StatCard(
-                  label: 'Total Time',
-                  value: _fmt(_totalSecs),
-                  sub: '$_recordingCount recording${_recordingCount != 1 ? 's' : ''}',
-                  icon: Icons.timer_outlined,
-                  color: Colors.blue,
-                ),
-              ]),
-              const SizedBox(height: 10),
-              Row(children: [
-                _StatCard(
-                  label: 'Local',
-                  value: '$_localCount',
-                  sub: 'not yet uploaded',
-                  icon: Icons.phone_android,
-                  color: Colors.orange,
-                ),
-                const SizedBox(width: 10),
-                _StatCard(
-                  label: 'Synced',
-                  value: '$_syncedCount',
-                  sub: 'on OneDrive',
-                  icon: Icons.cloud_done_outlined,
-                  color: _green,
-                ),
-              ]),
-
-              const SizedBox(height: 14),
-
-              // ── My Recordings link ──────────────────────────────────────
-              GestureDetector(
-                onTap: () async {
-                  await Navigator.push(context,
-                      MaterialPageRoute(builder: (_) => const HistoryScreen()));
-                  _load();
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                  decoration: BoxDecoration(color: _card,
-                      borderRadius: BorderRadius.circular(14),
-                      border: Border.all(color: _border)),
-                  child: Row(children: [
-                    const Icon(Icons.history, color: _green, size: 22),
-                    const SizedBox(width: 12),
-                    const Expanded(child: Text('My Recordings',
-                        style: TextStyle(color: _text, fontSize: 15,
-                            fontWeight: FontWeight.w600))),
-                    Text('$_recordingCount video${_recordingCount != 1 ? 's' : ''}',
-                        style: const TextStyle(color: _textSub, fontSize: 13)),
-                    const SizedBox(width: 6),
-                    const Icon(Icons.chevron_right, color: _textSub, size: 18),
-                  ]),
-                ),
-              ),
-
-              const SizedBox(height: 24),
-            ]),
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              children: [
+                _buildHeader(),
+                const SizedBox(height: 16),
+                _buildStartRecording(),
+                const SizedBox(height: 16),
+                _buildSyncBanner(),
+                const SizedBox(height: 16),
+                _buildFilterSection(),
+                const SizedBox(height: 12),
+                // ── TOP ROW: Live queue stats ──────────────────────────
+                _buildLiveQueueRow(),
+                const SizedBox(height: 16),
+                // ── ATTENDANCE: Cloud totals ───────────────────────────
+                _buildAttendance(),
+                const SizedBox(height: 16),
+                _buildMyRecordingsCard(),
+              ],
+            ),
           ),
         ),
       ),
     );
   }
+
+  // ── Header ────────────────────────────────────────────────────────────────
+
+  Widget _buildHeader() => Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+            color: Colors.white, borderRadius: BorderRadius.circular(12)),
+        child: Row(children: [
+          Container(
+            width: 48, height: 48,
+            decoration: BoxDecoration(
+                color: Colors.black,
+                borderRadius: BorderRadius.circular(10)),
+            child: const Center(
+              child: Text('OTN',
+                  style: TextStyle(
+                      color: _green,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13)),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Hello, $_userDisplayName',
+                    style: const TextStyle(
+                        fontWeight: FontWeight.bold, fontSize: 16)),
+                const Text('Omni Trade Networks',
+                    style: TextStyle(color: Colors.grey, fontSize: 12)),
+              ],
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.logout, color: Colors.grey),
+            onPressed: () {
+              UserService().clearCache();
+              FirebaseAuth.instance.signOut();
+            },
+          ),
+        ]),
+      );
+
+  Widget _buildStartRecording() => GestureDetector(
+        onTap: () => Navigator.pushNamed(context, '/camera'),
+        child: Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+              color: Colors.black,
+              borderRadius: BorderRadius.circular(12)),
+          child: const Row(children: [
+            Icon(Icons.videocam, color: _green, size: 32),
+            SizedBox(width: 16),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Start Recording',
+                    style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 18)),
+                Text('Tap to open camera',
+                    style: TextStyle(color: Colors.grey, fontSize: 12)),
+              ],
+            ),
+          ]),
+        ),
+      );
+
+  Widget _buildSyncBanner() {
+    return StreamBuilder<CacheState>(
+      stream: _cache.stream,
+      builder: (_, snap) {
+        final synced = _cache.files.length;
+        if (synced == 0) return const SizedBox.shrink();
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          decoration: BoxDecoration(
+              color: const Color(0xFFE8F5E9),
+              borderRadius: BorderRadius.circular(12)),
+          child: Row(children: [
+            const Icon(Icons.cloud_done, color: _green),
+            const SizedBox(width: 8),
+            Text('$synced file(s) synced ✓',
+                style: const TextStyle(
+                    color: _green, fontWeight: FontWeight.w600)),
+            const Spacer(),
+            Text(_cache.lastSyncLabel,
+                style: const TextStyle(color: _green, fontSize: 12)),
+          ]),
+        );
+      },
+    );
+  }
+
+  // ── Filter section ────────────────────────────────────────────────────────
+
+  Widget _buildFilterSection() => Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+            color: Colors.white, borderRadius: BorderRadius.circular(12)),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              const Icon(Icons.calendar_month, color: _green, size: 20),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                    color: const Color(0xFFE8F5E9),
+                    borderRadius: BorderRadius.circular(12)),
+                child: Text(_cache.lastSyncLabel,
+                    style: const TextStyle(color: _green, fontSize: 12)),
+              ),
+              const SizedBox(width: 8),
+              Text(_filter.label,
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 15)),
+            ]),
+            const SizedBox(height: 12),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(children: [
+                ...[
+                  DateFilter.today,
+                  DateFilter.yesterday,
+                  DateFilter.thisWeek,
+                  DateFilter.thisMonth,
+                ].map((f) => _DashChip(
+                      label: f.label,
+                      selected: _filter.type == f.type,
+                      onTap: () => _applyFilter(f),
+                    )),
+                _CalendarChip(
+                  selected: _filter.type == FilterType.custom,
+                  label: _filter.type == FilterType.custom
+                      ? _filter.label
+                      : null,
+                  onTap: _pickCustomRange,
+                ),
+              ]),
+            ),
+          ],
+        ),
+      );
+
+  Future<void> _pickCustomRange() async {
+    final now = DateTime.now();
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(now.year, now.month, 1),
+      lastDate: DateTime(now.year, now.month + 1, 0),
+      builder: (ctx, child) => Theme(
+        data: Theme.of(ctx).copyWith(
+            colorScheme: const ColorScheme.light(primary: _green)),
+        child: child!,
+      ),
+    );
+    if (picked != null) {
+      _applyFilter(DateFilter(FilterType.custom,
+          from: picked.start, to: picked.end));
+    }
+  }
+
+  // ── TOP ROW: Live ChunkUploadQueue stats ──────────────────────────────────
+
+  Widget _buildLiveQueueRow() {
+    return StreamBuilder<List<ChunkState>>(
+      stream: _queue.stream,
+      builder: (_, snap) {
+        final pending   = _queue.pendingCount;
+        final uploading = _queue.uploadingCount;
+        final failed    = _queue.failedCount;
+        final synced    = _syncedForFilter;
+
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12)),
+          child: Row(children: [
+            _MetricTile(
+              icon: Icons.play_circle_outline,
+              value: '$synced',
+              label: 'sessions',
+              color: _green,
+            ),
+            _vDivider(),
+            _MetricTile(
+              icon: Icons.cloud_upload_outlined,
+              value: '$uploading${pending > 0 ? '+$pending' : ''}',
+              label: uploading > 0 ? 'uploading' : 'idle',
+              color: uploading > 0 ? _blue : Colors.grey,
+            ),
+            _vDivider(),
+            _MetricTile(
+              icon: failed > 0
+                  ? Icons.error_outline
+                  : Icons.check_circle_outline,
+              value: failed > 0 ? '$failed' : '✓',
+              label: failed > 0 ? 'failed' : 'synced',
+              color: failed > 0 ? _red : _green,
+            ),
+          ]),
+        );
+      },
+    );
+  }
+
+  Widget _vDivider() => Container(
+      height: 32,
+      width: 1,
+      color: Colors.grey[200],
+      margin: const EdgeInsets.symmetric(horizontal: 8));
+
+  // ── ATTENDANCE: Cloud totals ──────────────────────────────────────────────
+
+  Widget _buildAttendance() {
+    return StreamBuilder<CacheState>(
+      stream: _cache.stream,
+      builder: (_, __) {
+        return Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12)),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: [
+                const Icon(Icons.person_outline, color: _green, size: 20),
+                const SizedBox(width: 8),
+                const Text('Attendance',
+                    style: TextStyle(
+                        fontWeight: FontWeight.bold, fontSize: 15)),
+                const Spacer(),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                      color: const Color(0xFFE8F5E9),
+                      borderRadius: BorderRadius.circular(12)),
+                  child: Text(_cache.lastSyncLabel,
+                      style:
+                          const TextStyle(color: _green, fontSize: 12)),
+                ),
+              ]),
+              const SizedBox(height: 12),
+
+              // Recorded time for selected filter
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                    color: const Color(0xFFE8F5E9),
+                    borderRadius: BorderRadius.circular(10)),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(children: [
+                      const Icon(Icons.calendar_today,
+                          color: _green, size: 20),
+                      const SizedBox(width: 8),
+                      Text(_fmtMins(_filteredTotalMins),
+                          style: const TextStyle(
+                              fontSize: 28,
+                              fontWeight: FontWeight.bold,
+                              color: _green)),
+                    ]),
+                    const SizedBox(height: 4),
+                    Text("${_filter.label}'s recorded time",
+                        style: TextStyle(
+                            color: Colors.grey[600], fontSize: 12)),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+
+              // This month totals (always month, regardless of filter)
+              Row(children: [
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                        color: const Color(0xFFE3F2FD),
+                        borderRadius: BorderRadius.circular(10)),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(Icons.timer_outlined,
+                            color: Colors.blue, size: 20),
+                        const SizedBox(height: 4),
+                        Text(_fmtMins(_monthTotalMins),
+                            style: const TextStyle(
+                                fontSize: 22,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.blue)),
+                        const SizedBox(height: 2),
+                        const Text('Total Time\n(this month)',
+                            style: TextStyle(
+                                color: Colors.blue, fontSize: 11)),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                        color: const Color(0xFFF3E5F5),
+                        borderRadius: BorderRadius.circular(10)),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(Icons.play_circle_outline,
+                            color: Colors.purple, size: 20),
+                        const SizedBox(height: 4),
+                        Text('$_monthSessionCount',
+                            style: const TextStyle(
+                                fontSize: 22,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.purple)),
+                        const SizedBox(height: 2),
+                        const Text('All Sessions\n(this month)',
+                            style: TextStyle(
+                                color: Colors.purple, fontSize: 11)),
+                      ],
+                    ),
+                  ),
+                ),
+              ]),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildMyRecordingsCard() => GestureDetector(
+        onTap: () => Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => HistoryScreen(initialFilter: _filter),
+          ),
+        ),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12)),
+          child: Row(children: [
+            const Icon(Icons.history, color: _green, size: 22),
+            const SizedBox(width: 12),
+            const Text('My Recordings',
+                style: TextStyle(
+                    fontWeight: FontWeight.bold, fontSize: 15)),
+            const Spacer(),
+            Text(
+              '$_filteredSessionCount session${_filteredSessionCount == 1 ? '' : 's'}',
+              style: TextStyle(color: Colors.grey[500], fontSize: 13),
+            ),
+            const SizedBox(width: 4),
+            const Icon(Icons.chevron_right, color: Colors.grey, size: 20),
+          ]),
+        ),
+      );
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  DateTime? _parseFolderDate(String folder) {
+    final parts = folder.split('-');
+    if (parts.length != 3) return null;
+    try {
+      return DateTime(int.parse(parts[2]),
+          int.parse(parts[1]), int.parse(parts[0]));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  int _parseFileDurationMins(String name) {
+    final m = RegExp(r'_(\d{4})-(\d{4})\.mp4').firstMatch(name);
+    if (m == null) return 0;
+    int toSecs(String s) =>
+        int.parse(s.substring(0, 2)) * 60 + int.parse(s.substring(2));
+    final diff = toSecs(m.group(2)!) - toSecs(m.group(1)!);
+    return (diff / 60).ceil().clamp(0, 9999);
+  }
 }
 
-// ── Preset chip ───────────────────────────────────────────────────────────────
-class _Preset extends StatelessWidget {
+// ── Small reusable widgets ────────────────────────────────────────────────────
+
+class _DashChip extends StatelessWidget {
   final String label;
+  final bool selected;
   final VoidCallback onTap;
-  final bool active;
-  const _Preset(this.label, this.onTap, this.active);
+  const _DashChip(
+      {required this.label, required this.selected, required this.onTap});
 
   @override
-  Widget build(BuildContext context) => GestureDetector(
-    onTap: onTap,
-    child: Container(
-      margin: const EdgeInsets.only(right: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-      decoration: BoxDecoration(
-        color: active ? _green : _surface,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: active ? _green : _border)),
-      child: Text(label,
-          style: TextStyle(
-              fontSize: 12, fontWeight: FontWeight.w600,
-              color: active ? Colors.white : _textSub)),
-    ),
-  );
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        margin: const EdgeInsets.only(right: 8),
+        padding:
+            const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected
+              ? const Color(0xFF00C853)
+              : Colors.transparent,
+          border: Border.all(
+              color: selected
+                  ? const Color(0xFF00C853)
+                  : Colors.grey[300]!),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Text(label,
+            style: TextStyle(
+                color: selected ? Colors.white : Colors.grey[700],
+                fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+                fontSize: 13)),
+      ),
+    );
+  }
 }
 
-// ── Stat card ─────────────────────────────────────────────────────────────────
-class _StatCard extends StatelessWidget {
-  final String label, value;
-  final String? sub;
-  final IconData icon;
-  final Color color;
-  const _StatCard({required this.label, required this.value,
-      required this.icon, required this.color, this.sub});
+class _CalendarChip extends StatelessWidget {
+  final bool selected;
+  final VoidCallback onTap;
+  final String? label;
+  const _CalendarChip(
+      {required this.selected, required this.onTap, this.label});
 
   @override
-  Widget build(BuildContext context) => Expanded(child: Container(
-    padding: const EdgeInsets.all(16),
-    decoration: BoxDecoration(color: _card,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _border)),
-    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Icon(icon, color: color, size: 22),
-      const SizedBox(height: 8),
-      Text(value, style: TextStyle(color: color, fontSize: 22,
-          fontWeight: FontWeight.bold)),
-      const SizedBox(height: 2),
-      Text(label, style: const TextStyle(color: _textSub, fontSize: 11,
-          fontWeight: FontWeight.w600)),
-      if (sub != null) ...[
-        const SizedBox(height: 2),
-        Text(sub!, style: const TextStyle(color: _textSub, fontSize: 10),
-            overflow: TextOverflow.ellipsis),
-      ],
-    ]),
-  ));
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFF00C853) : Colors.transparent,
+          border: Border.all(
+              color: selected
+                  ? const Color(0xFF00C853)
+                  : Colors.grey[300]!),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(Icons.calendar_today,
+              size: 14,
+              color: selected ? Colors.white : Colors.grey[600]),
+          if (label != null) ...[
+            const SizedBox(width: 4),
+            Text(label!,
+                style: TextStyle(
+                    color: selected ? Colors.white : Colors.grey[700],
+                    fontSize: 12)),
+          ],
+        ]),
+      ),
+    );
+  }
+}
+
+class _MetricTile extends StatelessWidget {
+  final IconData icon;
+  final String value;
+  final String label;
+  final Color color;
+  const _MetricTile(
+      {required this.icon,
+      required this.value,
+      required this.label,
+      required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: Column(children: [
+        Icon(icon, color: color, size: 20),
+        const SizedBox(height: 4),
+        Text(value,
+            style: TextStyle(
+                fontWeight: FontWeight.bold, fontSize: 13, color: color)),
+        Text(label,
+            style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+      ]),
+    );
+  }
 }

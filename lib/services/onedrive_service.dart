@@ -1,280 +1,344 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
-import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
+import 'session_store.dart';
+import 'user_service.dart';
 
-/// Uploads files directly from phone to cloud storage using Microsoft Graph API.
-/// Backend only needed for token refresh — no file data passes through it.
 class OneDriveService {
-  static const String _backendUrl = 'https://video-recorder-app-d7zk.onrender.com';
-  static const String _graphBase  = 'https://graph.microsoft.com/v1.0/me/drive';
+  static const String _backendBaseUrl =
+      'https://video-recorder-app-d7zk.onrender.com';
 
-  // Adaptive chunk sizing: 20MB–40MB based on measured network speed
-  static const int _minChunk  = 20 * 1024 * 1024;
-  static const int _maxChunk  = 40 * 1024 * 1024;
-  static const int _chunkStep =       320 * 1024; // Graph API requires 320KB multiples
-  int _currentChunk = _minChunk;
+  static const String _rootFolder = 'OTN Recorder';
 
-  final Dio _dio = Dio(BaseOptions(
-    connectTimeout: const Duration(seconds: 30),
-    receiveTimeout: const Duration(minutes: 10),
-    sendTimeout:    const Duration(minutes: 10),
-  ));
+  // ─── Token ────────────────────────────────────────────────────────────────
 
-  String?   _accessToken;
-  DateTime? _tokenExpiry;
+  static String?   _cachedToken;
+  static DateTime? _tokenExpiry;
 
-  // ── Adaptive chunk sizing ─────────────────────────────────────────────────
-  void _adaptChunkSize(double bytesPerSec) {
-    final mbps = bytesPerSec / 1024 / 1024;
-    int target;
-    if (mbps >= 10) {
-      target = _maxChunk;
-    } else if (mbps >= 5) {
-      target = 30 * 1024 * 1024;
-    } else {
-      target = _minChunk;
-    }
-    target = ((target / _chunkStep).round() * _chunkStep).clamp(_minChunk, _maxChunk);
-    if (target != _currentChunk) {
-      _currentChunk = target;
-      debugPrint('=== Adaptive: ${mbps.toStringAsFixed(1)} Mbps → ${(_currentChunk~/1024~/1024)}MB');
-    }
-  }
-
-  // ── Token ─────────────────────────────────────────────────────────────────
-  Future<String> _getToken() async {
-    if (_accessToken != null &&
+  static Future<String> getAccessToken() async {
+    if (_cachedToken != null &&
         _tokenExpiry != null &&
-        DateTime.now().isBefore(_tokenExpiry!.subtract(const Duration(minutes: 2)))) {
-      return _accessToken!;
+        DateTime.now().isBefore(_tokenExpiry!)) {
+      return _cachedToken!;
     }
-    final res = await _dio.get(
-      '$_backendUrl/token',
-      options: Options(
-        receiveTimeout: const Duration(seconds: 75),
-        validateStatus: (s) => s != null && s < 600,
-      ),
-    );
+    final res = await http
+        .get(Uri.parse('$_backendBaseUrl/token'))
+        .timeout(const Duration(seconds: 15));
     if (res.statusCode != 200) {
-      throw Exception('Token failed: ${res.statusCode} — push new server.js to Render');
+      throw Exception('Token fetch failed: ${res.body}');
     }
-    _accessToken = res.data['access_token'] as String;
-    final expiresIn = res.data['expires_in'] as int? ?? 3600;
-    _tokenExpiry = DateTime.now().add(Duration(seconds: expiresIn));
-    debugPrint('=== Token refreshed');
-    return _accessToken!;
+    final data    = jsonDecode(res.body);
+    _cachedToken  = data['access_token'] as String;
+    _tokenExpiry  = DateTime.now().add(const Duration(seconds: 3500));
+    return _cachedToken!;
   }
 
-  // ── Folder helpers — fixed to avoid duplicate folders ─────────────────────
-  // Uses conflictBehavior:fail + catches 409 instead of $filter query.
-  // $filter had eventual consistency issues causing duplicate folder creation
-  // when multiple users upload simultaneously.
-  Future<String> _getOrCreateFolder(String token, String parentId, String name) async {
-    // First try to find existing folder by listing children
-    try {
-      final r = await _dio.get(
-        '$_graphBase/items/$parentId/children?\$select=id,name&\$top=200',
-        options: Options(
-          headers: {'Authorization': 'Bearer $token'},
-          validateStatus: (s) => s != null && s < 600,
-        ),
-      );
-      if (r.statusCode == 200) {
-        final items = r.data['value'] as List? ?? [];
-        for (final item in items) {
-          if ((item['name'] as String?)?.toLowerCase() == name.toLowerCase()) {
-            return item['id'] as String;
-          }
-        }
-      }
-    } catch (_) {}
+  // ─── Folder path builder ──────────────────────────────────────────────────
 
-    // Not found — create it
-    try {
-      final r = await _dio.post(
-        '$_graphBase/items/$parentId/children',
-        data: {
-          'name':   name,
-          'folder': {},
-          '@microsoft.graph.conflictBehavior': 'fail', // fail if exists → catch 409
-        },
-        options: Options(
-          headers: {
-            'Authorization': 'Bearer $token',
-            'Content-Type':  'application/json',
-          },
-          validateStatus: (s) => s != null && s < 600,
-        ),
-      );
-      if (r.statusCode == 201) return r.data['id'] as String;
-
-      // 409 conflict = folder was created by another request simultaneously
-      if (r.statusCode == 409) {
-        // Re-fetch to get the ID
-        final r2 = await _dio.get(
-          '$_graphBase/items/$parentId/children?\$select=id,name&\$top=200',
-          options: Options(
-            headers: {'Authorization': 'Bearer $token'},
-            validateStatus: (s) => s != null && s < 600,
-          ),
-        );
-        final items = r2.data['value'] as List? ?? [];
-        for (final item in items) {
-          if ((item['name'] as String?)?.toLowerCase() == name.toLowerCase()) {
-            return item['id'] as String;
-          }
-        }
-      }
-      throw Exception('Could not get/create folder "$name": ${r.statusCode}');
-    } catch (e) {
-      throw Exception('Folder error "$name": $e');
-    }
+  /// All parts of one session go into ONE folder.
+  /// Format: OTN Recorder/DD-MM-YYYY/UserFullName/SessionID_Date_StartTime
+  static String buildSessionFolderPath({
+    required String dateFolder,
+    required String userFullName,
+    required String sessionId,
+    required String sessionDate,
+    required String sessionStartTime, // START time only — never stop time
+  }) {
+    final sessionFolder = '${sessionId}_${sessionDate}_$sessionStartTime';
+    return '$_rootFolder/$dateFolder/$userFullName/$sessionFolder';
   }
 
-  Future<String> _getRootFolderId(String token, String rootName) async {
-    // Get root's ID first, then use _getOrCreateFolder
-    final rootRes = await _dio.get(
-      '$_graphBase/root?\$select=id',
-      options: Options(
-        headers: {'Authorization': 'Bearer $token'},
-        validateStatus: (s) => s != null && s < 600,
-      ),
+  // ─── Create resumable upload session ─────────────────────────────────────
+
+  static Future<String> createUploadSession({
+    required String folderPath,
+    required String fileName,
+  }) async {
+    final token       = await getAccessToken();
+    final encodedPath = folderPath.split('/').map(Uri.encodeComponent).join('/');
+    final graphUrl    =
+        'https://graph.microsoft.com/v1.0/me/drive/root:/$encodedPath/$fileName:/createUploadSession';
+
+    final res = await http.post(
+      Uri.parse(graphUrl),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Content-Type':  'application/json',
+      },
+      body: jsonEncode({
+        'item': {
+          '@microsoft.graph.conflictBehavior': 'rename',
+          'name': fileName,
+        }
+      }),
     );
-    final rootId = rootRes.data['id'] as String;
-    return _getOrCreateFolder(token, rootId, rootName);
+
+    if (res.statusCode != 200) {
+      throw Exception(
+          'createUploadSession failed ${res.statusCode}: ${res.body}');
+    }
+    return jsonDecode(res.body)['uploadUrl'] as String;
   }
 
-  // ── Upload single file ────────────────────────────────────────────────────
+  // ─── Chunked PUT upload ───────────────────────────────────────────────────
+
+  static Future<void> uploadFileInChunks({
+    required String         uploadUrl,
+    required File           file,
+    required Function(double) onProgress,
+    int chunkSize = 5 * 1024 * 1024, // 5 MB
+  }) async {
+    final fileSize = await file.length();
+    int   offset   = 0;
+    final raf      = await file.open();
+    try {
+      while (offset < fileSize) {
+        final end    = (offset + chunkSize > fileSize) ? fileSize : offset + chunkSize;
+        final length = end - offset;
+        await raf.setPosition(offset);
+        final chunk = await raf.read(length);
+
+        final res = await http.put(
+          Uri.parse(uploadUrl),
+          headers: {
+            'Content-Range':  'bytes $offset-${end - 1}/$fileSize',
+            'Content-Length': '$length',
+          },
+          body: chunk,
+        ).timeout(const Duration(seconds: 120));
+
+        if (res.statusCode != 200 &&
+            res.statusCode != 201 &&
+            res.statusCode != 202) {
+          throw Exception(
+              'Chunk PUT failed ${res.statusCode} at offset $offset');
+        }
+        offset = end;
+        onProgress(offset / fileSize);
+      }
+    } finally {
+      await raf.close();
+    }
+  }
+
+  // ─── uploadFile ───────────────────────────────────────────────────────────
+  // Called by upload_service.dart (the compression + single-file upload path)
+
   Future<void> uploadFile({
     required String filePath,
     required String fileName,
     required String dateFolder,
     required String userFolder,
     required String rootFolder,
+    required bool Function() isPaused,
+    required bool Function() isCancelled,
     required void Function(double) onProgress,
     required void Function(String) onStatus,
-    bool Function()? isPaused,
-    bool Function()? isCancelled,
   }) async {
-    onStatus('Getting access token...');
-    final token = await _getToken();
-
-    // Build folder structure — no duplicate folders
-    onStatus('Preparing cloud folder...');
-    final otnId  = await _getRootFolderId(token, rootFolder);
-    final dateId = await _getOrCreateFolder(token, otnId,  dateFolder);
-    final userId = await _getOrCreateFolder(token, dateId, userFolder);
-
-    final fileSize = await File(filePath).length();
-    final fileSizeMB = (fileSize / 1024 / 1024).toStringAsFixed(1);
-    debugPrint('=== Uploading: $fileName ($fileSizeMB MB)');
-
-    // Create upload session — valid for 24h, renewed automatically if expired
-    onStatus('Starting upload ($fileSizeMB MB)...');
-    String uploadUrl = await _createUploadSession(token, userId, fileName);
-
-    _currentChunk = _minChunk;
-    int offset   = 0;
-    int chunkNum = 0;
-    final sessionCreated = DateTime.now();
-
-    while (offset < fileSize) {
-      // Pause/cancel
-      while (isPaused != null && isPaused()) {
-        if (isCancelled != null && isCancelled()) return;
-        await Future.delayed(const Duration(milliseconds: 500));
-      }
-      if (isCancelled != null && isCancelled()) return;
-
-      // Renew upload session if it's been open >20 minutes
-      // Graph API sessions expire after 24h but connections can drop
-      if (DateTime.now().difference(sessionCreated).inMinutes > 20 && offset > 0) {
-        debugPrint('=== Renewing upload session...');
-        try {
-          uploadUrl = await _createUploadSession(token, userId, fileName);
-        } catch (_) {
-          // If renewal fails, continue with existing URL
-        }
-      }
-
-      final end       = (offset + _currentChunk).clamp(0, fileSize);
-      final chunkSize = end - offset;
-      chunkNum++;
-
-      final chunk      = await _readChunk(filePath, offset, chunkSize);
-      final sliceStart = DateTime.now();
-
-      for (int attempt = 1; attempt <= 3; attempt++) {
-        try {
-          final res = await _dio.put(
-            uploadUrl,
-            data: chunk,
-            options: Options(
-              headers: {
-                'Content-Range':  'bytes $offset-${end - 1}/$fileSize',
-                'Content-Length': '$chunkSize',
-                'Content-Type':   'application/octet-stream',
-              },
-              receiveTimeout: const Duration(minutes: 8),
-              sendTimeout:    const Duration(minutes: 8),
-              validateStatus: (s) =>
-                  s != null && (s == 200 || s == 201 || s == 202 || s == 308),
-            ),
-          );
-
-          // Measure speed and adapt
-          final elapsedMs = DateTime.now().difference(sliceStart).inMilliseconds;
-          if (elapsedMs > 0) {
-            _adaptChunkSize(chunkSize / (elapsedMs / 1000));
-          }
-          debugPrint('=== Slice $chunkNum → ${res.statusCode} | '
-              '${(chunkSize~/1024~/1024)}MB in ${elapsedMs}ms');
-          break;
-        } catch (e) {
-          debugPrint('=== Slice $chunkNum attempt $attempt: $e');
-          if (attempt == 3) rethrow;
-          _currentChunk = _minChunk; // back to safe size on retry
-          await Future.delayed(Duration(seconds: attempt * 5));
-        }
-      }
-
-      offset = end;
-      final pct = offset / fileSize;
-      onProgress(pct);
-      onStatus(
-        'Uploading ${(pct * 100).toStringAsFixed(0)}%'
-        ' · ${(_currentChunk ~/ 1024 ~/ 1024)}MB slices',
-      );
-    }
-
-    debugPrint('=== Upload complete: $fileName');
-  }
-
-  Future<String> _createUploadSession(
-      String token, String parentId, String fileName) async {
-    final res = await _dio.post(
-      '$_graphBase/items/$parentId:/${Uri.encodeComponent(fileName)}:/createUploadSession',
-      data: {'item': {'@microsoft.graph.conflictBehavior': 'replace', 'name': fileName}},
-      options: Options(
-        headers: {
-          'Authorization': 'Bearer $token',
-          'Content-Type':  'application/json',
-        },
-        validateStatus: (s) => s != null && s < 600,
-      ),
+    final folderPath = '$rootFolder/$dateFolder/$userFolder';
+    final uploadUrl  = await createUploadSession(
+      folderPath: folderPath,
+      fileName:   fileName,
     );
-    if (res.statusCode != 200) {
-      throw Exception('Upload session failed: ${res.statusCode} ${res.data}');
-    }
-    return res.data['uploadUrl'] as String;
+
+    final file = File(filePath);
+    await uploadFileInChunks(
+      uploadUrl:  uploadUrl,
+      file:       file,
+      onProgress: (p) {
+        // Respect pause/cancel
+        if (isCancelled()) throw Exception('Upload cancelled');
+        onProgress(p);
+      },
+    );
   }
 
-  Future<Uint8List> _readChunk(String filePath, int start, int length) async {
-    final raf   = await File(filePath).open();
-    await raf.setPosition(start);
-    final bytes = await raf.read(length);
-    await raf.close();
-    return Uint8List.fromList(bytes);
+  // ─── uploadFileInSession ──────────────────────────────────────────────────
+  // Called by chunk_upload_queue.dart (the auto-split background upload path)
+
+  Future<void> uploadFileInSession({
+    required String filePath,
+    required String fileName,
+    required String dateFolder,
+    required String userFolder,
+    required String sessionFolder,
+    required String rootFolder,
+    required void Function(double) onProgress,
+    required void Function(String) onStatus,
+  }) async {
+    // Full path: OTN Recorder/DD-MM-YYYY/UserName/SessionFolder/
+    final folderPath = '$rootFolder/$dateFolder/$userFolder/$sessionFolder';
+    onStatus('Creating upload session...');
+    final uploadUrl = await createUploadSession(
+      folderPath: folderPath,
+      fileName:   fileName,
+    );
+    onStatus('Uploading...');
+    await uploadFileInChunks(
+      uploadUrl:  uploadUrl,
+      file:       File(filePath),
+      onProgress: onProgress,
+    );
+  }
+
+  // ─── listUserFiles ────────────────────────────────────────────────────────
+  // Called by cloud_cache_service.dart
+
+  Future<List<Map<String, dynamic>>> listUserFiles({
+    required String rootFolder,
+    required String userFolder,
+  }) async {
+    final token = await getAccessToken();
+    final files = <Map<String, dynamic>>[];
+
+    try {
+      // List date folders under OTN Recorder/
+      final rootPath    = Uri.encodeComponent(rootFolder);
+      final datesRes    = await http.get(
+        Uri.parse(
+            'https://graph.microsoft.com/v1.0/me/drive/root:/$rootPath:/children'),
+        headers: {'Authorization': 'Bearer $token'},
+      ).timeout(const Duration(seconds: 15));
+
+      if (datesRes.statusCode != 200) return files;
+      final dateFolders = (jsonDecode(datesRes.body)['value'] as List)
+          .cast<Map<String, dynamic>>();
+
+      for (final dateFolder in dateFolders) {
+        if (dateFolder['folder'] == null) continue; // skip files
+        final dateName   = dateFolder['name'] as String;
+        final userPath   = Uri.encodeComponent('$rootFolder/$dateName/$userFolder');
+
+        final userRes = await http.get(
+          Uri.parse(
+              'https://graph.microsoft.com/v1.0/me/drive/root:/$userPath:/children'),
+          headers: {'Authorization': 'Bearer $token'},
+        ).timeout(const Duration(seconds: 15));
+
+        if (userRes.statusCode != 200) continue;
+        final items = (jsonDecode(userRes.body)['value'] as List)
+            .cast<Map<String, dynamic>>();
+
+        for (final item in items) {
+          if (item['folder'] != null) {
+            // Session subfolder — list files inside it
+            final sessionName = item['name'] as String;
+            final sessionPath = Uri.encodeComponent(
+                '$rootFolder/$dateName/$userFolder/$sessionName');
+            final sessionRes  = await http.get(
+              Uri.parse(
+                  'https://graph.microsoft.com/v1.0/me/drive/root:/$sessionPath:/children'),
+              headers: {'Authorization': 'Bearer $token'},
+            ).timeout(const Duration(seconds: 15));
+
+            if (sessionRes.statusCode != 200) continue;
+            final parts = (jsonDecode(sessionRes.body)['value'] as List)
+                .cast<Map<String, dynamic>>();
+
+            for (final part in parts) {
+              if (part['file'] != null) {
+                files.add({
+                  'name':          part['name'],
+                  'size':          part['size'],
+                  'dateFolder':    dateName,
+                  'sessionFolder': sessionName,
+                  'userFolder':    userFolder,
+                  'id':            part['id'],
+                });
+              }
+            }
+          } else if (item['file'] != null) {
+            // Direct file (legacy format without session subfolder)
+            files.add({
+              'name':       item['name'],
+              'size':       item['size'],
+              'dateFolder': dateName,
+              'userFolder': userFolder,
+              'id':         item['id'],
+            });
+          }
+        }
+      }
+    } catch (e) {
+      throw Exception('listUserFiles failed: $e');
+    }
+
+    return files;
+  }
+
+  // ─── Background sync ─────────────────────────────────────────────────────
+
+  static Timer? _syncTimer;
+
+  /// Starts background sync every 5 min.
+  /// Removes sessions from local store if their OneDrive folder is gone.
+  static void startBackgroundSync() {
+    _syncTimer?.cancel();
+    _syncTimer = Timer.periodic(const Duration(minutes: 5), (_) {
+      _verifySyncedSessions();
+    });
+    _verifySyncedSessions(); // run once immediately
+  }
+
+  static void stopBackgroundSync() {
+    _syncTimer?.cancel();
+    _syncTimer = null;
+  }
+
+  static Future<void> _verifySyncedSessions() async {
+    try {
+      final userFullName = await UserService().getDisplayName();
+      final token        = await getAccessToken();
+      final store        = await SessionStore.load();
+
+      final synced = store.sessions
+          .where((s) => s.status == 'synced')
+          .toList();
+
+      for (final session in synced) {
+        final folderPath = buildSessionFolderPath(
+          dateFolder:       session.dateFolder,
+          userFullName:     userFullName,
+          sessionId:        session.id.length >= 6
+              ? session.id.substring(0, 6).toUpperCase()
+              : session.id.toUpperCase(),
+          sessionDate:      session.sessionDate,
+          sessionStartTime: session.startTime,
+        );
+
+        final exists = await _folderExistsOnOneDrive(
+            token: token, folderPath: folderPath);
+
+        if (!exists) {
+          await store.removeSession(session.id);
+        }
+      }
+    } catch (_) {
+      // Silent fail — retry next cycle
+    }
+  }
+
+  static Future<bool> _folderExistsOnOneDrive({
+    required String token,
+    required String folderPath,
+  }) async {
+    try {
+      final encodedPath =
+          folderPath.split('/').map(Uri.encodeComponent).join('/');
+      final res = await http.get(
+        Uri.parse(
+            'https://graph.microsoft.com/v1.0/me/drive/root:/$encodedPath'),
+        headers: {'Authorization': 'Bearer $token'},
+      ).timeout(const Duration(seconds: 10));
+      return res.statusCode == 200;
+    } catch (_) {
+      return true; // Network error → assume still exists
+    }
+  }
+
+  /// Force immediate sync (called on pull-to-refresh in HistoryScreen).
+  static Future<void> forceSync() async {
+    await _verifySyncedSessions();
   }
 }

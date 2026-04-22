@@ -3,13 +3,17 @@ import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'screens/login_screen.dart';
+import 'screens/history_screen.dart';
 import 'screens/dashboard_screen.dart';
+import 'screens/camera_screen.dart';
 import 'services/local_video_storage.dart';
 import 'services/notification_service.dart';
 import 'services/upload_resume_service.dart';
 import 'services/backend_keepalive.dart';
+import 'services/cloud_cache_service.dart';
 import 'services/session_store.dart';
-import 'screens/upload_progress_screen.dart';
+
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
 const kGreen     = Color(0xFF00C853);
 const kGreenDark = Color(0xFF00A045);
@@ -21,57 +25,55 @@ const kText      = Color(0xFF1A1A1A);
 const kTextSub   = Color(0xFF666666);
 
 void main() async {
-  // ── 1. Flutter engine must be first — always ──────────────────────────────
   WidgetsFlutterBinding.ensureInitialized();
 
-  // ── 2. Firebase must be second — everything else depends on it ───────────
   await Firebase.initializeApp(
     options: const FirebaseOptions(
-      apiKey: 'AIzaSyAU5jiCE8sCIMjm0ywBFnHupvOIAkCbMLM',
-      appId: '1:164325680744:android:4f0c0284c3a3db8e4f7ddd',
-      messagingSenderId: '164325680744',
-      projectId: 'videorecorderapp-305b8',
-      storageBucket: 'videorecorderapp-305b8.firebasestorage.app',
+      apiKey:           'AIzaSyAU5jiCE8sCIMjm0ywBFnHupvOIAkCbMLM',
+      appId:            '1:164325680744:android:4f0c0284c3a3db8e4f7ddd',
+      messagingSenderId:'164325680744',
+      projectId:        'videorecorderapp-305b8',
+      storageBucket:    'videorecorderapp-305b8.firebasestorage.app',
     ),
   );
 
-  // ── 3. System UI & orientation ────────────────────────────────────────────
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
   ]);
 
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-    statusBarBrightness: Brightness.light,
+    statusBarBrightness:     Brightness.light,
     statusBarIconBrightness: Brightness.dark,
   ));
 
-  // ── 4. Non-critical services — wrapped in try/catch so they never ─────────
-  //       crash the app if something goes wrong
   try {
     await NotificationService().init();
+    NotificationService().setOnFailureTap(() {
+      navigatorKey.currentState?.pushNamed('/history');
+    });
   } catch (e) {
     debugPrint('=== NotificationService init failed: $e');
   }
 
-  // ── Fix 3: Check for interrupted upload and auto-resume ──────────────────
+  // ── Check for interrupted upload and auto-resume ──────────────────────────
   try {
     final pending = await UploadResumeService().getPendingUpload();
     if (pending != null && pending.isIncomplete) {
       debugPrint('=== Found interrupted upload: ${pending.sessionId} '
           '(${pending.completedBlocks}/${pending.totalBlocks} done)');
-      // Mark the session back to partial/pending so user sees the Upload button
-      final store = SessionStore();
+
+      // FIX: use SessionStore.load() (async factory) then getById()
+      final store   = await SessionStore.load();
       final session = await store.getById(pending.sessionId);
+
       if (session != null && session.status == 'uploading') {
-        // Update to partial if some blocks done, else pending
-        final newStatus = pending.completedBlocks > 0 ? 'partial' : 'pending';
-        session.uploadedBlocks = pending.uploadedBlocks;
-        session.status = newStatus;
-        await store.save(session);
+        final newStatus          = pending.completedBlocks > 0 ? 'partial' : 'pending';
+        session.uploadedBlocks   = pending.uploadedBlocks;
+        session.status           = newStatus;
+        await store.save(session); // FIX: save(SessionModel) not save(session: ...)
         debugPrint('=== Reset interrupted upload to $newStatus');
       }
-      // Clear the stale resume marker
       await UploadResumeService().clearUpload();
     }
   } catch (e) {
@@ -84,10 +86,9 @@ void main() async {
     debugPrint('=== Storage permission request failed: $e');
   }
 
-  // ── 5. Start backend keep-alive (prevents Render cold start) ────────────
   BackendKeepAlive().start();
+  CloudCacheService().init();
 
-  // ── 6. Run the app ────────────────────────────────────────────────────────
   runApp(const OTNApp());
 }
 
@@ -97,25 +98,30 @@ class OTNApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: navigatorKey,
+      routes: {
+        '/history': (_) => const HistoryScreen(),
+        '/camera':  (_) => const CameraScreen(),
+      },
       title: 'OTN',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.light,
         scaffoldBackgroundColor: kSurface,
         colorScheme: const ColorScheme.light(
-          primary: kGreen,
+          primary:   kGreen,
           secondary: kGreenDark,
-          surface: kCard,
+          surface:   kCard,
           onPrimary: Colors.white,
           onSurface: kText,
         ),
         useMaterial3: true,
-        cardColor: kCard,
+        cardColor:    kCard,
         dividerColor: kBorder,
         appBarTheme: const AppBarTheme(
-          backgroundColor: kCard,
-          foregroundColor: kText,
-          elevation: 0,
+          backgroundColor:  kCard,
+          foregroundColor:  kText,
+          elevation:        0,
           surfaceTintColor: Colors.transparent,
         ),
         elevatedButtonTheme: ElevatedButtonThemeData(
@@ -128,9 +134,7 @@ class OTNApp extends StatelessWidget {
           ),
         ),
       ),
-      // ── Global error widget so black screen never happens ─────────────────
       builder: (context, child) {
-        // Catch any widget-level errors in release mode
         ErrorWidget.builder = (FlutterErrorDetails details) {
           return Scaffold(
             backgroundColor: kSurface,
@@ -140,8 +144,7 @@ class OTNApp extends StatelessWidget {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.error_outline,
-                        color: kGreen, size: 48),
+                    const Icon(Icons.error_outline, color: kGreen, size: 48),
                     const SizedBox(height: 16),
                     const Text('Something went wrong',
                         style: TextStyle(
@@ -151,8 +154,7 @@ class OTNApp extends StatelessWidget {
                     const SizedBox(height: 8),
                     Text(details.summary.toString(),
                         textAlign: TextAlign.center,
-                        style: const TextStyle(
-                            color: kTextSub, fontSize: 12)),
+                        style: const TextStyle(color: kTextSub, fontSize: 12)),
                   ],
                 ),
               ),
@@ -167,8 +169,7 @@ class OTNApp extends StatelessWidget {
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const Scaffold(
               backgroundColor: kSurface,
-              body: Center(
-                  child: CircularProgressIndicator(color: kGreen)),
+              body: Center(child: CircularProgressIndicator(color: kGreen)),
             );
           }
           if (snapshot.hasError) {

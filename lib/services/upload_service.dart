@@ -20,7 +20,10 @@ class UploadService {
   // while reducing 2.74GB files to ~550MB — 5x smaller, same visual quality.
   // CRF 28 = good quality. Lower = better quality, larger file.
   static const int    _targetBitrate = 4000; // kbps
-  static const String _videoCodec    = 'libx265';
+  // libx264 is always available in ffmpeg_kit_flutter_new full-gpl
+  // Gives ~3x file reduction vs raw (2.74GB → ~900MB) vs libx265 5x
+  // but libx265 fails on Vivo I2217 hardware encoder
+  static const String _videoCodec    = 'libx264';
   static const int    _crf           = 28;
 
   final _notif    = NotificationService();
@@ -65,7 +68,7 @@ class UploadService {
     bool   compressed   = false;
     File?  compressedFile;
 
-    if (originalSizeMB > 200) {
+    if (originalSizeMB > 100) { // compress anything over 100MB
       onStatus('Compressing video for faster upload...');
       onOverallProgress?.call(0.01);
 
@@ -73,7 +76,7 @@ class UploadService {
         inputPath:  localFile,
         onProgress: (p) {
           onStatus('Compressing ${(p * 100).toStringAsFixed(0)}%... '
-              '(reduces upload time by ~5x)');
+              '(reduces file size ~3x for faster upload)');
           onOverallProgress?.call(0.01 + p * 0.19); // 1–20% = compression
         },
       );
@@ -198,14 +201,19 @@ class UploadService {
       // -preset fast     = encoding speed vs compression ratio
       // -acodec aac      = audio stays as AAC
       // -movflags +faststart = playable immediately without full download
+      // -crf 28: quality level (18=near-lossless, 28=good, 35=acceptable)
+      // -preset veryfast: fastest encoding, slightly larger than 'fast' but much quicker
+      // No -b:v: let CRF control bitrate (more consistent quality)
+      // -tune fastdecode: optimise for playback on mobile
       final cmd = '-i "$inputPath" '
           '-vcodec $_videoCodec '
           '-crf $_crf '
-          '-preset fast '
-          '-b:v ${_targetBitrate}k '
+          '-preset veryfast '
+          '-tune fastdecode '
           '-acodec aac '
           '-b:a 128k '
           '-movflags +faststart '
+          '-threads 0 '
           '-y "$outPath"';
 
       debugPrint('=== Compressing: ${cmd.substring(0, 60)}...');
