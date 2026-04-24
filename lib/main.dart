@@ -12,6 +12,7 @@ import 'services/upload_resume_service.dart';
 import 'services/backend_keepalive.dart';
 import 'services/cloud_cache_service.dart';
 import 'services/session_store.dart';
+import 'services/chunk_upload_queue.dart'; // FIX: added for recoverFromCache
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
@@ -56,22 +57,18 @@ void main() async {
     debugPrint('=== NotificationService init failed: $e');
   }
 
-  // ── Check for interrupted upload and auto-resume ──────────────────────────
   try {
     final pending = await UploadResumeService().getPendingUpload();
     if (pending != null && pending.isIncomplete) {
       debugPrint('=== Found interrupted upload: ${pending.sessionId} '
           '(${pending.completedBlocks}/${pending.totalBlocks} done)');
-
-      // FIX: use SessionStore.load() (async factory) then getById()
       final store   = await SessionStore.load();
       final session = await store.getById(pending.sessionId);
-
       if (session != null && session.status == 'uploading') {
-        final newStatus          = pending.completedBlocks > 0 ? 'partial' : 'pending';
-        session.uploadedBlocks   = pending.uploadedBlocks;
-        session.status           = newStatus;
-        await store.save(session); // FIX: save(SessionModel) not save(session: ...)
+        final newStatus        = pending.completedBlocks > 0 ? 'partial' : 'pending';
+        session.uploadedBlocks = pending.uploadedBlocks;
+        session.status         = newStatus;
+        await store.save(session);
         debugPrint('=== Reset interrupted upload to $newStatus');
       }
       await UploadResumeService().clearUpload();
@@ -191,7 +188,13 @@ class OTNApp extends StatelessWidget {
               ),
             );
           }
-          if (snapshot.hasData) return const DashboardScreen();
+          if (snapshot.hasData) {
+            // FIX: recover any interrupted chunk uploads on every login/app open
+            // This re-enqueues chunks from otn_backup/ and otn_upload_chunks/
+            // and runs the 7-day cleanup
+            ChunkUploadQueue().recoverFromCache();
+            return const DashboardScreen();
+          }
           return const LoginScreen();
         },
       ),

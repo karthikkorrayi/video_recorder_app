@@ -12,8 +12,9 @@ dependencies:
 
   # Camera & playback
   camera: ^0.10.6
-  video_player: ^2.8.3
+  video_player: ^2.9.2
   video_compress: ^3.1.2
+  video_thumbnail: ^0.5.3
   ffmpeg_kit_flutter_new: ^4.1.0
 
   # Firebase

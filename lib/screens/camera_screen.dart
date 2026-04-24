@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
@@ -26,22 +28,16 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   bool _processingFrame = false;
   bool _autoDetect      = false;
 
-  // ── Timing constants ──────────────────────────────────────────────────────
-  // CHUNK   = 2 min — silent background split + upload, user never aware
-  // SESSION = 20 min — user-visible boundary with alert beeps + auto-restart
   static const int _chunkSecs   =  2 * 60;
   static const int _sessionSecs = 20 * 60;
-  static const int _warnSecs    = 10;       // beep from 19:50 → 20:00
+  static const int _warnSecs    = 10;
 
-  // ── Session state ─────────────────────────────────────────────────────────
   String?   _sessionId;
   DateTime? _sessionStart;
   DateTime? _chunkStart;
   int       _partNumber        = 0;
   int       _displaySecs       = 0;
   bool      _warnFired         = false;
-
-  // Q2: track current session part count for "0/N uploading" reset
   int       _sessionPartCount  = 0;
 
   Timer? _ticker;
@@ -55,7 +51,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   String get _userId =>
       FirebaseAuth.instance.currentUser?.uid ?? 'unknown';
 
-  // ── Elapsed helpers ───────────────────────────────────────────────────────
   int get _sessionElapsedSecs => _sessionStart == null ? 0
       : DateTime.now().difference(_sessionStart!).inSeconds.clamp(0, _sessionSecs);
 
@@ -65,13 +60,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   double get _sessionProgress => (_sessionElapsedSecs / _sessionSecs).clamp(0.0, 1.0);
   bool   get _isWarning => _isRecording && _sessionElapsedSecs >= _sessionSecs - _warnSecs;
 
-  // ── State helpers ─────────────────────────────────────────────────────────
   bool get _isRecording => _state == _S.recording;
   bool get _isCounting  => _state == _S.countdown;
   bool get _isDetecting => _state == _S.detecting;
   bool get _isSaved     => _state == _S.saved;
 
-  // ── Colors ────────────────────────────────────────────────────────────────
   static const _green   = Color(0xFF00C853);
   static const _red     = Color(0xFFE53935);
   static const _white   = Color(0xFFFFFFFF);
@@ -80,7 +73,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   static const _sub     = Color(0xFF888888);
   static const _border  = Color(0xFFE8E8E8);
 
-  // ── Lifecycle ─────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
@@ -90,7 +82,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     WakelockPlus.enable();
     _beep.init();
-    _queue.startNetworkMonitor();
+    _queue.startNetworkMonitor(context: context);
     _initCamera();
   }
 
@@ -150,7 +142,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _processingFrame = true;
     try {
       final buf = WriteBuffer();
-      for (final p in img.planes) buf.putUint8List(p.bytes);
+      // FIX lint: curly braces in for loop
+      for (final p in img.planes) { buf.putUint8List(p.bytes); }
       final input = InputImage.fromBytes(
         bytes: buf.done().buffer.asUint8List(),
         metadata: InputImageMetadata(
@@ -164,11 +157,12 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       if (poses.isNotEmpty) {
         final lw = poses.first.landmarks[PoseLandmarkType.leftWrist];
         final rw = poses.first.landmarks[PoseLandmarkType.rightWrist];
+        // FIX lint: curly braces in if
         if (lw != null && rw != null) {
           both = lw.likelihood > 0.55 && rw.likelihood > 0.55;
         }
       }
-      if (both) { await _stopStream(); if (mounted && _isDetecting) _doCountdown(); }
+      if (both) { await _stopStream(); if (mounted && _isDetecting) { _doCountdown(); } }
     } finally { _processingFrame = false; }
   }
 
@@ -176,7 +170,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     if (_isRecording || _isCounting) return;
     final next = !_autoDetect;
     setState(() => _autoDetect = next);
-    if (next) _startStream(); else await _stopStream();
+    if (next) { _startStream(); } else { await _stopStream(); }
   }
 
   // ── Countdown ─────────────────────────────────────────────────────────────
@@ -201,7 +195,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     if (!_isDetecting && !_isSaved) return;
     await _stopStream();
     setState(() => _autoDetect = false);
-    if (mounted) _doCountdown();
+    if (mounted) { _doCountdown(); }
   }
 
   // ── Session start ─────────────────────────────────────────────────────────
@@ -211,10 +205,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _partNumber       = 0;
     _sessionPartCount = 0;
     _warnFired        = false;
-
-    // Q2: Clear completed so badge resets to "0/N uploading" for new session
     _queue.clearCompleted();
-
     debugPrint('=== Session started: $_sessionId');
     await _startChunk();
   }
@@ -225,51 +216,55 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     return List.generate(6, (_) => chars[rng.nextInt(chars.length)]).join();
   }
 
-  // ── Start one 2-min chunk recording ───────────────────────────────────────
+  // ── Backup path helper ─────────────────────────────────────────────────────
+  /// Computes the backup path for a chunk file.
+  /// The actual file copy is made inside ChunkUploadQueue.enqueue().
+  Future<String> _backupPathFor(String filePath) async {
+    final tmpDir    = await getTemporaryDirectory();
+    final backupDir = Directory('${tmpDir.path}/otn_backup');
+    if (!await backupDir.exists()) {
+      await backupDir.create(recursive: true);
+    }
+    final fileName = filePath.split('/').last;
+    return '${backupDir.path}/$fileName';
+  }
+
+  // ── Start one chunk recording ─────────────────────────────────────────────
   Future<void> _startChunk() async {
     try {
       await _ctrl!.startVideoRecording();
       _partNumber++;
       _sessionPartCount++;
       _chunkStart = DateTime.now();
-
       if (!mounted) return;
       setState(() { _state = _S.recording; });
 
       _ticker = Timer.periodic(const Duration(seconds: 1), (_) async {
         if (!mounted || !_isRecording) { _ticker?.cancel(); return; }
-
         _displaySecs = _sessionStart == null ? 0
             : DateTime.now().difference(_sessionStart!).inSeconds;
         setState(() {});
 
-        // ── 20-min session boundary: warn at 19:50 ──────────────────────
         if (!_warnFired && _sessionElapsedSecs >= _sessionSecs - _warnSecs) {
           _warnFired = true;
-          _startSessionWarning(); // beep every 2s from 19:50
+          _startSessionWarning();
         }
-
-        // ── 20-min session end: save last chunk, auto-restart session ───
         if (_sessionElapsedSecs >= _sessionSecs) {
           _ticker?.cancel();
           _alertTimer?.cancel();
           await _endSessionAndRestart();
           return;
         }
-
-        // ── 2-min chunk boundary: SILENT split + upload ─────────────────
-        // No beep, no UI change — completely transparent to user
         if (_chunkElapsedSecs >= _chunkSecs) {
           await _silentChunkSplit();
         }
       });
     } catch (e) {
       debugPrint('=== startChunk error: $e');
-      if (mounted) setState(() => _state = _S.detecting);
+      if (mounted) { setState(() => _state = _S.detecting); }
     }
   }
 
-  // ── Session warning (19:50–20:00): ascending beeps every 2s ──────────────
   void _startSessionWarning() {
     _alertTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       if (!mounted || !_isRecording) { _alertTimer?.cancel(); return; }
@@ -278,12 +273,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   }
 
   // ── SILENT 2-min chunk split ───────────────────────────────────────────────
-  // stop → save to cache → start next → queue upload
-  // No beep, no state change, no UI flash — user sees nothing
   Future<void> _silentChunkSplit() async {
     if (!_isRecording) return;
-
-    // Cancel only the ticker (not alert timer — session warning continues)
     _ticker?.cancel();
 
     final capturedChunkStart = _chunkStart ?? DateTime.now();
@@ -293,18 +284,19 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     final capturedStart0     = _sessionStart!;
 
     try {
-      // Stop → start (0.5s gap — acceptable per Q1)
       final file = await _ctrl!.stopVideoRecording();
       await _ctrl!.startVideoRecording();
       _partNumber++;
       _sessionPartCount++;
       _chunkStart = DateTime.now();
 
-      // Enqueue completed chunk for background upload
-      final startSec = (capturedPart - 1) * _chunkSecs;
-      final endSec   = capturedEnd.difference(capturedChunkStart).inSeconds + startSec;
-      _queue.enqueue(PendingChunk(
+      final startSec   = (capturedPart - 1) * _chunkSecs;
+      final endSec     = capturedEnd.difference(capturedChunkStart).inSeconds + startSec;
+      // FIX: compute backupPath and await enqueue
+      final backupPath = await _backupPathFor(file.path);
+      await _queue.enqueue(PendingChunk(
         filePath:         file.path,
+        backupPath:       backupPath,
         sessionId:        capturedSessionId,
         userId:           _userId,
         partNumber:       capturedPart,
@@ -317,7 +309,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
       debugPrint('=== Silent split: part $capturedPart queued, part $_partNumber recording');
 
-      // Restart ticker for new chunk — checks BOTH 2-min AND 20-min boundaries
       _ticker = Timer.periodic(const Duration(seconds: 1), (_) async {
         if (!mounted || !_isRecording) { _ticker?.cancel(); return; }
         _displaySecs = DateTime.now().difference(capturedStart0).inSeconds;
@@ -340,18 +331,17 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
     } catch (e) {
       debugPrint('=== silentChunkSplit error: $e');
-      // Try to restart recording if split fails
       try {
         await _ctrl!.startVideoRecording();
         _partNumber++;
         _chunkStart = DateTime.now();
       } catch (_) {
-        if (mounted) setState(() => _state = _S.detecting);
+        if (mounted) { setState(() => _state = _S.detecting); }
       }
     }
   }
 
-  // ── 20-min session end → save last chunk → immediately start new session ──
+  // ── 20-min session end → save last chunk → start new session ──────────────
   Future<void> _endSessionAndRestart() async {
     if (!_isRecording) return;
     _ticker?.cancel();
@@ -366,11 +356,13 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     try {
       final file = await _ctrl!.stopVideoRecording();
 
-      // Enqueue final chunk of this 20-min session
-      final startSec = (capturedPart - 1) * _chunkSecs;
-      final endSec   = capturedEnd.difference(capturedChunkStart).inSeconds + startSec;
-      _queue.enqueue(PendingChunk(
+      final startSec   = (capturedPart - 1) * _chunkSecs;
+      final endSec     = capturedEnd.difference(capturedChunkStart).inSeconds + startSec;
+      // FIX: compute backupPath and await enqueue
+      final backupPath = await _backupPathFor(file.path);
+      await _queue.enqueue(PendingChunk(
         filePath:         file.path,
+        backupPath:       backupPath,
         sessionId:        capturedSessionId,
         userId:           _userId,
         partNumber:       capturedPart,
@@ -381,15 +373,14 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         endSec:           endSec,
       ));
 
-      _beep.blockTransition(); // session-end chime
+      _beep.blockTransition();
 
-      // Start brand new session immediately (no countdown between sessions)
       _sessionId        = _generateSessionId();
       _sessionStart     = DateTime.now();
       _partNumber       = 0;
       _sessionPartCount = 0;
       _warnFired        = false;
-      _queue.clearCompleted(); // Q2: reset badge for new session
+      _queue.clearCompleted();
 
       await _ctrl!.startVideoRecording();
       _partNumber       = 1;
@@ -398,7 +389,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
       debugPrint('=== New session after 20min: $_sessionId');
 
-      // Restart ticker for new session
       _ticker = Timer.periodic(const Duration(seconds: 1), (_) async {
         if (!mounted || !_isRecording) { _ticker?.cancel(); return; }
         _displaySecs = DateTime.now().difference(_sessionStart!).inSeconds;
@@ -420,7 +410,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
     } catch (e) {
       debugPrint('=== endSessionAndRestart error: $e');
-      if (mounted) setState(() => _state = _S.detecting);
+      if (mounted) { setState(() => _state = _S.detecting); }
     }
   }
 
@@ -440,10 +430,13 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     try {
       final file = await _ctrl!.stopVideoRecording();
 
-      final startSec = (capturedPart - 1) * _chunkSecs;
-      final endSec   = capturedEnd.difference(capturedChunkStart).inSeconds + startSec;
-      _queue.enqueue(PendingChunk(
+      final startSec   = (capturedPart - 1) * _chunkSecs;
+      final endSec     = capturedEnd.difference(capturedChunkStart).inSeconds + startSec;
+      // FIX: compute backupPath and await enqueue
+      final backupPath = await _backupPathFor(file.path);
+      await _queue.enqueue(PendingChunk(
         filePath:         file.path,
+        backupPath:       backupPath,
         sessionId:        capturedSessionId,
         userId:           _userId,
         partNumber:       capturedPart,
@@ -465,11 +458,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         Navigator.popUntil(context, (r) => r.isFirst);
       } else {
         await Future.delayed(const Duration(seconds: 3));
-        if (mounted && _isSaved) setState(() => _state = _S.detecting);
+        if (mounted && _isSaved) { setState(() => _state = _S.detecting); }
       }
     } catch (e) {
       debugPrint('=== saveAndStop error: $e');
-      if (mounted) setState(() { _state = _S.detecting; _displaySecs = 0; });
+      if (mounted) { setState(() { _state = _S.detecting; _displaySecs = 0; }); }
     }
   }
 
@@ -503,7 +496,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   Future<void> _toggleTorch() async {
     _torchOn = !_torchOn;
     try { await _ctrl?.setFlashMode(_torchOn ? FlashMode.torch : FlashMode.off); } catch (_) {}
-    if (mounted) setState(() {});
+    if (mounted) { setState(() {}); }
   }
 
   String _fmt(int secs) {
@@ -529,12 +522,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         Expanded(flex: 58, child: Stack(children: [
           Positioned.fill(child: CameraPreview(_ctrl!)),
 
-          // Top-left: format badge
           Positioned(top: 14, left: 14,
             child: _pill('Standard · 1.0x · 1080p · 30fps',
                 Colors.black.withValues(alpha: 0.6), Colors.white)),
 
-          // Top-left below: REC timer
           if (_isRecording)
             Positioned(top: 42, left: 14,
               child: Container(
@@ -553,18 +544,15 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                       style: const TextStyle(color: Colors.white70, fontSize: 11)),
                 ]))),
 
-          // Top-right: upload status badge (current session only)
           Positioned(top: 14, right: 14,
             child: StreamBuilder<List<ChunkState>>(
               stream: _queue.stream,
               builder: (_, snap) {
-                final chunks  = snap.data ?? _queue.current;
-                final done    = chunks.where((c) => c.status == ChunkStatus.done).length;
-                final total   = chunks.length;
-                final active  = chunks.where((c) => c.status == ChunkStatus.uploading).firstOrNull;
+                final chunks = snap.data ?? _queue.current;
+                final done   = chunks.where((c) => c.status == ChunkStatus.done).length;
+                final total  = chunks.length;
+                final active = chunks.where((c) => c.status == ChunkStatus.uploading).firstOrNull;
                 if (total == 0 && !_isRecording) return const SizedBox.shrink();
-                // Q2: show "0/N uploading" at start of session
-                final displayDone  = done;
                 final displayTotal = total > 0 ? total : _sessionPartCount;
                 return Container(
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
@@ -579,7 +567,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                         Icon(Icons.cloud_upload,
                             color: active != null ? Colors.blue : _green, size: 13),
                         const SizedBox(width: 5),
-                        Text('$displayDone/$displayTotal synced',
+                        Text('$done/$displayTotal synced',
                             style: const TextStyle(color: Colors.white, fontSize: 11)),
                       ]),
                       if (active != null)
@@ -589,7 +577,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                 );
               })),
 
-          // Countdown overlay
           if (_isCounting && _countdown > 0)
             Center(child: Container(
               width: 110, height: 110,
@@ -603,24 +590,22 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                       color: _countdown <= 2 ? _red : Colors.white,
                       fontSize: 58, fontWeight: FontWeight.bold))))),
 
-          // Saved overlay
           if (_isSaved)
             Center(child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
               decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.75),
                   borderRadius: BorderRadius.circular(16)),
-              child: Column(mainAxisSize: MainAxisSize.min, children: [
-                const Icon(Icons.cloud_upload, color: _green, size: 48),
-                const SizedBox(height: 10),
-                const Text('Session Saved!',
+              child: const Column(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.cloud_upload, color: _green, size: 48),
+                SizedBox(height: 10),
+                Text('Session Saved!',
                     style: TextStyle(color: Colors.white, fontSize: 16,
                         fontWeight: FontWeight.w700)),
-                const SizedBox(height: 4),
-                const Text('Upload continues in background',
+                SizedBox(height: 4),
+                Text('Upload continues in background',
                     style: TextStyle(color: Colors.white60, fontSize: 12)),
               ]))),
 
-          // Warning banner (19:50 → 20:00)
           if (_isWarning)
             Positioned(bottom: 14, left: 14, right: 14,
               child: Container(
@@ -642,7 +627,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           color: _surface,
           child: Column(children: [
 
-            // Header
             Container(
               color: _white,
               padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
@@ -664,7 +648,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                 ]),
                 const SizedBox(height: 4),
 
-                // Session timer display
                 Row(children: [
                   Flexible(child: FittedBox(
                     fit: BoxFit.scaleDown,
@@ -691,7 +674,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                       ])),
                 ]),
 
-                // 20-min session progress bar
                 if (_isRecording) ...[
                   const SizedBox(height: 6),
                   ClipRRect(
@@ -740,7 +722,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
               padding: const EdgeInsets.all(10),
               child: Column(children: [
 
-                // Q3: Fixed height buttons — removed info card to give full height
                 SizedBox(height: 56, child: Row(children: [
                   Expanded(child: _CtrlTile(
                       icon: Icons.home_rounded, label: 'Home',
@@ -765,15 +746,14 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                     onTap: (!_isRecording && !_isCounting) ? _toggleAutoDetect : null)),
                 const SizedBox(height: 8),
 
-                // Compact upload status (no info card — Q3)
                 StreamBuilder<List<ChunkState>>(
                   stream: _queue.stream,
                   builder: (_, snap) {
-                    final chunks   = snap.data ?? _queue.current;
+                    final chunks = snap.data ?? _queue.current;
                     if (chunks.isEmpty) return const SizedBox(height: 4);
-                    final done     = chunks.where((c) => c.status == ChunkStatus.done).length;
-                    final failed   = chunks.where((c) => c.status == ChunkStatus.failed).length;
-                    final active   = chunks.where((c) => c.status == ChunkStatus.uploading).firstOrNull;
+                    final done   = chunks.where((c) => c.status == ChunkStatus.done).length;
+                    final failed = chunks.where((c) => c.status == ChunkStatus.failed).length;
+                    final active = chunks.where((c) => c.status == ChunkStatus.uploading).firstOrNull;
                     return Container(
                       width: double.infinity,
                       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -789,7 +769,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                           active != null
                               ? 'Part ${active.chunk.partNumber}: ${(active.progress * 100).toStringAsFixed(0)}%'
                               : failed > 0 ? '$failed failed'
-                              : '$done/${chunks.length} synced ✓',
+                              : '$done/${chunks.length} synced \u2713',
                           style: TextStyle(fontSize: 11,
                               color: failed > 0 ? _red : _text,
                               fontWeight: FontWeight.w600))),
@@ -827,20 +807,23 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         label: _isSaved ? 'Record Again' : 'Start Recording',
         color: _green, onTap: _manualStart);
     }
-    if (_isRecording) return _ActionBtn(
-        icon: Icons.stop_rounded, label: 'Stop Recording',
-        color: _red, onTap: _saveAndStop);
-    if (_isCounting) return _ActionBtn(
-        icon: Icons.hourglass_top_rounded,
-        label: 'Starting in $_countdown...',
-        color: Colors.grey.shade400, onTap: null);
+    if (_isRecording) {
+      return _ActionBtn(
+          icon: Icons.stop_rounded, label: 'Stop Recording',
+          color: _red, onTap: _saveAndStop);
+    }
+    if (_isCounting) {
+      return _ActionBtn(
+          icon: Icons.hourglass_top_rounded,
+          label: 'Starting in $_countdown...',
+          color: Colors.grey.shade400, onTap: null);
+    }
     return _ActionBtn(
         icon: Icons.hourglass_bottom_rounded,
         label: 'Saving...', color: Colors.grey.shade400, onTap: null);
   }
 }
 
-// ── Reusable widgets ──────────────────────────────────────────────────────────
 class _CtrlTile extends StatelessWidget {
   final IconData icon; final String label;
   final VoidCallback? onTap; final bool active;
