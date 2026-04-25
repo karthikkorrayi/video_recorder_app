@@ -322,7 +322,7 @@ class ChunkUploadQueue {
                   Switch(
                     value: toggleValue,
                     onChanged: (v) => setState(() => toggleValue = v),
-                    activeColor: const Color(0xFF00C853),
+                    activeThumbColor: const Color(0xFF00C853),
                   ),
                 ]),
               ),
@@ -698,6 +698,13 @@ class ChunkUploadQueue {
       _emit();
       if (_canUpload) _processNext();
     }
+  }
+
+  /// Called from history_screen when the persistent toggle changes
+  void setMeteredAllowed(bool value) {
+    _allowMetered = value;
+    _emit();
+    if (_canUpload) _processNext();
   }
 }
 

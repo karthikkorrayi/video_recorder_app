@@ -7,6 +7,7 @@ import '../services/session_store.dart';
 import '../services/onedrive_service.dart';
 import '../services/user_service.dart';
 import 'history_screen.dart';
+import '../widgets/network_banner.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -105,8 +106,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFFF5F5F5),
-      body: SafeArea(
-        child: RefreshIndicator(
+      body: NetworkBannerWrapper(
+        child: SafeArea(child: RefreshIndicator(
           color: _green,
           onRefresh: _manualRefresh,
           child: SingleChildScrollView(
@@ -130,6 +131,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ]),
           ),
         ),
+        )
       ),
     );
   }

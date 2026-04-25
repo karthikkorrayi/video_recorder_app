@@ -1,17 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'session_store.dart';
 import 'user_service.dart';
 
 class OneDriveService {
-  static const String _backendBaseUrl =
-      'https://video-recorder-app-d7zk.onrender.com';
-  static const String _rootFolder = 'OTN Recorder';
+  static const String _backendBaseUrl = 'https://video-recorder-app-d7zk.onrender.com';
+  static const String _rootFolder     = 'OTN Recorder';
 
-  // ─── Token ────────────────────────────────────────────────────────────────
-
+  // ─── Token (cached, auto-refreshes) ──────────────────────────────────────
   static String?   _cachedToken;
   static DateTime? _tokenExpiry;
 
@@ -23,16 +22,21 @@ class OneDriveService {
     }
     final res = await http
         .get(Uri.parse('$_backendBaseUrl/token'))
-        .timeout(const Duration(seconds: 15));
+        .timeout(const Duration(seconds: 20));
     if (res.statusCode != 200) throw Exception('Token failed: ${res.body}');
     final data   = jsonDecode(res.body);
     _cachedToken = data['access_token'] as String;
-    _tokenExpiry = DateTime.now().add(const Duration(seconds: 3500));
+    // Refresh 5 minutes before actual expiry
+    _tokenExpiry = DateTime.now().add(const Duration(seconds: 3300));
     return _cachedToken!;
   }
 
-  // ─── Folder path ──────────────────────────────────────────────────────────
+  // ─── Encode a path segment ────────────────────────────────────────────────
+  static String _enc(String s) => Uri.encodeComponent(s);
+  static String _encPath(String path) =>
+      path.split('/').map(_enc).join('/');
 
+  // ─── Folder path builder ──────────────────────────────────────────────────
   static String buildSessionFolderPath({
     required String dateFolder,
     required String userFullName,
@@ -42,83 +46,101 @@ class OneDriveService {
   }) =>
       '$_rootFolder/$dateFolder/$userFullName/${sessionId}_${sessionDate}_$sessionStartTime';
 
-  // ─── Create fresh resumable upload session ────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // CORE UPLOAD METHOD — simple, reliable, no complex resume logic
+  //
+  // Strategy:
+  // 1. Check if file already exists and is complete → skip (idempotent)
+  // 2. Delete ANY existing incomplete file for this name (prevents 409)
+  // 3. Create fresh upload session with conflictBehavior:'replace'
+  // 4. Upload in 5MB chunks
+  // 5. If anything fails → caller handles retry
+  // ─────────────────────────────────────────────────────────────────────────
+  Future<void> uploadFileInSession({
+    required String filePath,
+    required String fileName,
+    required String dateFolder,
+    required String userFolder,
+    required String sessionFolder,
+    required String rootFolder,
+    required void Function(double) onProgress,
+    required void Function(String) onStatus,
+    String? existingUploadUrl, // kept for API compat, no longer used
+  }) async {
+    final folderPath = '$rootFolder/$dateFolder/$userFolder/$sessionFolder';
 
-  static Future<String> createUploadSession({
+    // Step 1: Already complete on OneDrive? Skip entirely.
+    onStatus('Checking...');
+    if (await fileExistsAndComplete(folderPath: folderPath, fileName: fileName)) {
+      debugPrint('=== OD: $fileName already complete — skip');
+      return;
+    }
+
+    // Step 2: Delete any incomplete/partial file to clear the way.
+    // This is the key fix — prevents 409 CONFLICT on retry.
+    onStatus('Preparing...');
+    await _deleteFileIfExists(folderPath: folderPath, fileName: fileName);
+    // Small delay to let OneDrive propagate the delete
+    await Future.delayed(const Duration(milliseconds: 800));
+
+    // Step 3: Create a fresh upload session.
+    // Use 'replace' as belt-and-suspenders in case delete hasn't propagated.
+    onStatus('Creating session...');
+    final uploadUrl = await _createFreshSession(
+        folderPath: folderPath, fileName: fileName);
+
+    // Step 4: Upload in chunks.
+    onStatus('Uploading...');
+    await _uploadInChunks(
+      uploadUrl:  uploadUrl,
+      file:       File(filePath),
+      onProgress: onProgress,
+    );
+  }
+
+  // ─── Create upload session ────────────────────────────────────────────────
+  static Future<String> _createFreshSession({
     required String folderPath,
     required String fileName,
   }) async {
-    final token       = await getAccessToken();
-    final encodedPath = folderPath.split('/').map(Uri.encodeComponent).join('/');
-    final url =
-        'https://graph.microsoft.com/v1.0/me/drive/root:/$encodedPath/$fileName:/createUploadSession';
+    final token = await getAccessToken();
+    final url   = 'https://graph.microsoft.com/v1.0/me/drive/root:/'
+        '${_encPath(folderPath)}/$fileName:/createUploadSession';
+
     final res = await http.post(
       Uri.parse(url),
-      headers: {'Authorization': 'Bearer $token', 'Content-Type': 'application/json'},
-      body: jsonEncode({'item': {
-        '@microsoft.graph.conflictBehavior': 'fail',
-        'name': fileName,
-      }}),
-    );
-    if (res.statusCode == 409) throw Exception('FILE_EXISTS:$fileName');
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Content-Type':  'application/json',
+      },
+      body: jsonEncode({
+        'item': {
+          // 'replace' means: if the file already exists, overwrite it.
+          // This prevents 409 CONFLICT even if delete didn't fully propagate.
+          '@microsoft.graph.conflictBehavior': 'replace',
+          'name': fileName,
+        }
+      }),
+    ).timeout(const Duration(seconds: 30));
+
     if (res.statusCode != 200) {
-      throw Exception('createUploadSession ${res.statusCode}: ${res.body}');
+      throw Exception('createSession failed ${res.statusCode}: ${res.body}');
     }
     return jsonDecode(res.body)['uploadUrl'] as String;
   }
 
-  // ─── Resume API ───────────────────────────────────────────────────────────
-  /// Queries OneDrive for how many bytes were received so far.
-  /// Returns the next byte offset to resume from, or null if session expired.
-  static Future<int?> queryUploadProgress(String uploadUrl) async {
-    try {
-      final res = await http.get(Uri.parse(uploadUrl))
-          .timeout(const Duration(seconds: 10));
-      // 200/308 = still active, body contains nextExpectedRanges
-      if (res.statusCode == 200 || res.statusCode == 308) {
-        final data   = jsonDecode(res.body);
-        final ranges = data['nextExpectedRanges'] as List?;
-        if (ranges != null && ranges.isNotEmpty) {
-          final first = ranges.first as String; // e.g. "0-" or "5242880-"
-          final start = int.tryParse(first.split('-').first) ?? 0;
-          return start;
-        }
-        return 0;
-      }
-      // 404/410 = expired
-      return null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  // ─── Delete a folder on OneDrive (used when abandoning stale session) ─────
-  static Future<void> deleteOneDriveFolder({
-    required String folderPath,
-  }) async {
-    try {
-      final token       = await getAccessToken();
-      final encodedPath = folderPath.split('/').map(Uri.encodeComponent).join('/');
-      await http.delete(
-        Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$encodedPath'),
-        headers: {'Authorization': 'Bearer $token'},
-      ).timeout(const Duration(seconds: 15));
-    } catch (_) {
-      // Non-fatal — stale folder cleanup is best-effort
-    }
-  }
-
-  // ─── Chunked PUT with optional resume offset ──────────────────────────────
-  static Future<void> uploadFileInChunks({
+  // ─── Upload file in 5MB chunks ────────────────────────────────────────────
+  static Future<void> _uploadInChunks({
     required String           uploadUrl,
     required File             file,
     required Function(double) onProgress,
-    int    chunkSize    = 5 * 1024 * 1024, // 5 MB
-    int    startOffset  = 0,               // for resume
+    int chunkSize = 5 * 1024 * 1024,
   }) async {
     final fileSize = await file.length();
-    int   offset   = startOffset;
-    final raf      = await file.open();
+    if (fileSize == 0) throw Exception('File is empty: ${file.path}');
+
+    int    offset = 0;
+    final  raf    = await file.open();
     try {
       while (offset < fileSize) {
         final end    = (offset + chunkSize > fileSize) ? fileSize : offset + chunkSize;
@@ -133,12 +155,12 @@ class OneDriveService {
             'Content-Length': '$length',
           },
           body: chunk,
-        ).timeout(const Duration(seconds: 120));
+        ).timeout(const Duration(seconds: 180));
 
         if (res.statusCode != 200 &&
             res.statusCode != 201 &&
             res.statusCode != 202) {
-          throw Exception('Chunk PUT failed ${res.statusCode} at $offset');
+          throw Exception('PUT failed ${res.statusCode} at offset $offset');
         }
         offset = end;
         onProgress(offset / fileSize);
@@ -148,91 +170,47 @@ class OneDriveService {
     }
   }
 
-  // ─── uploadFileInSession (used by ChunkUploadQueue) ───────────────────────
-  /// Supports resume: if [existingUploadUrl] is provided, tries to resume.
-  /// If the URL is expired → deletes the stale OneDrive folder → starts fresh.
-  Future<void> uploadFileInSession({
-    required String filePath,
+  // ─── Delete a specific file (best-effort, non-fatal) ─────────────────────
+  static Future<void> _deleteFileIfExists({
+    required String folderPath,
     required String fileName,
-    required String dateFolder,
-    required String userFolder,
-    required String sessionFolder,
-    required String rootFolder,
-    required void Function(double) onProgress,
-    required void Function(String) onStatus,
-    String? existingUploadUrl, // for resume attempt
   }) async {
-    final folderPath = '$rootFolder/$dateFolder/$userFolder/$sessionFolder';
-    String uploadUrl;
-    int    startOffset = 0;
-
-    if (existingUploadUrl != null) {
-      // Try to resume from existing upload session
-      onStatus('Checking upload progress...');
-      final resumeOffset = await queryUploadProgress(existingUploadUrl);
-      if (resumeOffset != null) {
-        // Session still alive — resume from where it left off
-        uploadUrl   = existingUploadUrl;
-        startOffset = resumeOffset;
-        onStatus('Resuming from ${(resumeOffset / 1024 / 1024).toStringAsFixed(1)} MB...');
-      } else {
-        // Session expired — delete the incomplete/stale OneDrive folder
-        // then start a completely fresh upload session
-        onStatus('Upload session expired — restarting...');
-        await deleteOneDriveFolder(folderPath: folderPath);
-        await Future.delayed(const Duration(seconds: 2)); // let OneDrive settle
-        uploadUrl   = await createUploadSession(folderPath: folderPath, fileName: fileName);
-        startOffset = 0;
-      }
-    } else {
-      // No existing session — create fresh
-      onStatus('Creating upload session...');
-      uploadUrl   = await createUploadSession(folderPath: folderPath, fileName: fileName);
-      startOffset = 0;
+    try {
+      final token = await getAccessToken();
+      final path  = '${_encPath(folderPath)}/${_enc(fileName)}';
+      await http.delete(
+        Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$path'),
+        headers: {'Authorization': 'Bearer $token'},
+      ).timeout(const Duration(seconds: 15));
+      debugPrint('=== OD: pre-cleared $fileName');
+    } catch (_) {
+      // Non-fatal — file may not exist yet, that's fine
     }
-
-    onStatus('Uploading...');
-    await uploadFileInChunks(
-      uploadUrl:   uploadUrl,
-      file:        File(filePath),
-      onProgress:  onProgress,
-      startOffset: startOffset,
-    );
   }
 
-  // ─── uploadFile (used by upload_service.dart) ─────────────────────────────
-  Future<void> uploadFile({
-    required String filePath, required String fileName,
-    required String dateFolder, required String userFolder,
-    required String rootFolder,
-    required bool Function() isPaused, required bool Function() isCancelled,
-    required void Function(double) onProgress, required void Function(String) onStatus,
-  }) async {
-    final fp  = '$rootFolder/$dateFolder/$userFolder';
-    final url = await createUploadSession(folderPath: fp, fileName: fileName);
-    await uploadFileInChunks(
-      uploadUrl: url, file: File(filePath),
-      onProgress: (p) { if (isCancelled()) throw Exception('cancelled'); onProgress(p); },
-    );
+  // ─── Delete a folder (best-effort) ───────────────────────────────────────
+  static Future<void> deleteOneDriveFolder({required String folderPath}) async {
+    try {
+      final token = await getAccessToken();
+      await http.delete(
+        Uri.parse(
+            'https://graph.microsoft.com/v1.0/me/drive/root:/${_encPath(folderPath)}'),
+        headers: {'Authorization': 'Bearer $token'},
+      ).timeout(const Duration(seconds: 15));
+    } catch (_) {}
   }
 
-  // ─── File integrity check (size > 0) ─────────────────────────────────────
+  // ─── File integrity check ─────────────────────────────────────────────────
+  /// Returns true only if file exists AND size > 0 bytes on OneDrive.
   Future<bool> fileExistsAndComplete({
     required String folderPath,
     required String fileName,
   }) async {
     try {
-      final token       = await getAccessToken();
-      final encodedPath = folderPath.split('/').map(Uri.encodeComponent).join('/');
-      final fr = await http.get(
-        Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$encodedPath'),
-        headers: {'Authorization': 'Bearer $token'},
-      ).timeout(const Duration(seconds: 10));
-      if (fr.statusCode != 200) return false;
-
-      final ef = Uri.encodeComponent(fileName);
-      final r  = await http.get(
-        Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$encodedPath/$ef'),
+      final token = await getAccessToken();
+      final path  = '${_encPath(folderPath)}/${_enc(fileName)}';
+      final r     = await http.get(
+        Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$path'),
         headers: {'Authorization': 'Bearer $token'},
       ).timeout(const Duration(seconds: 10));
       if (r.statusCode != 200) return false;
@@ -242,7 +220,56 @@ class OneDriveService {
     }
   }
 
-  // ─── listUserFiles ────────────────────────────────────────────────────────
+  // ─── Compatibility methods (used by upload_manager.dart + upload_service.dart)
+
+  /// Public wrapper — used by upload_manager.dart
+  static Future<String> createUploadSession({
+    required String folderPath,
+    required String fileName,
+  }) => _createFreshSession(folderPath: folderPath, fileName: fileName);
+
+  /// Public wrapper — used by upload_manager.dart
+  static Future<void> uploadFileInChunks({
+    required String           uploadUrl,
+    required File             file,
+    required Function(double) onProgress,
+    int chunkSize   = 5 * 1024 * 1024,
+    int startOffset = 0,
+  }) => _uploadInChunks(
+    uploadUrl:  uploadUrl,
+    file:       file,
+    onProgress: onProgress,
+    chunkSize:  chunkSize,
+  );
+
+  /// Public wrapper — used by upload_service.dart
+  Future<void> uploadFile({
+    required String filePath,
+    required String fileName,
+    required String dateFolder,
+    required String userFolder,
+    required String rootFolder,
+    required bool Function() isPaused,
+    required bool Function() isCancelled,
+    required void Function(double) onProgress,
+    required void Function(String) onStatus,
+  }) async {
+    await uploadFileInSession(
+      filePath:      filePath,
+      fileName:      fileName,
+      dateFolder:    dateFolder,
+      userFolder:    userFolder,
+      sessionFolder: '',
+      rootFolder:    rootFolder,
+      onProgress:    (p) {
+        if (isCancelled()) throw Exception('Upload cancelled');
+        onProgress(p);
+      },
+      onStatus: onStatus,
+    );
+  }
+
+  // ─── List user files ──────────────────────────────────────────────────────
   Future<List<Map<String, dynamic>>> listUserFiles({
     required String rootFolder,
     required String userFolder,
@@ -250,33 +277,34 @@ class OneDriveService {
     final token = await getAccessToken();
     final files = <Map<String, dynamic>>[];
     try {
-      final rp      = Uri.encodeComponent(rootFolder);
+      final rp       = _enc(rootFolder);
       final datesRes = await http.get(
         Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$rp:/children'),
         headers: {'Authorization': 'Bearer $token'},
-      ).timeout(const Duration(seconds: 15));
+      ).timeout(const Duration(seconds: 20));
       if (datesRes.statusCode != 200) return files;
 
       for (final df in (jsonDecode(datesRes.body)['value'] as List)
           .cast<Map<String, dynamic>>()) {
         if (df['folder'] == null) continue;
         final dateName = df['name'] as String;
-        final up = Uri.encodeComponent('$rootFolder/$dateName/$userFolder');
-        final userRes = await http.get(
+        final up       = _encPath('$rootFolder/$dateName/$userFolder');
+        final userRes  = await http.get(
           Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$up:/children'),
           headers: {'Authorization': 'Bearer $token'},
-        ).timeout(const Duration(seconds: 15));
+        ).timeout(const Duration(seconds: 20));
         if (userRes.statusCode != 200) continue;
 
         for (final item in (jsonDecode(userRes.body)['value'] as List)
             .cast<Map<String, dynamic>>()) {
           if (item['folder'] != null) {
             final sn = item['name'] as String;
-            final sp = Uri.encodeComponent('$rootFolder/$dateName/$userFolder/$sn');
+            final sp = _encPath('$rootFolder/$dateName/$userFolder/$sn');
             final sr = await http.get(
-              Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$sp:/children'),
+              Uri.parse(
+                  'https://graph.microsoft.com/v1.0/me/drive/root:/$sp:/children'),
               headers: {'Authorization': 'Bearer $token'},
-            ).timeout(const Duration(seconds: 15));
+            ).timeout(const Duration(seconds: 20));
             if (sr.statusCode != 200) continue;
             for (final part in (jsonDecode(sr.body)['value'] as List)
                 .cast<Map<String, dynamic>>()) {
@@ -306,15 +334,15 @@ class OneDriveService {
     return files;
   }
 
-  // ─── Two attendance CSVs ──────────────────────────────────────────────────
+  // ─── Attendance CSVs ──────────────────────────────────────────────────────
   static Future<void> writeAdminAttendanceCsv() async {
     try {
       final token    = await getAccessToken();
-      final rp       = Uri.encodeComponent(_rootFolder);
+      final rp       = _enc(_rootFolder);
       final datesRes = await http.get(
         Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$rp:/children'),
         headers: {'Authorization': 'Bearer $token'},
-      ).timeout(const Duration(seconds: 15));
+      ).timeout(const Duration(seconds: 20));
       if (datesRes.statusCode != 200) return;
 
       final detail = <Map<String, dynamic>>[];
@@ -323,33 +351,33 @@ class OneDriveService {
           .cast<Map<String, dynamic>>()) {
         if (df['folder'] == null) continue;
         final dateName = df['name'] as String;
-        final dp = Uri.encodeComponent('$_rootFolder/$dateName');
         final usersRes = await http.get(
-          Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$dp:/children'),
+          Uri.parse(
+              'https://graph.microsoft.com/v1.0/me/drive/root:/${_encPath('$_rootFolder/$dateName')}:/children'),
           headers: {'Authorization': 'Bearer $token'},
-        ).timeout(const Duration(seconds: 15));
+        ).timeout(const Duration(seconds: 20));
         if (usersRes.statusCode != 200) continue;
 
         for (final uf in (jsonDecode(usersRes.body)['value'] as List)
             .cast<Map<String, dynamic>>()) {
           if (uf['folder'] == null) continue;
           final userName = uf['name'] as String;
-          final up = Uri.encodeComponent('$_rootFolder/$dateName/$userName');
-          final sessRes = await http.get(
-            Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$up:/children'),
+          final sessRes  = await http.get(
+            Uri.parse(
+                'https://graph.microsoft.com/v1.0/me/drive/root:/${_encPath('$_rootFolder/$dateName/$userName')}:/children'),
             headers: {'Authorization': 'Bearer $token'},
-          ).timeout(const Duration(seconds: 15));
+          ).timeout(const Duration(seconds: 20));
           if (sessRes.statusCode != 200) continue;
 
           for (final sf in (jsonDecode(sessRes.body)['value'] as List)
               .cast<Map<String, dynamic>>()) {
             if (sf['folder'] == null) continue;
             final sessionName = sf['name'] as String;
-            final sp = Uri.encodeComponent('$_rootFolder/$dateName/$userName/$sessionName');
-            final partsRes = await http.get(
-              Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$sp:/children'),
+            final partsRes    = await http.get(
+              Uri.parse(
+                  'https://graph.microsoft.com/v1.0/me/drive/root:/${_encPath('$_rootFolder/$dateName/$userName/$sessionName')}:/children'),
               headers: {'Authorization': 'Bearer $token'},
-            ).timeout(const Duration(seconds: 15));
+            ).timeout(const Duration(seconds: 20));
             if (partsRes.statusCode != 200) continue;
 
             final parts = (jsonDecode(partsRes.body)['value'] as List)
@@ -365,7 +393,8 @@ class OneDriveService {
             if (nameParts.length >= 3) {
               final t = nameParts[2];
               if (t.length == 6) {
-                startTime = '${t.substring(0,2)}:${t.substring(2,4)}:${t.substring(4,6)}';
+                startTime =
+                    '${t.substring(0,2)}:${t.substring(2,4)}:${t.substring(4,6)}';
               }
             }
             for (final p in parts) {
@@ -373,10 +402,10 @@ class OneDriveService {
             }
             if (startTime.isNotEmpty && totalMins > 0) {
               try {
-                final hh  = int.parse(startTime.substring(0, 2));
-                final mm  = int.parse(startTime.substring(3, 5));
-                final ss  = int.parse(startTime.substring(6, 8));
-                final end = DateTime(2000, 1, 1, hh, mm, ss)
+                final hh  = int.parse(startTime.substring(0,2));
+                final mm  = int.parse(startTime.substring(3,5));
+                final ss  = int.parse(startTime.substring(6,8));
+                final end = DateTime(2000,1,1,hh,mm,ss)
                     .add(Duration(minutes: totalMins));
                 endTime = '${end.hour.toString().padLeft(2,'0')}:'
                     '${end.minute.toString().padLeft(2,'0')}:'
@@ -395,8 +424,7 @@ class OneDriveService {
       detail.sort((a, b) {
         final dc = (b['date'] as String).compareTo(a['date'] as String);
         if (dc != 0) return dc;
-        final uc = (a['user'] as String).compareTo(b['user'] as String);
-        return uc != 0 ? uc : (a['session'] as String).compareTo(b['session'] as String);
+        return (a['user'] as String).compareTo(b['user'] as String);
       });
 
       final summaryMap = <String, Map<String, dynamic>>{};
@@ -406,45 +434,51 @@ class OneDriveService {
           'date': r['date'], 'user': r['user'],
           'totalSessions': 0, 'totalMins': 0, 'totalParts': 0,
         });
-        summaryMap[key]!['totalSessions'] = (summaryMap[key]!['totalSessions'] as int) + 1;
-        summaryMap[key]!['totalMins']     = (summaryMap[key]!['totalMins']     as int) + (r['mins'] as int);
-        summaryMap[key]!['totalParts']    = (summaryMap[key]!['totalParts']    as int) + (r['parts'] as int);
+        summaryMap[key]!['totalSessions'] =
+            (summaryMap[key]!['totalSessions'] as int) + 1;
+        summaryMap[key]!['totalMins'] =
+            (summaryMap[key]!['totalMins'] as int) + (r['mins'] as int);
+        summaryMap[key]!['totalParts'] =
+            (summaryMap[key]!['totalParts'] as int) + (r['parts'] as int);
       }
-      final summary = summaryMap.values.toList()
-        ..sort((a, b) {
-          final dc = (b['date'] as String).compareTo(a['date'] as String);
-          return dc != 0 ? dc : (a['user'] as String).compareTo(b['user'] as String);
-        });
 
-      final detailSb = StringBuffer();
-      detailSb.writeln('Date,User,Session,StartTime,EndTime,Duration(mins),Parts');
+      final detailSb = StringBuffer()
+        ..writeln('Date,User,Session,StartTime,EndTime,Duration(mins),Parts');
       for (final r in detail) {
         detailSb.writeln('${r['date']},${r['user']},${r['session']},'
             '${r['startTime']},${r['endTime']},${r['mins']},${r['parts']}');
       }
       await _writeCsv(token, 'attendance_detail.csv', detailSb.toString());
 
-      final sumSb = StringBuffer();
-      sumSb.writeln('Date,User,TotalSessions,TotalMins,TotalParts');
-      for (final r in summary) {
+      final sumSb = StringBuffer()
+        ..writeln('Date,User,TotalSessions,TotalMins,TotalParts');
+      for (final r in summaryMap.values.toList()
+          ..sort((a,b) {
+            final dc = (b['date'] as String).compareTo(a['date'] as String);
+            return dc != 0 ? dc :
+                (a['user'] as String).compareTo(b['user'] as String);
+          })) {
         sumSb.writeln('${r['date']},${r['user']},'
             '${r['totalSessions']},${r['totalMins']},${r['totalParts']}');
       }
       await _writeCsv(token, 'attendance_summary.csv', sumSb.toString());
 
-      // ignore: avoid_print
-      print('=== Attendance CSVs: ${detail.length} sessions, ${summary.length} user-days');
+      debugPrint('=== Attendance CSVs written: ${detail.length} sessions');
     } catch (e) {
-      // ignore: avoid_print
-      print('=== writeAdminAttendanceCsv error: $e');
+      debugPrint('=== writeAdminAttendanceCsv error: $e');
     }
   }
 
-  static Future<void> _writeCsv(String token, String fileName, String content) async {
-    final path = Uri.encodeComponent(_rootFolder) + '/' + Uri.encodeComponent(fileName);
+  static Future<void> _writeCsv(
+      String token, String fileName, String content) async {
+    final path = '${_enc(_rootFolder)}/${_enc(fileName)}';
     await http.put(
-      Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$path:/content'),
-      headers: {'Authorization': 'Bearer $token', 'Content-Type': 'text/csv'},
+      Uri.parse(
+          'https://graph.microsoft.com/v1.0/me/drive/root:/$path:/content'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Content-Type':  'text/csv',
+      },
       body: utf8.encode(content),
     ).timeout(const Duration(seconds: 30));
   }
@@ -455,16 +489,20 @@ class OneDriveService {
     return int.parse(m.group(2)!) - int.parse(m.group(1)!);
   }
 
-  // ─── Background sync ─────────────────────────────────────────────────────
+  // ─── Background sync ──────────────────────────────────────────────────────
   static Timer? _syncTimer;
 
   static void startBackgroundSync() {
     _syncTimer?.cancel();
-    _syncTimer = Timer.periodic(const Duration(minutes: 5), (_) => _verifySyncedSessions());
+    _syncTimer = Timer.periodic(
+        const Duration(minutes: 5), (_) => _verifySyncedSessions());
     _verifySyncedSessions();
   }
 
-  static void stopBackgroundSync() { _syncTimer?.cancel(); _syncTimer = null; }
+  static void stopBackgroundSync() {
+    _syncTimer?.cancel();
+    _syncTimer = null;
+  }
 
   static Future<void> _verifySyncedSessions() async {
     try {
@@ -473,26 +511,25 @@ class OneDriveService {
       final store        = await SessionStore.load();
       for (final s in store.sessions.where((s) => s.status == 'synced')) {
         final fp = buildSessionFolderPath(
-          dateFolder: s.dateFolder, userFullName: userFullName,
-          sessionId: s.id.length >= 6 ? s.id.substring(0,6).toUpperCase() : s.id.toUpperCase(),
-          sessionDate: s.sessionDate, sessionStartTime: s.startTime,
+          dateFolder:       s.dateFolder,
+          userFullName:     userFullName,
+          sessionId:        s.id.length >= 6
+              ? s.id.substring(0, 6).toUpperCase()
+              : s.id.toUpperCase(),
+          sessionDate:      s.sessionDate,
+          sessionStartTime: s.startTime,
         );
-        if (!await _folderExistsOnOneDrive(token: token, folderPath: fp)) {
-          await store.removeSession(s.id);
-        }
+        try {
+          final ep  = _encPath(fp);
+          final res = await http.get(
+            Uri.parse(
+                'https://graph.microsoft.com/v1.0/me/drive/root:/$ep'),
+            headers: {'Authorization': 'Bearer $token'},
+          ).timeout(const Duration(seconds: 10));
+          if (res.statusCode != 200) await store.removeSession(s.id);
+        } catch (_) {}
       }
     } catch (_) {}
-  }
-
-  static Future<bool> _folderExistsOnOneDrive({required String token, required String folderPath}) async {
-    try {
-      final ep  = folderPath.split('/').map(Uri.encodeComponent).join('/');
-      final res = await http.get(
-        Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$ep'),
-        headers: {'Authorization': 'Bearer $token'},
-      ).timeout(const Duration(seconds: 10));
-      return res.statusCode == 200;
-    } catch (_) { return true; }
   }
 
   static Future<void> forceSync() async => _verifySyncedSessions();
