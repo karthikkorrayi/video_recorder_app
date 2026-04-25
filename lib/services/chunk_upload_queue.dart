@@ -6,6 +6,8 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'onedrive_service.dart';
+import 'queue_persistence.dart';
+import 'firestore_cache_service.dart';
 import 'notification_service.dart';
 import 'user_service.dart';
 import 'package:intl/intl.dart';
@@ -137,7 +139,20 @@ class ChunkUploadQueue {
       });
 
   List<ChunkState> get all => _states.values.toList();
-  void _emit() => _ctrl.add(current);
+  void _emit() {
+    _ctrl.add(current);
+    _persistToDisk(); // Issue 3: save queue state after every change
+  }
+
+  void _persistToDisk() {
+    // Save all non-done chunks to persistent storage
+    // Runs async but doesn't block UI
+    final entries = _states.values
+        .where((s) => s.status != ChunkStatus.done)
+        .map((s) => QueuePersistence.chunkToMap(s.chunk))
+        .toList();
+    QueuePersistence.instance.save(entries).ignore();
+  }
 
   // ── Metrics ──────────────────────────────────────────────────────────────
   int  get pendingCount   => _states.values.where((s) => s.status == ChunkStatus.queued).length;
@@ -204,6 +219,12 @@ class ChunkUploadQueue {
     final prefs    = await SharedPreferences.getInstance();
     _wifiPreferred = prefs.getBool(_wifiPrefKey) ?? true;
     _allowMetered  = prefs.getBool(_meteredPrefKey) ?? false;
+    // Fix: after loading prefs, attempt upload if conditions now met
+    if (_canUpload && _states.values.any(
+        (s) => s.status == ChunkStatus.queued)) {
+      _processNext();
+    }
+    _emit();
   }
 
   Future<void> _saveMeteredPref(bool value) async {
@@ -214,7 +235,7 @@ class ChunkUploadQueue {
 
   // ── Network monitor ───────────────────────────────────────────────────────
   void startNetworkMonitor({BuildContext? context}) {
-    _loadPrefs();
+    _loadPrefs(); // async — prefs available shortly after
     Connectivity().onConnectivityChanged.listen((results) async {
       final wasWifi = _isWifi;
       final result  = results.isNotEmpty ? results.first : ConnectivityResult.none;
@@ -430,6 +451,9 @@ class ChunkUploadQueue {
     } catch (_) { return; }
 
     _running = true;
+    // Fix: always wrap in try/finally so _running is ALWAYS cleared,
+    // even if an unexpected exception escapes the inner catch blocks
+    try {
     final state = _states[next.filePath]!;
     state.status  = ChunkStatus.uploading;
     state.message = 'Starting...';
@@ -485,10 +509,14 @@ class ChunkUploadQueue {
       _queue.remove(next);
       _emit();
       debugPrint('=== Queue: ${next.cloudFileName} done ✓');
-      _running = false;
+      // Issue 7: Write to Firestore after confirmed
+      _writeChunkToFirestore(next).ignore();
+      // Issue 3: Remove from persistent storage
+      QueuePersistence.instance.remove(next.filePath).ignore();
 
-      // Continue with next queued chunk
+      _running = false;
       if (_canUpload) _processNext();
+      return; // skip the finally-path processNext
 
     } else {
       // ── Issue 1: Failure after retries — GLOBAL HOLD ─────────────────
@@ -511,8 +539,30 @@ class ChunkUploadQueue {
           'Part ${next.partNumber} of ${next.sessionId} failed. '
           'Open app and tap Retry All to continue.');
 
+      // _running cleared in finally
+    }
+    } finally {
+      // Fix: ALWAYS clear _running, no matter what happens
       _running = false;
-      // No _processNext() — global hold prevents further uploads
+    }
+  }
+
+  Future<void> _writeChunkToFirestore(PendingChunk chunk) async {
+    try {
+      final userFolder = await UserService().getDisplayName();
+      final dateFolder = DateFormat('dd-MM-yyyy').format(chunk.sessionDate);
+      await FirestoreCacheService().recordChunkUploaded(
+        sessionId:         chunk.sessionId,
+        dateFolder:        dateFolder,
+        userFolder:        userFolder,
+        sessionFolder:     chunk.sessionFolderName,
+        chunkDurationSecs: chunk.durationSecs,
+        chunkSizeBytes:    await File(chunk.bestFilePath).length().catchError((_) => 0),
+        partNumber:        chunk.partNumber,
+        sessionStartMs:    chunk.sessionStartTime.millisecondsSinceEpoch,
+      );
+    } catch (e) {
+      debugPrint('=== Firestore write error (non-fatal): \$e');
     }
   }
 
@@ -559,6 +609,7 @@ class ChunkUploadQueue {
   /// Issue 1: Manual retry — clears global hold, re-queues ALL failed chunks
   void retryFailed() {
     _globalHold = false; // release the hold
+    _running    = false; // Fix: force-clear stuck _running from previous attempt
     for (final s in _states.values) {
       if (s.status == ChunkStatus.failed) {
         if (s.chunk.hasAnyFile) {
@@ -593,6 +644,7 @@ class ChunkUploadQueue {
     }
     // Single chunk retry also releases global hold
     _globalHold           = false;
+    _running              = false; // Fix: force-clear stuck _running
     s.status              = ChunkStatus.queued;
     s.progress            = 0.0;
     s.message             = 'Retrying...';
@@ -639,7 +691,51 @@ class ChunkUploadQueue {
       .any((s) => s.chunk.sessionId == sessionId && s.status != ChunkStatus.done);
 
   // ── Recovery ──────────────────────────────────────────────────────────────
+  Future<void> _recoverFromPersistence() async {
+    try {
+      final entries = await QueuePersistence.instance.load();
+      for (final e in entries) {
+        final filePath   = e['filePath']   as String? ?? '';
+        final backupPath = e['backupPath'] as String? ?? '';
+        if (filePath.isEmpty) continue;
+        if (_states.containsKey(filePath)) continue;
+
+        final chunk = PendingChunk(
+          filePath:         filePath,
+          backupPath:       backupPath,
+          sessionId:        e['sessionId']      as String? ?? '',
+          userId:           e['userId']         as String? ?? '',
+          partNumber:       (e['partNumber']    as num? ?? 0).toInt(),
+          sessionDate:      DateTime.fromMillisecondsSinceEpoch(
+              (e['sessionDateMs']  as num? ?? 0).toInt()),
+          sessionStartTime: DateTime.fromMillisecondsSinceEpoch(
+              (e['sessionStartMs'] as num? ?? 0).toInt()),
+          sessionEndTime:   DateTime.fromMillisecondsSinceEpoch(
+              (e['sessionEndMs']   as num? ?? 0).toInt()),
+          startSec:         (e['startSec'] as num? ?? 0).toInt(),
+          endSec:           (e['endSec']   as num? ?? 0).toInt(),
+        );
+
+        // Only add if file actually exists
+        if (!chunk.hasAnyFile) {
+          debugPrint('=== QueuePersist: file gone for \${chunk.cloudFileName}');
+          continue;
+        }
+
+        _states[chunk.filePath] = ChunkState(chunk);
+        _queue.add(chunk);
+        debugPrint('=== QueuePersist: restored \${chunk.cloudFileName}');
+      }
+      if (_states.isNotEmpty) _emit();
+    } catch (e) {
+      debugPrint('=== _recoverFromPersistence error: \$e');
+    }
+  }
+
   Future<void> recoverFromCache() async {
+    // Issue 3: First restore from persistent JSON (survives recents clear)
+    await _recoverFromPersistence();
+    // Then scan backup folders for any files not in persistence
     await cleanStaleFiles();
     final bdir = await _backupDir();
     final cdir = await _chunksDir();

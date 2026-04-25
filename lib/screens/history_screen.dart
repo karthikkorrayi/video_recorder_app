@@ -54,6 +54,33 @@ class _HistoryScreenState extends State<HistoryScreen> {
   }
 
   Future<void> _saveMeteredPref(bool v) async {
+    // Issue 1: Show confirmation when turning ON cellular
+    if (v && mounted) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (_) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Text('Use Mobile Data?'),
+          content: const Text(
+              'This will use your cellular data to upload videos.\n\n'
+              'Video files can be large. Standard carrier data rates apply.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF00C853)),
+              child: const Text('Enable',
+                  style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return; // user cancelled — don't enable
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_meteredKey, v);
     setState(() => _allowMetered = v);
