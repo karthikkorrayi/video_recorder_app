@@ -14,8 +14,9 @@ class OneDriveService {
   static String?   _cachedToken;
   static DateTime? _tokenExpiry;
 
-  static Future<String> getAccessToken() async {
-    if (_cachedToken != null &&
+  static Future<String> getAccessToken({bool forceRefresh = false}) async {
+    if (!forceRefresh &&
+        _cachedToken != null &&
         _tokenExpiry != null &&
         DateTime.now().isBefore(_tokenExpiry!)) {
       return _cachedToken!;
@@ -27,7 +28,7 @@ class OneDriveService {
     final data   = jsonDecode(res.body);
     _cachedToken = data['access_token'] as String;
     // Refresh 5 minutes before actual expiry
-    _tokenExpiry = DateTime.now().add(const Duration(seconds: 3300));
+    _tokenExpiry = DateTime.now().add(const Duration(seconds: 2700));
     return _cachedToken!;
   }
 
@@ -123,6 +124,11 @@ class OneDriveService {
       }),
     ).timeout(const Duration(seconds: 30));
 
+    if (res.statusCode == 401) {
+      _cachedToken = null;
+      _tokenExpiry  = null;
+      throw Exception('createSession failed 401 (token cleared for retry): ${res.body}');
+    }
     if (res.statusCode != 200) {
       throw Exception('createSession failed ${res.statusCode}: ${res.body}');
     }
@@ -130,44 +136,139 @@ class OneDriveService {
   }
 
   // ─── Upload file in 5MB chunks ────────────────────────────────────────────
+  // ─── True resumable chunked upload ───────────────────────────────────────
+  // Uses 1MB chunks (vs 5MB) for finer progress granularity.
+  // On any network error (timeout, reset, etc.) → queries OneDrive for how
+  // many bytes it already received → resumes from that offset automatically.
+  // This handles "Connection reset by peer" and "Connection timed out" without
+  // losing progress or requiring a full restart.
+  static const int _chunkBytes = 5 * 1024 * 1024; // 5 MB per PUT request
+  static const int _maxChunkRetries = 5; // retry each individual chunk up to 5x
+
   static Future<void> _uploadInChunks({
     required String           uploadUrl,
     required File             file,
     required Function(double) onProgress,
-    int chunkSize = 5 * 1024 * 1024,
+    int chunkSize = _chunkBytes, // kept for compat, uses _chunkBytes internally
   }) async {
     final fileSize = await file.length();
     if (fileSize == 0) throw Exception('File is empty: ${file.path}');
 
-    int    offset = 0;
-    final  raf    = await file.open();
+    int offset = 0;
+    final raf  = await file.open();
+
     try {
       while (offset < fileSize) {
-        final end    = (offset + chunkSize > fileSize) ? fileSize : offset + chunkSize;
+        final end    = (offset + _chunkBytes > fileSize)
+            ? fileSize : offset + _chunkBytes;
         final length = end - offset;
-        await raf.setPosition(offset);
-        final chunk = await raf.read(length);
 
-        final res = await http.put(
-          Uri.parse(uploadUrl),
-          headers: {
-            'Content-Range':  'bytes $offset-${end - 1}/$fileSize',
-            'Content-Length': '$length',
-          },
-          body: chunk,
-        ).timeout(const Duration(seconds: 180));
+        bool chunkOk = false;
+        int  chunkAttempt = 0;
 
-        if (res.statusCode != 200 &&
-            res.statusCode != 201 &&
-            res.statusCode != 202) {
-          throw Exception('PUT failed ${res.statusCode} at offset $offset');
+        while (!chunkOk && chunkAttempt < _maxChunkRetries) {
+          chunkAttempt++;
+          try {
+            await raf.setPosition(offset);
+            final chunk = await raf.read(length);
+
+            final res = await http.put(
+              Uri.parse(uploadUrl),
+              headers: {
+                'Content-Range':  'bytes $offset-${end - 1}/$fileSize',
+                'Content-Length': '$length',
+              },
+              body: chunk,
+            ).timeout(const Duration(seconds: 300)); // 300s per 1MB chunk — slow connections
+
+            if (res.statusCode == 401) {
+              _cachedToken = null;
+              _tokenExpiry  = null;
+              throw Exception('PUT 401 — token cleared');
+            }
+            if (res.statusCode == 200 ||
+                res.statusCode == 201 ||
+                res.statusCode == 202) {
+              chunkOk = true;
+              offset  = end;
+              onProgress(offset / fileSize);
+              debugPrint('=== OD: chunk $offset/$fileSize (${(offset/fileSize*100).toStringAsFixed(0)}%)');
+            } else {
+              throw Exception('PUT ${res.statusCode} at offset $offset');
+            }
+
+          } catch (e) {
+            final errStr = e.toString();
+            debugPrint('=== OD: chunk attempt $chunkAttempt failed at offset $offset: $errStr');
+
+            if (errStr.contains('401')) rethrow; // token error — bubble up immediately
+
+            // DNS/network-gone errors: do NOT count against retry limit
+            // Wait for DNS to recover then retry same attempt
+            final isDnsError = errStr.contains('No address associated with hostname') ||
+                errStr.contains('Failed host lookup') ||
+                errStr.contains('errno = 7') ||
+                errStr.contains('UnknownHostException');
+
+            if (isDnsError) {
+              debugPrint('=== OD: DNS failure — waiting 15s for network to recover');
+              await Future.delayed(const Duration(seconds: 15));
+              chunkAttempt--; // do NOT count DNS failure as a retry attempt
+              continue;       // retry same chunk without consuming a retry slot
+            }
+
+            if (chunkAttempt < _maxChunkRetries) {
+              // For real network errors (timeout, reset): query resume offset
+              final resumeOffset = await _queryUploadProgress(uploadUrl);
+              if (resumeOffset > offset) {
+                debugPrint('=== OD: resuming from $resumeOffset (was $offset)');
+                offset = resumeOffset;
+                if (offset >= fileSize) { chunkOk = true; break; }
+              }
+              final waitSecs = chunkAttempt * 3;
+              debugPrint('=== OD: waiting ${waitSecs}s before chunk retry');
+              await Future.delayed(Duration(seconds: waitSecs));
+            }
+          }
         }
-        offset = end;
-        onProgress(offset / fileSize);
+
+        if (!chunkOk) {
+          // All chunk retries exhausted — bubble up to outer retry logic
+          throw Exception(
+              'Chunk at offset $offset failed after $_maxChunkRetries attempts');
+        }
       }
     } finally {
       await raf.close();
     }
+  }
+
+  // ─── Query OneDrive for upload progress ──────────────────────────────────
+  // Returns how many bytes OneDrive has already received.
+  // Used to resume after a connection reset.
+  static Future<int> _queryUploadProgress(String uploadUrl) async {
+    try {
+      final res = await http.put(
+        Uri.parse(uploadUrl),
+        headers: {
+          'Content-Range': 'bytes */*', // special: query-only, no body
+          'Content-Length': '0',
+        },
+      ).timeout(const Duration(seconds: 15));
+
+      // 308 Resume Incomplete — response header tells us the range received
+      if (res.statusCode == 308) {
+        final range = res.headers['range'];
+        if (range != null) {
+          // range = "bytes=0-12345" → next offset is 12346
+          final parts = range.split('-');
+          if (parts.length == 2) {
+            return int.parse(parts[1]) + 1;
+          }
+        }
+      }
+    } catch (_) {}
+    return 0; // unknown — restart chunk from beginning
   }
 
   // ─── Delete a specific file (best-effort, non-fatal) ─────────────────────

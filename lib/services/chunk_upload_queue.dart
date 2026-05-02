@@ -9,6 +9,7 @@ import 'onedrive_service.dart';
 import 'queue_persistence.dart';
 import 'firestore_cache_service.dart';
 import 'notification_service.dart';
+import 'upload_foreground_service.dart';
 import 'user_service.dart';
 import 'package:intl/intl.dart';
 
@@ -139,14 +140,38 @@ class ChunkUploadQueue {
       });
 
   List<ChunkState> get all => _states.values.toList();
+  Timer? _persistDebounce;
+
   void _emit() {
     _ctrl.add(current);
-    _persistToDisk(); // Issue 3: save queue state after every change
+    _persistDebounced();
+    _updateForegroundService(); // update notification with latest state
+  }
+
+  void _updateForegroundService() {
+    final uploading = _states.values
+        .where((s) => s.status == ChunkStatus.uploading)
+        .toList();
+    if (uploading.isEmpty) return;
+    final active  = uploading.first;
+    final total   = _states.length;
+    final pct     = (active.progress * 100).toStringAsFixed(0);
+    final sid     = active.chunk.sessionId;
+    final part    = active.chunk.partNumber;
+    UploadForegroundService.update(
+      progressText: 'Part $part: $pct% — $sid',
+      chunksText:   '$total chunk${total == 1 ? '' : 's'} pending',
+    ).ignore();
+  }
+
+  void _persistDebounced() {
+    // Debounce: only write to disk at most once per 2 seconds
+    // Prevents log spam and excessive disk writes during upload progress updates
+    _persistDebounce?.cancel();
+    _persistDebounce = Timer(const Duration(seconds: 2), _persistToDisk);
   }
 
   void _persistToDisk() {
-    // Save all non-done chunks to persistent storage
-    // Runs async but doesn't block UI
     final entries = _states.values
         .where((s) => s.status != ChunkStatus.done)
         .map((s) => QueuePersistence.chunkToMap(s.chunk))
@@ -458,6 +483,12 @@ class ChunkUploadQueue {
     state.status  = ChunkStatus.uploading;
     state.message = 'Starting...';
     _emit();
+    // Start foreground service so upload continues in background
+    final pendingTotal = _states.length;
+    UploadForegroundService.start(
+      progressText: 'Uploading Part ${next.partNumber} of ${next.sessionId}',
+      chunksText:   '$pendingTotal chunk${pendingTotal == 1 ? '' : 's'} pending',
+    ).ignore();
 
     bool uploadSuccess = false;
 
@@ -509,14 +540,14 @@ class ChunkUploadQueue {
       _queue.remove(next);
       _emit();
       debugPrint('=== Queue: ${next.cloudFileName} done ✓');
-      // Issue 7: Write to Firestore after confirmed
       _writeChunkToFirestore(next).ignore();
-      // Issue 3: Remove from persistent storage
       QueuePersistence.instance.remove(next.filePath).ignore();
 
       _running = false;
+      final hasMore = _states.values.any((s) => s.status == ChunkStatus.queued);
+      if (!hasMore) UploadForegroundService.stop().ignore();
       if (_canUpload) _processNext();
-      return; // skip the finally-path processNext
+      return;
 
     } else {
       // ── Issue 1: Failure after retries — GLOBAL HOLD ─────────────────
@@ -535,6 +566,7 @@ class ChunkUploadQueue {
       }
       _emit();
 
+      UploadForegroundService.stop().ignore();
       NotificationService().showUploadFailed(
           'Part ${next.partNumber} of ${next.sessionId} failed. '
           'Open app and tap Retry All to continue.');
@@ -718,13 +750,18 @@ class ChunkUploadQueue {
 
         // Only add if file actually exists
         if (!chunk.hasAnyFile) {
-          debugPrint('=== QueuePersist: file gone for \${chunk.cloudFileName}');
+          debugPrint('=== QueuePersist: file gone for ${chunk.cloudFileName}');
           continue;
         }
 
-        _states[chunk.filePath] = ChunkState(chunk);
+        final cs = ChunkState(chunk);
+        // Always start recovered chunks as queued — never stale uploading state
+        cs.status   = ChunkStatus.queued;
+        cs.progress = 0.0;
+        cs.message  = 'Recovered — queued';
+        _states[chunk.filePath] = cs;
         _queue.add(chunk);
-        debugPrint('=== QueuePersist: restored \${chunk.cloudFileName}');
+        debugPrint('=== QueuePersist: restored ${chunk.cloudFileName}');
       }
       if (_states.isNotEmpty) _emit();
     } catch (e) {

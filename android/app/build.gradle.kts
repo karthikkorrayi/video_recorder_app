@@ -26,7 +26,7 @@ configurations.all {
 }
 
 android {
-    namespace = "com.example.video_recorder_app"
+    namespace = "com.otn.videorecorder"
     compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
