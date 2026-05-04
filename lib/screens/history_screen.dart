@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/cloud_cache_service.dart';
+import '../services/firestore_cache_service.dart';
 import '../services/session_store.dart';
 import '../services/onedrive_service.dart';
 import '../widgets/chunk_popup.dart'; // provides ChunkUploadQueue, ChunkState, ChunkStatus, fmtDuration, PendingChunk, ChunkPopup
@@ -25,8 +26,9 @@ class _HistoryScreenState extends State<HistoryScreen> {
   static const _text   = Color(0xFF1A1A1A);
   static const _grey   = Color(0xFF888888);
 
-  final _queue = ChunkUploadQueue();
-  final _cache = CloudCacheService();
+  final _queue     = ChunkUploadQueue();
+  final _cache     = CloudCacheService();
+  final _firestore = FirestoreCacheService();
 
   DateFilter _filter   = DateFilter.today;
   bool       _syncing  = false;
@@ -54,33 +56,6 @@ class _HistoryScreenState extends State<HistoryScreen> {
   }
 
   Future<void> _saveMeteredPref(bool v) async {
-    // Issue 1: Show confirmation when turning ON cellular
-    if (v && mounted) {
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (_) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          title: const Text('Use Mobile Data?'),
-          content: const Text(
-              'This will use your cellular data to upload videos.\n\n'
-              'Video files can be large. Standard carrier data rates apply.'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(context, true),
-              style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF00C853)),
-              child: const Text('Enable',
-                  style: TextStyle(color: Colors.white)),
-            ),
-          ],
-        ),
-      );
-      if (confirmed != true) return; // user cancelled — don't enable
-    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_meteredKey, v);
     setState(() => _allowMetered = v);
@@ -194,29 +169,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
               _buildFilterRow(),
               const SizedBox(height: 10),
 
-              StreamBuilder<CacheState>(
-                stream: _cache.stream,
-                builder: (_, __) {
-                  final sessions = _groupedSessions;
-                  if (sessions.isEmpty && _cache.isSyncing) {
-                    return const Center(
-                      child: Padding(padding: EdgeInsets.all(40),
-                        child: Column(children: [
-                          CircularProgressIndicator(color: _green),
-                          SizedBox(height: 12),
-                          Text('Syncing from OneDrive...',
-                              style: TextStyle(color: Colors.grey, fontSize: 13)),
-                        ])));
-                  }
-                  if (sessions.isEmpty) return _buildEmptyCloud();
-                  // Issue 4: latest first (already sorted in groupedSessions)
-                  return Column(
-                    children: sessions.entries
-                        .map((e) => _buildSessionCard(e.key, e.value))
-                        .toList(),
-                  );
-                },
-              ),
+              _buildFirestoreSessions(),
             ],
           ),
         ),
@@ -777,8 +730,6 @@ class _HistoryScreenState extends State<HistoryScreen> {
           Row(mainAxisAlignment: MainAxisAlignment.center, children: [
             _pill(Icons.timer_outlined, dur),
             const SizedBox(width: 12),
-            _pill(Icons.storage_outlined, '$sizeMb MB'),
-            const SizedBox(width: 12),
             _pill(Icons.cloud_done_outlined, 'Synced'),
           ]),
           const SizedBox(height: 20),
@@ -799,6 +750,228 @@ class _HistoryScreenState extends State<HistoryScreen> {
           color: _green, fontSize: 12, fontWeight: FontWeight.w600)),
     ]),
   );
+
+  // ── Firestore-backed uploaded sessions ───────────────────────────────────
+  Widget _buildFirestoreSessions() {
+    final now   = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+
+    Stream<DashMetrics> metricsStream;
+    Stream<List<SessionMeta>> sessionsStream;
+
+    // Build date folders based on filter
+    final col = FirestoreCacheService().sessionsCollection;
+    if (col == null) return _buildEmptyCloud();
+
+    switch (_filter.type) {
+      case FilterType.today:
+        final f = _dateFolderStr(today);
+        sessionsStream = col.where('dateFolder', isEqualTo: f)
+            .orderBy('sessionStartMs', descending: true)
+            .snapshots()
+            .map((s) => s.docs.map((d) =>
+                SessionMeta.fromMap(d.id, d.data())).toList());
+        break;
+      case FilterType.yesterday:
+        final y = today.subtract(const Duration(days: 1));
+        final f = _dateFolderStr(y);
+        sessionsStream = col.where('dateFolder', isEqualTo: f)
+            .orderBy('sessionStartMs', descending: true)
+            .snapshots()
+            .map((s) => s.docs.map((d) =>
+                SessionMeta.fromMap(d.id, d.data())).toList());
+        break;
+      case FilterType.thisWeek:
+        final weekStart = today.subtract(Duration(days: today.weekday - 1));
+        final folders   = _dateFolderRange(weekStart, today);
+        sessionsStream  = col.where('dateFolder', whereIn: folders)
+            .orderBy('sessionStartMs', descending: true)
+            .snapshots()
+            .map((s) => s.docs.map((d) =>
+                SessionMeta.fromMap(d.id, d.data())).toList());
+        break;
+      case FilterType.thisMonth:
+        final monthStart = DateTime(now.year, now.month, 1);
+        final folders    = _dateFolderRange(monthStart, today);
+        sessionsStream   = col.where('dateFolder', whereIn: folders)
+            .orderBy('sessionStartMs', descending: true)
+            .snapshots()
+            .map((s) => s.docs.map((d) =>
+                SessionMeta.fromMap(d.id, d.data())).toList());
+        break;
+      case FilterType.custom:
+        if (_filter.from == null || _filter.to == null) {
+          return _buildEmptyCloud();
+        }
+        final folders = _dateFolderRange(_filter.from!, _filter.to!);
+        sessionsStream = col.where('dateFolder', whereIn: folders)
+            .orderBy('sessionStartMs', descending: true)
+            .snapshots()
+            .map((s) => s.docs.map((d) =>
+                SessionMeta.fromMap(d.id, d.data())).toList());
+        break;
+    }
+
+    return StreamBuilder<List<SessionMeta>>(
+      stream: sessionsStream,
+      builder: (_, snap) {
+        if (snap.connectionState == ConnectionState.waiting) {
+          return const Center(
+            child: Padding(padding: EdgeInsets.all(40),
+              child: CircularProgressIndicator(color: _green)));
+        }
+        final sessions = snap.data ?? [];
+        if (sessions.isEmpty) return _buildEmptyCloud();
+        return Column(
+          children: sessions.map((s) => _buildFirestoreSessionCard(s)).toList(),
+        );
+      },
+    );
+  }
+
+  String _dateFolderStr(DateTime d) =>
+      '${d.day.toString().padLeft(2,'0')}-'
+      '${d.month.toString().padLeft(2,'0')}-${d.year}';
+
+  List<String> _dateFolderRange(DateTime from, DateTime to) {
+    final folders = <String>[];
+    var cur = DateTime(from.year, from.month, from.day);
+    final end = DateTime(to.year, to.month, to.day);
+    while (!cur.isAfter(end)) {
+      folders.add(_dateFolderStr(cur));
+      cur = cur.add(const Duration(days: 1));
+    }
+    return folders.take(30).toList();
+  }
+
+  Widget _buildFirestoreSessionCard(SessionMeta s) {
+    // Use actual stored duration — not filename-parsed
+    final dur    = fmtDuration(s.totalSecs);
+    final sid    = s.sessionId.length >= 6
+        ? s.sessionId.substring(0, 6).toUpperCase()
+        : s.sessionId;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: _border)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+
+        // Header
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+          child: Row(children: [
+            Container(
+              width: 28, height: 28,
+              decoration: const BoxDecoration(
+                  color: Color(0xFFE8F5E9), shape: BoxShape.circle),
+              child: const Icon(Icons.check, color: _green, size: 14)),
+            const SizedBox(width: 10),
+            Expanded(child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Session $sid',
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 14)),
+              Text(
+                '${s.dateFolder}  ·  ${s.chunksUploaded} '
+                'chunk${s.chunksUploaded == 1 ? '' : 's'}'
+                '  ·  $dur',
+                style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            ])),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+              decoration: BoxDecoration(
+                  color: const Color(0xFFE8F5E9),
+                  borderRadius: BorderRadius.circular(8)),
+              child: const Text('Synced \u2713',
+                  style: TextStyle(
+                      color: _green, fontSize: 10,
+                      fontWeight: FontWeight.w600))),
+          ]),
+        ),
+
+        const Divider(height: 1),
+
+        // Chunk boxes — use actual per-chunk duration from parts list
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+          child: Wrap(spacing: 5, runSpacing: 5,
+            children: List.generate(s.chunksUploaded, (i) {
+              final partNum   = s.parts.length > i ? s.parts[i] : i + 1;
+              // Use actual stored duration for this part, fallback to even split
+              final stored    = s.durationForPart(partNum);
+              final chunkSecs = stored > 0
+                  ? stored
+                  : (s.chunksUploaded > 0
+                      ? (s.totalSecs / s.chunksUploaded).round() : 0);
+              return GestureDetector(
+                onTap: () => _showFirestorePartDetail(
+                    partNum, fmtDuration(chunkSecs), s),
+                child: Container(
+                  width: 48, height: 48,
+                  decoration: BoxDecoration(
+                      color: const Color(0xFFE8F5E9),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                          color: _green.withValues(alpha: 0.3))),
+                  child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                    const Icon(Icons.cloud_done, color: _green, size: 14),
+                    const SizedBox(height: 2),
+                    Text('$partNum',
+                        style: const TextStyle(
+                            color: _green,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 11)),
+                    Text(fmtDuration(chunkSecs),
+                        style: TextStyle(
+                            color: Colors.grey[600], fontSize: 9)),
+                  ]),
+                ),
+              );
+            }),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  void _showFirestorePartDetail(
+      int partNum, String dur, SessionMeta s) {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (_) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const SizedBox(height: 8),
+          Container(width: 40, height: 4,
+              decoration: BoxDecoration(color: Colors.grey[300],
+                  borderRadius: BorderRadius.circular(2))),
+          const SizedBox(height: 16),
+          const Icon(Icons.cloud_done, color: _green, size: 32),
+          const SizedBox(height: 8),
+          Text('Chunk $partNum',
+              style: const TextStyle(
+                  fontWeight: FontWeight.bold, fontSize: 16)),
+          const SizedBox(height: 4),
+          Text(s.sessionFolder,
+              style: const TextStyle(fontSize: 12, color: _grey),
+              textAlign: TextAlign.center),
+          const SizedBox(height: 12),
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            _pill(Icons.timer_outlined, dur),
+            const SizedBox(width: 12),
+            _pill(Icons.cloud_done_outlined, 'Synced'),
+          ]),
+          const SizedBox(height: 20),
+        ]),
+      ),
+    );
+  }
 
   Widget _buildEmptyCloud() => Center(
     child: Padding(padding: const EdgeInsets.symmetric(vertical: 48),

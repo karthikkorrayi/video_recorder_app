@@ -19,6 +19,9 @@ class FirestoreCacheService {
   FirebaseFirestore get _db  => FirebaseFirestore.instance;
   String?           get _uid => FirebaseAuth.instance.currentUser?.uid;
 
+  /// Public accessor for history screen direct queries
+  CollectionReference<Map<String, dynamic>>? get sessionsCollection => _sessions;
+
   CollectionReference<Map<String, dynamic>>? get _sessions {
     final uid = _uid;
     if (uid == null) return null;
@@ -223,6 +226,7 @@ class FirestoreCacheService {
             'totalSecs':      chunkDurationSecs,
             'totalBytes':     chunkSizeBytes,
             'parts':          [partNumber],
+            'partDurations':  {'$partNumber': chunkDurationSecs},
             'status':         'uploading',
             'updatedAt':      FieldValue.serverTimestamp(),
           });
@@ -230,11 +234,15 @@ class FirestoreCacheService {
           final data  = snap.data()!;
           final parts = List<int>.from(data['parts'] as List? ?? []);
           if (!parts.contains(partNumber)) parts.add(partNumber);
+          final durations = Map<String, dynamic>.from(
+              data['partDurations'] as Map? ?? {});
+          durations['$partNumber'] = chunkDurationSecs;
           tx.update(ref, {
             'chunksUploaded': FieldValue.increment(1),
             'totalSecs':      FieldValue.increment(chunkDurationSecs),
             'totalBytes':     FieldValue.increment(chunkSizeBytes),
             'parts':          parts,
+            'partDurations':  durations,
             'updatedAt':      FieldValue.serverTimestamp(),
           });
         }
@@ -267,8 +275,9 @@ class SessionMeta {
   final int       chunksUploaded;
   final int       totalSecs;
   final int       totalBytes;
-  final List<int> parts;
-  final String    status;
+  final List<int>        parts;
+  final Map<int, int>    partDurations; // partNumber → durationSecs
+  final String           status;
 
   const SessionMeta({
     required this.sessionId,
@@ -280,6 +289,7 @@ class SessionMeta {
     required this.totalSecs,
     required this.totalBytes,
     required this.parts,
+    required this.partDurations,
     required this.status,
   });
 
@@ -293,10 +303,15 @@ class SessionMeta {
     totalSecs:      (d['totalSecs']    as num? ?? 0).toInt(),
     totalBytes:     (d['totalBytes']   as num? ?? 0).toInt(),
     parts:          List<int>.from(d['parts'] as List? ?? []),
+    partDurations:  (d['partDurations'] as Map? ?? {}).map(
+        (k, v) => MapEntry(int.tryParse(k.toString()) ?? 0, (v as num? ?? 0).toInt())),
     status:         d['status']        as String? ?? 'uploading',
   );
 
   double get totalMb => totalBytes / 1024 / 1024;
+
+  /// Returns actual duration for a given part number, 0 if not stored
+  int durationForPart(int partNum) => partDurations[partNum] ?? 0;
 }
 
 class DashMetrics {
