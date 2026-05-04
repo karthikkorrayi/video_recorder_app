@@ -1,6 +1,8 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 class LocalVideoStorage {
   static final LocalVideoStorage _i = LocalVideoStorage._();
@@ -21,11 +23,58 @@ class LocalVideoStorage {
   /// Builds the Android/media path and falls back to external files dir
   /// if somehow the media path isn't writable.
   Future<Directory> _baseDir() async {
-    // Primary: Android/media/<pkg>/OTN/recordings
-    // Visible in Files app, no permissions needed on Android 10+
+    // PRIMARY: /storage/emulated/0/OTN Recorder/recordings/
+    // This is the top-level visible path in ANY Android Files app (Vivo, Oppo,
+    // stock Android, Mi Files etc). No special permissions on Android 10+
+    // because we use MediaStore-compatible public storage path.
+    //
+    // Structure: OTN Recorder/recordings/DD-MM-YYYY/<username>/<sessionFolder>/
+    // Chunks stay here until OneDrive upload is confirmed — manual backup.
+    // Deleted only after fileExistsAndComplete() returns true.
+    final publicPath = '/storage/emulated/0/OTN Recorder/recordings';
+
+    // Android 11+ (API 30+): request MANAGE_EXTERNAL_STORAGE if not granted
+    // This is needed to write to /storage/emulated/0/ public folders on Vivo/OEM
+    if (Platform.isAndroid) {
+      final v = int.tryParse(
+              Platform.operatingSystemVersion.split('.').first.replaceAll(RegExp(r'[^0-9]'), ''))
+          ?? 0;
+      if (v >= 30) {
+        final status = await Permission.manageExternalStorage.status;
+        if (!status.isGranted) {
+          await Permission.manageExternalStorage.request();
+        }
+      }
+    }
+
+    try {
+      final dir = Directory(publicPath);
+      await dir.create(recursive: true);
+
+      // Write test file to confirm write access
+      final t = File('${dir.path}/.wtest');
+      await t.writeAsString('ok');
+      await t.delete();
+
+      // README for manual browsing
+      final readme = File('${dir.path}/README.txt');
+      if (!await readme.exists()) {
+        await readme.writeAsString(
+          'OTN Video Recorder — Local Backup\n'
+          '─────────────────────────────────\n'
+          'Structure: recordings/DD-MM-YYYY/username/sessionFolder/partNN.mp4\n\n'
+          'Files here are upload backups.\n'
+          'Auto-deleted ONLY after OneDrive confirms the file.\n'
+          'If a file is here = not yet uploaded. Safe to manually copy.\n',
+        );
+      }
+
+      return dir;
+    } catch (_) {}
+
+    // Fallback 1: Android/media/<pkg> (visible in stock Files but not all OEMs)
     final mediaPath =
         '/storage/emulated/0/Android/media/$_pkg/$_appFolder/recordings';
-
     try {
       final dir = Directory(mediaPath);
       await dir.create(recursive: true);
@@ -77,14 +126,37 @@ class LocalVideoStorage {
   }
 
   /// Returns (and creates) per-session folder:
-  ///   recordings/YYYY-MM-DD/<username>/
-  Future<Directory> sessionDir(DateTime t, String userEmail) async {
+  ///   recordings/DD-MM-YYYY/<username>/<sessionFolder>/
+  /// Mirrors the OneDrive structure exactly:
+  ///   OTN Recorder/DD-MM-YYYY/<username>/<sessionId>_<date>_<startTime>/
+  Future<Directory> sessionDir(DateTime t, String userEmail,
+      {String? sessionFolder}) async {
     final base = await _baseDir();
-    final date = DateFormat('yyyy-MM-dd').format(t);
+    final date = DateFormat('dd-MM-yyyy').format(t); // match OneDrive DD-MM-YYYY
     final user = _safe(userEmail.split('@').first);
-    final dir  = Directory('${base.path}/$date/$user');
+    final path = sessionFolder != null
+        ? '${base.path}/$date/$user/$sessionFolder'
+        : '${base.path}/$date/$user';
+    final dir  = Directory(path);
     await dir.create(recursive: true);
     return dir;
+  }
+
+  /// Delete a session's local folder ONLY after OneDrive has confirmed
+  /// all chunks exist and are complete. Returns true if deleted.
+  Future<bool> deleteSessionAfterVerify({
+    required String sessionFolderLocalPath,
+  }) async {
+    final dir = Directory(sessionFolderLocalPath);
+    if (!await dir.exists()) return true; // already gone
+    try {
+      await dir.delete(recursive: true);
+      debugPrint('=== LocalStorage: deleted verified session $sessionFolderLocalPath');
+      return true;
+    } catch (e) {
+      debugPrint('=== LocalStorage: delete failed — $e');
+      return false;
+    }
   }
 
   // ── File naming ───────────────────────────────────────────────────────────

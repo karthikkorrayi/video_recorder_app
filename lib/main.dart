@@ -12,7 +12,8 @@ import 'services/upload_resume_service.dart';
 import 'services/backend_keepalive.dart';
 import 'services/cloud_cache_service.dart';
 import 'services/session_store.dart';
-import 'services/chunk_upload_queue.dart'; // FIX: added for recoverFromCache
+import 'services/chunk_upload_queue.dart'; // for recoverFromCache
+import 'services/upload_work_manager.dart'; // WorkManager init
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
@@ -42,6 +43,10 @@ void main() async {
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
   ]);
+
+  // Initialize WorkManager — must happen before any scheduleUpload() call
+  // Android uses this to restart uploads even if the app is killed
+  await UploadWorkManager.initialize();
 
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarBrightness:     Brightness.light,
@@ -189,9 +194,9 @@ class OTNApp extends StatelessWidget {
             );
           }
           if (snapshot.hasData) {
-            // FIX: recover any interrupted chunk uploads on every login/app open
-            // This re-enqueues chunks from otn_backup/ and otn_upload_chunks/
-            // and runs the 7-day cleanup
+            // Recover any interrupted chunk uploads on every app open.
+            // Re-enqueues chunks from SQLite that were pending/failed,
+            // resets any stuck 'uploading' rows, and reschedules WorkManager.
             ChunkUploadQueue().recoverFromCache();
             return const DashboardScreen();
           }

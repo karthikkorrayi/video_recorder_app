@@ -38,6 +38,18 @@ dependencies:
 
   dio: ^5.4.0
 
+  # Persistent upload queue (SQLite)
+  sqflite: ^2.3.3+1
+  path: ^1.9.0
+
+  # WorkManager — survives app kill, Android manages restarts
+  workmanager: ^0.9.0+3
+
+  # Excel export for attendance reports
+  excel: ^4.0.6
+  share_plus: ^10.0.0
+  open_filex: ^4.3.4
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
+import 'attendance_export_service.dart';
 import 'package:intl/intl.dart';
 import 'onedrive_service.dart';
 import 'user_service.dart';
@@ -136,6 +137,52 @@ class FirestoreCacheService {
     return int.parse(m.group(1)!);
   }
 
+  // ── Sync deletions — remove Firestore docs for sessions deleted from OD ──
+  /// Diffs Firestore sessions vs OneDrive for the given date folders.
+  /// Any session in Firestore that no longer exists on OneDrive is deleted.
+  Future<void> syncDeletionsFromOneDrive({List<String>? dateFolders}) async {
+    try {
+      final col = _sessions;
+      if (col == null) return;
+      final userFolder = await UserService().getDisplayName();
+
+      // Get all sessions from Firestore (limited to provided date folders or all)
+      Query<Map<String, dynamic>> query = col;
+      if (dateFolders != null && dateFolders.isNotEmpty) {
+        query = col.where('dateFolder', whereIn: dateFolders.take(30).toList());
+      }
+      final firestoreDocs = await query.get();
+      if (firestoreDocs.docs.isEmpty) return;
+
+      // Get all session folders currently on OneDrive
+      final odFiles = await OneDriveService().listUserFiles(
+        rootFolder: 'OTN Recorder',
+        userFolder: userFolder,
+      ).timeout(const Duration(seconds: 60));
+
+      final odSessionFolders = odFiles
+          .map((f) => f['sessionFolder'] as String? ?? '')
+          .where((s) => s.isNotEmpty)
+          .toSet();
+
+      // Delete Firestore docs whose sessionFolder is not on OneDrive
+      int deleted = 0;
+      final batch = _db.batch();
+      for (final doc in firestoreDocs.docs) {
+        final sf = doc.data()['sessionFolder'] as String? ?? '';
+        if (sf.isNotEmpty && !odSessionFolders.contains(sf)) {
+          batch.delete(doc.reference);
+          deleted++;
+          debugPrint('=== Firestore syncDel: removed $sf (not on OD)');
+        }
+      }
+      if (deleted > 0) await batch.commit();
+      debugPrint('=== Firestore syncDel: removed $deleted orphaned docs');
+    } catch (e) {
+      debugPrint('=== Firestore syncDeletions error (non-fatal): $e');
+    }
+  }
+
   // ── Streams ───────────────────────────────────────────────────────────────
 
   /// Real-time stream for a specific date folder (DD-MM-YYYY).
@@ -260,7 +307,30 @@ class FirestoreCacheService {
         'status':    'synced',
         'updatedAt': FieldValue.serverTimestamp(),
       });
+      // Trigger attendance Excel update on OneDrive after session is fully synced
+      _triggerAttendanceUpdate(sessionId, col).ignore();
     } catch (_) {}
+  }
+
+  Future<void> _triggerAttendanceUpdate(
+      String sessionId,
+      CollectionReference<Map<String, dynamic>> col) async {
+    try {
+      final snap = await col.doc(sessionId).get();
+      if (!snap.exists) return;
+      final d = snap.data()!;
+      await AttendanceExportService().updateForSession(
+        sessionId:      sessionId,
+        dateFolder:     d['dateFolder']     as String? ?? '',
+        userFolder:     d['userFolder']     as String? ?? '',
+        totalSecs:      d['totalSecs']      as int? ?? 0,
+        chunksUploaded: d['chunksUploaded'] as int? ?? 0,
+        sessionStartMs: d['sessionStartMs'] as int? ?? 0,
+        status:         'Complete',
+      );
+    } catch (e) {
+      debugPrint('=== Firestore: attendance trigger error (non-fatal): \$e');
+    }
   }
 }
 

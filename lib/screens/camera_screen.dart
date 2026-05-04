@@ -114,8 +114,15 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   Future<void> _initCamera() async {
     final cams = await availableCameras();
     if (!mounted) return;
-    _ctrl = CameraController(cams[0], ResolutionPreset.veryHigh,
-        enableAudio: false, imageFormatGroup: ImageFormatGroup.nv21);
+    _ctrl = CameraController(
+      cams[0],
+      ResolutionPreset.veryHigh,
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.nv21,
+      // 4 Mbps — reduces chunk size from ~300MB to ~150MB at 1080p 30fps
+      // without changing frame rate, so motion stays smooth
+      videoBitrate: 4000000,
+    );
     await _ctrl!.initialize();
     try { await _ctrl!.lockCaptureOrientation(DeviceOrientation.landscapeLeft); } catch (_) {}
     _mlRotation = InputImageRotation.rotation0deg;
@@ -523,7 +530,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           Positioned.fill(child: CameraPreview(_ctrl!)),
 
           Positioned(top: 14, left: 14,
-            child: _pill('Standard · 1.0x · 1080p · 30fps',
+            child: _pill('Standard · 1.0x · 1080p · 30fps · 4Mbps',
                 Colors.black.withValues(alpha: 0.6), Colors.white)),
 
           if (_isRecording)
