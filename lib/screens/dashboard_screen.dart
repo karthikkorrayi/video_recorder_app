@@ -74,8 +74,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
         return _firestore.metricsStreamForRange(
             DateTime(now.year, now.month, 1), today);
       case FilterType.custom:
-        if (_filter.from != null && _filter.to != null)
+        if (_filter.from != null && _filter.to != null) {
           return _firestore.metricsStreamForRange(_filter.from!, _filter.to!);
+        }
         return _firestore.metricsStreamForDate(_fmtFolder(today));
     }
   }

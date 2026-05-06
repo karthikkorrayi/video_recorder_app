@@ -23,77 +23,47 @@ class LocalVideoStorage {
   /// Builds the Android/media path and falls back to external files dir
   /// if somehow the media path isn't writable.
   Future<Directory> _baseDir() async {
-    // PRIMARY: /storage/emulated/0/OTN Recorder/recordings/
-    // This is the top-level visible path in ANY Android Files app (Vivo, Oppo,
-    // stock Android, Mi Files etc). No special permissions on Android 10+
-    // because we use MediaStore-compatible public storage path.
-    //
-    // Structure: OTN Recorder/recordings/DD-MM-YYYY/<username>/<sessionFolder>/
-    // Chunks stay here until OneDrive upload is confirmed — manual backup.
-    // Deleted only after fileExistsAndComplete() returns true.
-    final publicPath = '/storage/emulated/0/OTN Recorder/recordings';
+    // STRATEGY: try 3 paths in order, use first truly writable one.
+    // Write-test with 1KB of data — small files can succeed even when large ones fail.
 
-    // Android 11+ (API 30+): request MANAGE_EXTERNAL_STORAGE if not granted
-    // This is needed to write to /storage/emulated/0/ public folders on Vivo/OEM
-    if (Platform.isAndroid) {
-      final v = int.tryParse(
-              Platform.operatingSystemVersion.split('.').first.replaceAll(RegExp(r'[^0-9]'), ''))
-          ?? 0;
-      if (v >= 30) {
-        final status = await Permission.manageExternalStorage.status;
-        if (!status.isGranted) {
-          await Permission.manageExternalStorage.request();
-        }
-      }
+    Future<bool> _canWrite(Directory dir) async {
+      try {
+        await dir.create(recursive: true);
+        final t = File('${dir.path}/.wtest');
+        // Write 4KB — large enough to detect filesystem restrictions
+        await t.writeAsBytes(List.filled(4096, 0x55));
+        final size = await t.length();
+        await t.delete();
+        return size == 4096;
+      } catch (_) { return false; }
     }
 
-    try {
-      final dir = Directory(publicPath);
-      await dir.create(recursive: true);
-
-      // Write test file to confirm write access
-      final t = File('${dir.path}/.wtest');
-      await t.writeAsString('ok');
-      await t.delete();
-
-      // README for manual browsing
-      final readme = File('${dir.path}/README.txt');
-      if (!await readme.exists()) {
-        await readme.writeAsString(
-          'OTN Video Recorder — Local Backup\n'
-          '─────────────────────────────────\n'
-          'Structure: recordings/DD-MM-YYYY/username/sessionFolder/partNN.mp4\n\n'
-          'Files here are upload backups.\n'
-          'Auto-deleted ONLY after OneDrive confirms the file.\n'
-          'If a file is here = not yet uploaded. Safe to manually copy.\n',
-        );
-      }
-
-      return dir;
-    } catch (_) {}
-
-    // Fallback 1: Android/media/<pkg> (visible in stock Files but not all OEMs)
-    final mediaPath =
-        '/storage/emulated/0/Android/media/$_pkg/$_appFolder/recordings';
-    try {
-      final dir = Directory(mediaPath);
-      await dir.create(recursive: true);
-      final t = File('${dir.path}/.wtest');
-      await t.writeAsString('ok');
-      await t.delete();
-      return dir;
-    } catch (_) {}
+    // Option 1: Android/data/<pkg>/files — guaranteed writable, no permission needed
     final ext = await getExternalStorageDirectory();
     if (ext != null) {
       final dir = Directory('${ext.path}/$_appFolder/recordings');
-      await dir.create(recursive: true);
-      return dir;
+      if (await _canWrite(dir)) {
+        debugPrint('=== LocalStorage: ✓ Android/data path: ${dir.path}');
+        return dir;
+      }
+      debugPrint('=== LocalStorage: ✗ Android/data not writable');
     }
 
-    // Last resort: app documents dir (internal, always available)
+    // Option 2: Android/media/<pkg> — works on most stock Android
+    final mediaPath =
+        '/storage/emulated/0/Android/media/$_pkg/$_appFolder/recordings';
+    final mediaDir = Directory(mediaPath);
+    if (await _canWrite(mediaDir)) {
+      debugPrint('=== LocalStorage: ✓ Android/media path: $mediaPath');
+      return mediaDir;
+    }
+    debugPrint('=== LocalStorage: ✗ Android/media not writable');
+
+    // Option 3: App documents dir — always writable
     final doc = await getApplicationDocumentsDirectory();
     final dir = Directory('${doc.path}/$_appFolder/recordings');
     await dir.create(recursive: true);
+    debugPrint('=== LocalStorage: ✓ using documents dir: ${dir.path}');
     return dir;
   }
 

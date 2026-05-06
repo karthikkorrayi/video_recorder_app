@@ -8,276 +8,371 @@ import 'package:path_provider/path_provider.dart';
 import 'package:excel/excel.dart';
 import 'onedrive_service.dart';
 
-// ─── AttendanceAutoSync ────────────────────────────────────────────────────
-// Triggered automatically after every chunk upload completes.
-// Reads ALL users' sessions for a date from Firestore,
-// builds a master Excel, and uploads to:
-//   OTN Recorder/Attendance Reports/OTN_Attendance_DD-MM-YYYY.xlsx
-//
-// Admin opens OneDrive → always sees up-to-date attendance for every user.
-// No export button. No manual action needed.
+/// Auto-updating admin attendance Excel on OneDrive.
+///
+/// ONE FILE: OTN Recorder/Attendance Reports/OTN_Attendance.xlsx
+/// ONE SHEET PER DATE: "05 May 2026", "06 May 2026", etc.
+/// All users' sessions in each sheet.
+///
+/// Flow (triggered after every chunk upload confirms):
+///   1. Download existing OTN_Attendance.xlsx from OneDrive
+///   2. Load it → find or create sheet for that date
+///   3. Rebuild that date's sheet from Firestore (fresh, no duplication)
+///   4. Re-upload (overwrites)
+///
+/// Admin opens: OneDrive → OTN Recorder → Attendance Reports → OTN_Attendance.xlsx
 class AttendanceAutoSync {
   static final AttendanceAutoSync _i = AttendanceAutoSync._();
   factory AttendanceAutoSync() => _i;
   AttendanceAutoSync._();
 
-  // Debounce per date — if 3 chunks finish in 10s for the same date,
-  // only one Excel rebuild happens.
-  final Map<String, Timer> _debounceTimers = {};
-  static const _debounce = Duration(seconds: 10);
+  static const _odFolder   = 'OTN Recorder/Attendance Reports';
+  static const _odFileName = 'OTN_Attendance.xlsx';
+
+  // Debounce per date — multiple chunks finishing together = one rebuild
+  final Map<String, Timer> _timers = {};
+  static const _debounce = Duration(seconds: 8);
 
   // ── Called from main queue (debounced) ───────────────────────────────────
   void scheduleUpdate(String dateFolder) {
-    _debounceTimers[dateFolder]?.cancel();
-    _debounceTimers[dateFolder] = Timer(_debounce, () {
-      _buildAndUpload(dateFolder).catchError((dynamic e) {
-        debugPrint('=== AttendanceAutoSync scheduleUpdate error: $e');
+    _timers[dateFolder]?.cancel();
+    _timers[dateFolder] = Timer(_debounce, () {
+      buildAndUploadNow(dateFolder).catchError((dynamic e) {
+        debugPrint('=== Attendance scheduleUpdate error: $e');
       });
     });
-    debugPrint('=== AttendanceAutoSync: scheduled update for $dateFolder');
+    debugPrint('=== Attendance: scheduled for $dateFolder');
   }
 
   // ── Called directly from WorkManager (awaited, no timer) ─────────────────
-  // WorkManager isolate closes after this returns — no dangling timers.
-  Future<void> buildAndUploadNow(String dateFolder) =>
-      _buildAndUpload(dateFolder);
-
-  // ── Core: query Firestore → build Excel → upload to OneDrive ─────────────
-  Future<void> _buildAndUpload(String dateFolder) async {
-    debugPrint('=== AttendanceAutoSync: building Excel for $dateFolder');
-
-    // ── 1. Query Firestore ───────────────────────────────────────────────────
-    final sessions = <Map<String, dynamic>>[];
+  Future<void> buildAndUploadNow(String dateFolder) async {
     try {
-      // Try collectionGroup first — gets ALL users (admin view).
-      // Requires Firestore rule:
-      //   match /{path=**}/sessions/{doc} { allow read: if request.auth != null; }
-      debugPrint('=== AttendanceAutoSync: querying collectionGroup for $dateFolder');
-      try {
-        final snap = await FirebaseFirestore.instance
-            .collectionGroup('sessions')
-            .where('dateFolder', isEqualTo: dateFolder)
-            .get()
-            .timeout(const Duration(seconds: 30));
-        for (final doc in snap.docs) {
-          sessions.add(doc.data());
-        }
-        debugPrint('=== AttendanceAutoSync: collectionGroup got ${sessions.length} sessions');
-      } catch (cgErr) {
-        // Fallback: current user only (if collectionGroup permission denied)
-        debugPrint('=== AttendanceAutoSync: collectionGroup failed ($cgErr) — fallback to current user');
-        final uid = FirebaseAuth.instance.currentUser?.uid;
-        if (uid == null) {
-          debugPrint('=== AttendanceAutoSync: no auth uid — cannot query');
-          return;
-        }
-        final snap = await FirebaseFirestore.instance
-            .collection('users')
-            .doc(uid)
-            .collection('sessions')
-            .where('dateFolder', isEqualTo: dateFolder)
-            .get()
-            .timeout(const Duration(seconds: 30));
-        for (final doc in snap.docs) {
-          sessions.add(doc.data());
-        }
-        debugPrint('=== AttendanceAutoSync: fallback got ${sessions.length} sessions');
-      }
+      await _buildAndUpload(dateFolder);
     } catch (e, st) {
-      debugPrint('=== AttendanceAutoSync: Firestore FAILED: $e\n$st');
-      return;
+      debugPrint('=== Attendance: buildAndUploadNow error: $e\n$st');
     }
+  }
 
+  // ── Core ─────────────────────────────────────────────────────────────────
+  Future<void> _buildAndUpload(String dateFolder) async {
+    debugPrint('=== Attendance: building for $dateFolder');
+
+    // ── 1. Query Firestore for this date ─────────────────────────────────
+    final sessions = await _querySessions(dateFolder);
     if (sessions.isEmpty) {
-      debugPrint('=== AttendanceAutoSync: no sessions for $dateFolder — skip');
+      debugPrint('=== Attendance: no sessions for $dateFolder — skip');
       return;
     }
+    debugPrint('=== Attendance: ${sessions.length} sessions found');
 
-    // Sort client-side: by userFolder then sessionStartMs
+    // Sort by userFolder then sessionStartMs
     sessions.sort((a, b) {
-      final uCmp = (a['userFolder'] as String? ?? '')
+      final u = (a['userFolder'] as String? ?? '')
           .compareTo(b['userFolder'] as String? ?? '');
-      if (uCmp != 0) return uCmp;
+      if (u != 0) return u;
       return ((a['sessionStartMs'] as int? ?? 0))
           .compareTo(b['sessionStartMs'] as int? ?? 0);
     });
 
-    // ── 2. Build Excel workbook ──────────────────────────────────────────────
-    final excel = Excel.createExcel();
-    excel.delete('Sheet1');
+    // ── 2. Download existing Excel from OneDrive (or create new) ─────────
+    final od    = OneDriveService();
+    final bytes = await od.downloadFileBytes(
+        folderPath: _odFolder, fileName: _odFileName);
 
-    final sheetLabel = _dateLabel(dateFolder);
-    final ws = excel[sheetLabel];
-    _writeSheet(ws, dateFolder, sheetLabel, sessions);
+    Excel excel;
+    if (bytes != null) {
+      try {
+        excel = Excel.decodeBytes(bytes);
+        // Remove default sheet if it crept in
+        if (excel.sheets.containsKey('Sheet1') && excel.sheets.length > 1) {
+          excel.delete('Sheet1');
+        }
+        debugPrint('=== Attendance: loaded existing workbook from OneDrive');
+      } on Exception catch (e) {
+        debugPrint('=== Attendance: decode Exception ($e) — new workbook');
+        excel = Excel.createExcel(); excel.delete('Sheet1');
+      } on Error catch (e) {
+        // UnsupportedError, StateError etc — non-xlsx bytes from OneDrive
+        debugPrint('=== Attendance: decode Error ($e) — new workbook');
+        excel = Excel.createExcel(); excel.delete('Sheet1');
+      }
+    } else {
+      excel = Excel.createExcel();
+      excel.delete('Sheet1');
+      debugPrint('=== Attendance: creating new workbook');
+    }
 
-    // ── 3. Save to temp file ─────────────────────────────────────────────────
-    final bytes = excel.encode();
-    if (bytes == null) {
-      debugPrint('=== AttendanceAutoSync: Excel encode returned null — abort');
+    // ── 3. Ensure Overview sheet exists ───────────────────────────────────
+    if (!excel.sheets.containsKey('Overview')) {
+      _buildOverviewHeader(excel['Overview']);
+    }
+
+    // ── 4. Rebuild this date's sheet (always fresh — no duplicates) ───────
+    final sheetName = _sheetName(dateFolder);
+    // Delete old version of this sheet if exists (fresh rebuild)
+    if (excel.sheets.containsKey(sheetName)) {
+      excel.delete(sheetName);
+    }
+    final ws = excel[sheetName];
+    _buildDateSheet(ws, dateFolder, sheetName, sessions);
+
+    // ── 5. Update overview row for this date ──────────────────────────────
+    _upsertOverviewRow(excel['Overview'], dateFolder, sheetName, sessions);
+
+    // ── 6. Encode → temp file → upload ───────────────────────────────────
+    final encoded = excel.encode();
+    if (encoded == null) {
+      debugPrint('=== Attendance: encode returned null — abort');
       return;
     }
 
     final tmp      = await getTemporaryDirectory();
-    final fileName = 'OTN_Attendance_$dateFolder.xlsx';
-    final filePath = '${tmp.path}/$fileName';
-    await File(filePath).writeAsBytes(bytes);
-    debugPrint('=== AttendanceAutoSync: saved temp → $filePath');
+    final filePath = '${tmp.path}/$_odFileName';
+    await File(filePath).writeAsBytes(encoded);
 
-    // ── 4. Upload to OneDrive ────────────────────────────────────────────────
     try {
-      debugPrint('=== AttendanceAutoSync: uploading $fileName → OTN Recorder/Attendance Reports/');
-      await OneDriveService().uploadToAttendanceFolder(
+      debugPrint('=== Attendance: uploading $_odFileName to OneDrive...');
+      await od.uploadToAttendanceFolder(
         filePath:   filePath,
-        fileName:   fileName,
-        onProgress: (p) => debugPrint('=== AttendanceAutoSync: upload ${(p * 100).toInt()}%'),
-        onStatus:   (s) => debugPrint('=== AttendanceAutoSync: $s'),
+        fileName:   _odFileName,
+        onProgress: (p) => debugPrint('=== Attendance: ${(p * 100).toInt()}%'),
+        onStatus:   (_) {},
       );
-      debugPrint('=== AttendanceAutoSync: ✓ SUCCESS — $fileName on OneDrive');
+      debugPrint('=== Attendance: ✓ uploaded $_odFileName');
     } catch (e, st) {
-      debugPrint('=== AttendanceAutoSync: OD upload FAILED: $e\n$st');
+      debugPrint('=== Attendance: upload FAILED: $e\n$st');
     } finally {
       try { File(filePath).deleteSync(); } catch (_) {}
     }
   }
 
-  // ── Excel sheet builder ──────────────────────────────────────────────────
-  void _writeSheet(Sheet ws, String dateFolder, String sheetLabel,
+  // ── Query Firestore with collectionGroup + fallback ───────────────────────
+  Future<List<Map<String, dynamic>>> _querySessions(String dateFolder) async {
+    final sessions = <Map<String, dynamic>>[];
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collectionGroup('sessions')
+          .where('dateFolder', isEqualTo: dateFolder)
+          .get()
+          .timeout(const Duration(seconds: 30));
+      for (final d in snap.docs) { sessions.add(d.data()); }
+      debugPrint('=== Attendance: collectionGroup got ${sessions.length} docs');
+    } catch (e) {
+      debugPrint('=== Attendance: collectionGroup failed ($e) — fallback');
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      if (uid == null) return sessions;
+      final snap = await FirebaseFirestore.instance
+          .collection('users').doc(uid).collection('sessions')
+          .where('dateFolder', isEqualTo: dateFolder)
+          .get()
+          .timeout(const Duration(seconds: 30));
+      for (final d in snap.docs) { sessions.add(d.data()); }
+      debugPrint('=== Attendance: fallback got ${sessions.length} docs');
+    }
+    return sessions;
+  }
+
+  // ── Build one date sheet ──────────────────────────────────────────────────
+  void _buildDateSheet(Sheet ws, String dateFolder, String sheetName,
       List<Map<String, dynamic>> sessions) {
-    // Row 0: Title
-    _cell(ws, 0, 0,
-        'OTN Video Recorder — Attendance  |  $sheetLabel',
-        bg: _navy, fg: _green, bold: true, fontSize: 13, span: 8);
+    final generated = DateFormat('dd MMM yyyy, HH:mm:ss').format(DateTime.now());
 
-    // Row 1: Generated timestamp
-    final now = DateFormat('dd MMM yyyy, HH:mm').format(DateTime.now());
-    _cell(ws, 1, 0,
-        'Generated: $now  (auto-updated on each upload)',
-        bg: _subHdr, fg: _white, span: 8);
+    // Row 0: Main title
+    _c(ws, 0, 0, 'OTN VIDEO RECORDER — ATTENDANCE REPORT',
+        bg: _navy, fg: _green, bold: true, sz: 14, span: 9);
 
-    // Row 2: Column headers
-    const hdrs = ['#', 'Name', 'Session ID', 'Start Time',
-                   'Duration', 'Chunks', 'Status', 'Notes'];
+    // Row 1: Date + generated time
+    _c(ws, 1, 0, '$sheetName   |   Generated: $generated',
+        bg: _subHdr, fg: _white, sz: 10, span: 9);
+
+    // Row 2: column headers
+    const hdrs = ['#', 'User Name', 'Session ID', 'Date',
+                   'Start Time', 'Duration', 'Chunks', 'Status', 'Notes'];
     for (var i = 0; i < hdrs.length; i++) {
-      _cell(ws, 2, i, hdrs[i], bg: _hdrBg, fg: _white, bold: true);
+      _c(ws, 2, i, hdrs[i], bg: _hdrBg, fg: _white, bold: true);
     }
 
     ws.setColumnWidth(0, 5);
-    ws.setColumnWidth(1, 22);
+    ws.setColumnWidth(1, 24);
     ws.setColumnWidth(2, 16);
     ws.setColumnWidth(3, 14);
     ws.setColumnWidth(4, 14);
-    ws.setColumnWidth(5, 10);
-    ws.setColumnWidth(6, 12);
-    ws.setColumnWidth(7, 25);
+    ws.setColumnWidth(5, 18);  // wider for "1h 20m 35s"
+    ws.setColumnWidth(6, 10);
+    ws.setColumnWidth(7, 14);
+    ws.setColumnWidth(8, 28);
 
-    // Group sessions by user
+    // Data rows — group by user
     final byUser = <String, List<Map<String, dynamic>>>{};
     for (final s in sessions) {
       final u = s['userFolder'] as String? ?? 'Unknown';
       byUser.putIfAbsent(u, () => []).add(s);
     }
 
-    var rowIdx  = 3;
-    var seqNum  = 1;
-    var altUser = false;
+    var row    = 3;
+    var seqNum = 1;
+    var altBg  = false;
 
     for (final entry in byUser.entries) {
-      final userName     = entry.key;
-      final userSessions = entry.value;
-      final userBg       = altUser ? _userAlt : _userRow;
-      altUser            = !altUser;
+      final name  = entry.key;
+      final rows  = entry.value;
+      final rowBg = altBg ? _rowAlt : _rowMain;
+      altBg = !altBg;
 
-      for (var si = 0; si < userSessions.length; si++) {
-        final s       = userSessions[si];
-        final isFirst = si == 0;
-        final secs    = s['totalSecs']      as int? ?? 0;
-        final chunks  = s['chunksUploaded'] as int? ?? 0;
-        final status  = s['status']         as String? ?? 'uploading';
-        final startMs = s['sessionStartMs'] as int? ?? 0;
-        final rawSid  = s['sessionId']      as String? ?? '';
-        final sid     = rawSid.length >= 8
-            ? rawSid.substring(0, 8).toUpperCase() : rawSid.toUpperCase();
-        final startStr = startMs > 0
-            ? DateFormat('HH:mm').format(
-                DateTime.fromMillisecondsSinceEpoch(startMs))
-            : '--';
-        final statusLabel = status == 'synced' ? '✓ Complete' : '⏳ Uploading';
-        final statusFg    = status == 'synced' ? _darkGrn : _orange;
-        final notes       = status != 'synced' ? 'Upload in progress' : '';
+      for (var si = 0; si < rows.length; si++) {
+        final s        = rows[si];
+        final secs     = s['totalSecs']      as int? ?? 0;
+        final chunks   = s['chunksUploaded'] as int? ?? 0;
+        final status   = s['status']         as String? ?? 'uploading';
+        final startMs  = s['sessionStartMs'] as int? ?? 0;
+        final rawId    = s['sessionId']      as String? ?? '';
+        final sid      = rawId.length >= 8
+            ? rawId.substring(0, 8).toUpperCase() : rawId.toUpperCase();
+        final startDt  = startMs > 0
+            ? DateTime.fromMillisecondsSinceEpoch(startMs) : null;
+        final startStr = startDt != null
+            ? DateFormat('HH:mm:ss').format(startDt) : '--';
+        final dateStr  = startDt != null
+            ? DateFormat('dd-MM-yyyy').format(startDt) : dateFolder;
+        final isSynced = status == 'synced';
+        final statusLbl = isSynced ? '✓ Uploaded' : '⏳ Uploading';
+        final statusFg  = isSynced ? _darkGrn : _orange;
+        final note      = isSynced ? '' : 'Upload in progress';
 
-        _cell(ws, rowIdx, 0, seqNum, bg: userBg);
-        _cell(ws, rowIdx, 1, isFirst ? userName : '',
-            bg: userBg, bold: isFirst, fg: isFirst ? _text : _grey);
-        _cell(ws, rowIdx, 2, sid,        bg: userBg);
-        _cell(ws, rowIdx, 3, startStr,   bg: userBg);
-        _cell(ws, rowIdx, 4, _fmt(secs), bg: userBg);
-        _cell(ws, rowIdx, 5, chunks,     bg: userBg);
-        _cell(ws, rowIdx, 6, statusLabel,bg: userBg, fg: statusFg, bold: true);
-        _cell(ws, rowIdx, 7, notes,      bg: userBg, fg: _grey);
+        _c(ws, row, 0, seqNum,          bg: rowBg);
+        _c(ws, row, 1, si == 0 ? name : '', bg: rowBg,
+            fg: si == 0 ? _text : _grey, bold: si == 0);
+        _c(ws, row, 2, sid,             bg: rowBg);
+        _c(ws, row, 3, dateStr,         bg: rowBg);
+        _c(ws, row, 4, startStr,        bg: rowBg);
+        _c(ws, row, 5, _fmt(secs),      bg: rowBg, fg: _text, bold: true);
+        _c(ws, row, 6, chunks,          bg: rowBg);
+        _c(ws, row, 7, statusLbl,       bg: rowBg, fg: statusFg, bold: true);
+        _c(ws, row, 8, note,            bg: rowBg, fg: _grey);
 
-        rowIdx++;
+        row++;
         seqNum++;
       }
 
-      // User subtotal row
-      final totalSecs   = userSessions.fold<int>(
-          0, (s, d) => s + (d['totalSecs']      as int? ?? 0));
-      final totalChunks = userSessions.fold<int>(
-          0, (s, d) => s + (d['chunksUploaded'] as int? ?? 0));
-      _cell(ws, rowIdx, 0, '', bg: _totalBg);
-      _cell(ws, rowIdx, 1,
-          '$userName — ${userSessions.length} session${userSessions.length == 1 ? '' : 's'}',
-          bg: _totalBg, fg: _totalFg, bold: true);
-      _cell(ws, rowIdx, 2, '',              bg: _totalBg);
-      _cell(ws, rowIdx, 3, '',              bg: _totalBg);
-      _cell(ws, rowIdx, 4, _fmt(totalSecs), bg: _totalBg, fg: _totalFg, bold: true);
-      _cell(ws, rowIdx, 5, totalChunks,     bg: _totalBg, fg: _totalFg, bold: true);
-      _cell(ws, rowIdx, 6, '',              bg: _totalBg);
-      _cell(ws, rowIdx, 7, '',              bg: _totalBg);
-      rowIdx++;
+      // User subtotal
+      final subSecs   = rows.fold<int>(0, (s, d) => s + (d['totalSecs']      as int? ?? 0));
+      final subChunks = rows.fold<int>(0, (s, d) => s + (d['chunksUploaded'] as int? ?? 0));
+      _c(ws, row, 0, '',              bg: _subtotalBg);
+      _c(ws, row, 1, '$name  (${rows.length} session${rows.length == 1 ? '' : 's'})',
+          bg: _subtotalBg, fg: _subtotalFg, bold: true);
+      _c(ws, row, 2, '',              bg: _subtotalBg);
+      _c(ws, row, 3, '',              bg: _subtotalBg);
+      _c(ws, row, 4, '',              bg: _subtotalBg);
+      _c(ws, row, 5, _fmt(subSecs),  bg: _subtotalBg, fg: _subtotalFg, bold: true);
+      _c(ws, row, 6, subChunks,      bg: _subtotalBg, fg: _subtotalFg, bold: true);
+      _c(ws, row, 7, '',              bg: _subtotalBg);
+      _c(ws, row, 8, '',              bg: _subtotalBg);
+      row++;
     }
 
-    // Grand total row
-    final grandSecs   = sessions.fold<int>(
-        0, (s, d) => s + (d['totalSecs']      as int? ?? 0));
-    final grandChunks = sessions.fold<int>(
-        0, (s, d) => s + (d['chunksUploaded'] as int? ?? 0));
-    rowIdx++; // blank gap
-    _cell(ws, rowIdx, 0, 'TOTAL',
-        bg: _green, fg: _white, bold: true, span: 2);
-    _cell(ws, rowIdx, 1, '', bg: _green);
-    _cell(ws, rowIdx, 2, '${sessions.length} session${sessions.length == 1 ? '' : 's'}',
-        bg: _green, fg: _white, bold: true);
-    _cell(ws, rowIdx, 3, '',              bg: _green);
-    _cell(ws, rowIdx, 4, _fmt(grandSecs), bg: _green, fg: _white, bold: true);
-    _cell(ws, rowIdx, 5, grandChunks,     bg: _green, fg: _white, bold: true);
-    _cell(ws, rowIdx, 6, '',              bg: _green);
-    _cell(ws, rowIdx, 7, '',              bg: _green);
+    // Grand total
+    row++;
+    final grandSecs   = sessions.fold<int>(0, (s, d) => s + (d['totalSecs']      as int? ?? 0));
+    final grandChunks = sessions.fold<int>(0, (s, d) => s + (d['chunksUploaded'] as int? ?? 0));
+    final userCount   = byUser.keys.length;
+    _c(ws, row, 0, 'GRAND TOTAL',   bg: _green, fg: _white, bold: true, span: 2);
+    _c(ws, row, 1, '',               bg: _green);
+    _c(ws, row, 2, '${sessions.length} sessions', bg: _green, fg: _white, bold: true);
+    _c(ws, row, 3, '$userCount users', bg: _green, fg: _white, bold: true);
+    _c(ws, row, 4, '',               bg: _green);
+    _c(ws, row, 5, _fmt(grandSecs), bg: _green, fg: _white, bold: true, sz: 11);
+    _c(ws, row, 6, grandChunks,     bg: _green, fg: _white, bold: true);
+    _c(ws, row, 7, '',               bg: _green);
+    _c(ws, row, 8, '',               bg: _green);
+  }
+
+  // ── Overview sheet ────────────────────────────────────────────────────────
+  void _buildOverviewHeader(Sheet ws) {
+    _c(ws, 0, 0, 'OTN RECORDER — ALL DATES OVERVIEW',
+        bg: _navy, fg: _green, bold: true, sz: 13, span: 6);
+    _c(ws, 1, 0, 'Auto-updated on every upload. Open individual date sheets for details.',
+        bg: _subHdr, fg: _white, span: 6);
+    const hdrs = ['Date', 'Sessions', 'Total Duration', 'Total Chunks', 'Users', 'Last Updated'];
+    for (var i = 0; i < hdrs.length; i++) {
+      _c(ws, 2, i, hdrs[i], bg: _hdrBg, fg: _white, bold: true);
+    }
+    ws.setColumnWidth(0, 16);
+    ws.setColumnWidth(1, 12);
+    ws.setColumnWidth(2, 18);
+    ws.setColumnWidth(3, 14);
+    ws.setColumnWidth(4, 30);
+    ws.setColumnWidth(5, 22);
+  }
+
+  void _upsertOverviewRow(Sheet ws, String dateFolder, String sheetName,
+      List<Map<String, dynamic>> sessions) {
+    // Find existing row for this date or append
+    int? existingRow;
+    for (var r = 3; r < ws.maxRows; r++) {
+      final cell = ws.cell(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: r));
+      final val  = cell.value;
+      if (val is TextCellValue && val.value.text == dateFolder) {
+        existingRow = r; break;
+      }
+    }
+    final row        = existingRow ?? ws.maxRows;
+    final isAlt      = (row - 3) % 2 == 0;
+    final bg         = isAlt ? _rowMain : _rowAlt;
+    final grandSecs  = sessions.fold<int>(0, (s, d) => s + (d['totalSecs'] as int? ?? 0));
+    final grandChunks= sessions.fold<int>(0, (s, d) => s + (d['chunksUploaded'] as int? ?? 0));
+    final users      = sessions.map((d) => d['userFolder'] as String? ?? '').toSet().join(', ');
+    final now        = DateFormat('dd MMM HH:mm').format(DateTime.now());
+
+    _c(ws, row, 0, dateFolder,       bg: bg);
+    _c(ws, row, 1, sessions.length,  bg: bg);
+    _c(ws, row, 2, _fmt(grandSecs),  bg: bg, bold: true);
+    _c(ws, row, 3, grandChunks,      bg: bg);
+    _c(ws, row, 4, users,            bg: bg);
+    _c(ws, row, 5, now,              bg: bg);
+  }
+
+  // ── Duration with seconds ─────────────────────────────────────────────────
+  String _fmt(int secs) {
+    if (secs <= 0) return '0s';
+    final h = secs ~/ 3600;
+    final m = (secs % 3600) ~/ 60;
+    final s = secs % 60;
+    if (h > 0) return '${h}h ${m}m ${s}s';
+    if (m > 0) return '${m}m ${s}s';
+    return '${s}s';
+  }
+
+  String _sheetName(String folder) {
+    try {
+      final p  = folder.split('-');
+      final dt = DateTime(int.parse(p[2]), int.parse(p[1]), int.parse(p[0]));
+      return DateFormat('dd MMM yyyy').format(dt);
+    } catch (_) { return folder; }
   }
 
   // ── Colors ────────────────────────────────────────────────────────────────
-  static const _navy    = '#1A1A2E';
-  static const _subHdr  = '#16213E';
-  static const _hdrBg   = '#0F3460';
-  static const _green   = '#00C853';
-  static const _darkGrn = '#2E7D32';
-  static const _orange  = '#E65100';
-  static const _white   = '#FFFFFF';
-  static const _text    = '#1A1A1A';
-  static const _grey    = '#888888';
-  static const _userRow = '#E8F5E9';
-  static const _userAlt = '#F1F8E9';
-  static const _totalBg = '#C8E6C9';
-  static const _totalFg = '#1B5E20';
-  static const _border  = '#C8E6C9';
+  static const _navy       = '#1A1A2E';
+  static const _subHdr     = '#16213E';
+  static const _hdrBg      = '#0F3460';
+  static const _green      = '#00C853';
+  static const _darkGrn    = '#2E7D32';
+  static const _orange     = '#E65100';
+  static const _white      = '#FFFFFF';
+  static const _text       = '#1A1A1A';
+  static const _grey       = '#888888';
+  static const _rowMain    = '#E8F5E9';
+  static const _rowAlt     = '#F1F8E9';
+  static const _subtotalBg = '#C8E6C9';
+  static const _subtotalFg = '#1B5E20';
+  static const _border     = '#C8E6C9';
 
-  // ── Cell helper ───────────────────────────────────────────────────────────
-  void _cell(Sheet ws, int row, int col, dynamic value, {
-    String bg       = '#FFFFFF',
-    String fg       = '#1A1A1A',
-    bool   bold     = false,
-    double fontSize = 10,
-    int    span     = 1,
+  // ── Cell builder ─────────────────────────────────────────────────────────
+  void _c(Sheet ws, int row, int col, dynamic value, {
+    String bg   = '#FFFFFF',
+    String fg   = '#1A1A1A',
+    bool   bold = false,
+    double sz   = 10,
+    int    span = 1,
   }) {
     final idx  = CellIndex.indexByColumnRow(columnIndex: col, rowIndex: row);
     final cell = ws.cell(idx);
@@ -292,7 +387,7 @@ class AttendanceAutoSync {
       backgroundColorHex: ExcelColor.fromHexString(bg),
       fontColorHex:       ExcelColor.fromHexString(fg),
       bold:               bold,
-      fontSize:           fontSize.toInt(),
+      fontSize:           sz.toInt(),
       horizontalAlign:    HorizontalAlign.Center,
       verticalAlign:      VerticalAlign.Center,
       leftBorder:   Border(borderStyle: BorderStyle.Thin,
@@ -305,28 +400,8 @@ class AttendanceAutoSync {
           borderColorHex: ExcelColor.fromHexString(_border)),
     );
     if (span > 1) {
-      ws.merge(idx,
-          CellIndex.indexByColumnRow(
-              columnIndex: col + span - 1, rowIndex: row));
-    }
-  }
-
-  // ── Helpers ───────────────────────────────────────────────────────────────
-  String _fmt(int secs) {
-    if (secs <= 0) return '0m';
-    final h = secs ~/ 3600;
-    final m = (secs % 3600) ~/ 60;
-    return h > 0 ? '${h}h ${m}m' : '${m}m';
-  }
-
-  String _dateLabel(String folder) {
-    try {
-      final p  = folder.split('-');
-      final dt = DateTime(
-          int.parse(p[2]), int.parse(p[1]), int.parse(p[0]));
-      return DateFormat('dd MMM yyyy').format(dt);
-    } catch (_) {
-      return folder;
+      ws.merge(idx, CellIndex.indexByColumnRow(
+          columnIndex: col + span - 1, rowIndex: row));
     }
   }
 }

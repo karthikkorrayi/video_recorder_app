@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'attendance_export_service.dart';
 import 'package:intl/intl.dart';
 import 'onedrive_service.dart';
+import 'upload_queue_db.dart';
 import 'user_service.dart';
 
 /// Fast metadata cache backed by Firestore.
@@ -15,7 +16,7 @@ class FirestoreCacheService {
   factory FirestoreCacheService() => _i;
   FirestoreCacheService._();
 
-  static const _backfillKey = 'firestore_backfill_done_v1';
+  static const _sessionsPath = 'sessions';
 
   FirebaseFirestore get _db  => FirebaseFirestore.instance;
   String?           get _uid => FirebaseAuth.instance.currentUser?.uid;
@@ -75,9 +76,28 @@ class FirestoreCacheService {
         final dateStr    = segments[1]; // YYYYMMDD
         final timeStr    = segments[2]; // HHMMSS
 
-        // Check if already exists in Firestore
+        // Check by sessionId doc AND by sessionFolder query
+        // (recordChunkUploaded writes by sessionId, backfill must match it)
         final existing = await col.doc(sessionId).get();
-        if (existing.exists) continue; // already backfilled
+        if (existing.exists) {
+          // Doc exists — update status to 'synced' if still 'uploading'
+          if ((existing.data()?['status'] as String?) == 'uploading') {
+            await col.doc(sessionId).update({'status': 'synced', 'backfilled': true});
+          }
+          continue;
+        }
+        // Also check by sessionFolder field to avoid duplicates from different write paths
+        final byFolder = await col
+            .where('sessionFolder', isEqualTo: sessionFolder)
+            .limit(1)
+            .get();
+        if (byFolder.docs.isNotEmpty) {
+          final existingDoc = byFolder.docs.first;
+          if ((existingDoc.data()['status'] as String?) == 'uploading') {
+            await existingDoc.reference.update({'status': 'synced', 'backfilled': true});
+          }
+          continue;
+        }
 
         // Parse date
         DateTime? sessionDate;
@@ -124,15 +144,26 @@ class FirestoreCacheService {
   }
 
   static int _parseFileSecs(String name) {
-    // Format: SESSIONID_DATE_TIME_NN_MM-MM.mp4
-    // MM-MM are minute markers
-    final m = RegExp(r'_(\d{2})-(\d{2})\.mp4$').firstMatch(name);
-    if (m == null) return 0;
-    return (int.parse(m.group(2)!) - int.parse(m.group(1)!)) * 60;
+    // Actual format: SESSIONID_DATE_TIME_NNMM-MM.mp4
+    // NN = 2-digit part number, then startMin-endMin (2 digits each)
+    // e.g. 3VCWW6_20260506_015642_0100-02.mp4 → part01, min 00 to 02 = 120s
+    final m = RegExp(r'_\d{2}(\d{2})-(\d{2})\.mp4\$').firstMatch(name);
+    if (m != null) {
+      final s = int.parse(m.group(1)!);
+      final e = int.parse(m.group(2)!);
+      return (e - s).abs() * 60;
+    }
+    // Fallback: old format _MM-MM.mp4 without embedded part number
+    final m2 = RegExp(r'_(\d{2})-(\d{2})\.mp4\$').firstMatch(name);
+    if (m2 != null) {
+      return (int.parse(m2.group(2)!) - int.parse(m2.group(1)!)) * 60;
+    }
+    return 0;
   }
 
   static int _parsePartNumber(String name) {
-    final m = RegExp(r'_(\d{2})_\d{2}-\d{2}\.mp4$').firstMatch(name);
+    // Format: _NNMM-MM.mp4 where NN = part number (2 digits)
+    final m = RegExp(r'_(\d{2})\d{2}-\d{2}\.mp4\$').firstMatch(name);
     if (m == null) return 1;
     return int.parse(m.group(1)!);
   }
@@ -154,6 +185,14 @@ class FirestoreCacheService {
       final firestoreDocs = await query.get();
       if (firestoreDocs.docs.isEmpty) return;
 
+      // Get session folders currently pending/uploading in SQLite queue
+      // — do NOT delete these even if not on OneDrive yet (still uploading)
+      final activeRows = await UploadQueueDb.instance.getActive();
+      final pendingSessionFolders = activeRows
+          .map((r) => r['onedrive_path'] as String? ?? '') // onedrive_path = sessionFolderName
+          .where((s) => s.isNotEmpty)
+          .toSet();
+
       // Get all session folders currently on OneDrive
       final odFiles = await OneDriveService().listUserFiles(
         rootFolder: 'OTN Recorder',
@@ -165,15 +204,19 @@ class FirestoreCacheService {
           .where((s) => s.isNotEmpty)
           .toSet();
 
-      // Delete Firestore docs whose sessionFolder is not on OneDrive
+      // Delete Firestore docs whose sessionFolder is:
+      // 1. Not on OneDrive AND
+      // 2. Not currently in the upload queue (would be on OD soon)
       int deleted = 0;
       final batch = _db.batch();
       for (final doc in firestoreDocs.docs) {
         final sf = doc.data()['sessionFolder'] as String? ?? '';
-        if (sf.isNotEmpty && !odSessionFolders.contains(sf)) {
+        if (sf.isNotEmpty
+            && !odSessionFolders.contains(sf)
+            && !pendingSessionFolders.contains(sf)) {
           batch.delete(doc.reference);
           deleted++;
-          debugPrint('=== Firestore syncDel: removed $sf (not on OD)');
+          debugPrint('=== Firestore syncDel: removed $sf (not on OD, not pending)');
         }
       }
       if (deleted > 0) await batch.commit();
@@ -274,24 +317,36 @@ class FirestoreCacheService {
             'totalBytes':     chunkSizeBytes,
             'parts':          [partNumber],
             'partDurations':  {'$partNumber': chunkDurationSecs},
-            'status':         'uploading',
+            'status':         'synced', // written only after OD confirms
             'updatedAt':      FieldValue.serverTimestamp(),
           });
         } else {
           final data  = snap.data()!;
           final parts = List<int>.from(data['parts'] as List? ?? []);
-          if (!parts.contains(partNumber)) parts.add(partNumber);
+          // Idempotent: only increment counts if this part is new
+          // Prevents double-count when WorkManager + main queue both call this
+          final isNewPart = !parts.contains(partNumber);
+          if (isNewPart) parts.add(partNumber);
           final durations = Map<String, dynamic>.from(
               data['partDurations'] as Map? ?? {});
           durations['$partNumber'] = chunkDurationSecs;
-          tx.update(ref, {
-            'chunksUploaded': FieldValue.increment(1),
-            'totalSecs':      FieldValue.increment(chunkDurationSecs),
-            'totalBytes':     FieldValue.increment(chunkSizeBytes),
-            'parts':          parts,
-            'partDurations':  durations,
-            'updatedAt':      FieldValue.serverTimestamp(),
-          });
+          if (isNewPart) {
+            tx.update(ref, {
+              'chunksUploaded': FieldValue.increment(1),
+              'totalSecs':      FieldValue.increment(chunkDurationSecs),
+              'totalBytes':     FieldValue.increment(chunkSizeBytes),
+              'parts':          parts,
+              'partDurations':  durations,
+              'status':         'synced',
+              'updatedAt':      FieldValue.serverTimestamp(),
+            });
+          } else {
+            // Already recorded — just ensure synced status
+            tx.update(ref, {
+              'status':    'synced',
+              'updatedAt': FieldValue.serverTimestamp(),
+            });
+          }
         }
       });
     } catch (e) {
@@ -382,6 +437,17 @@ class SessionMeta {
 
   /// Returns actual duration for a given part number, 0 if not stored
   int durationForPart(int partNum) => partDurations[partNum] ?? 0;
+
+  /// Human-readable start time, e.g. "Started 09:15 AM"
+  String get startTimeLabel {
+    if (sessionStartMs <= 0) return 'Start time unknown';
+    final dt = DateTime.fromMillisecondsSinceEpoch(sessionStartMs);
+    final h   = dt.hour;
+    final m   = dt.minute.toString().padLeft(2, '0');
+    final amPm = h >= 12 ? 'PM' : 'AM';
+    final h12  = h == 0 ? 12 : (h > 12 ? h - 12 : h);
+    return 'Started $h12:$m $amPm';
+  }
 }
 
 class DashMetrics {

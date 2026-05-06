@@ -60,7 +60,7 @@ class PendingChunk {
     final n    = partNumber.toString().padLeft(2,'0');
     final date = DateFormat('yyyyMMdd').format(sessionDate);
     final time = DateFormat('HHmmss').format(sessionStartTime);
-    return '${sessionId}_${date}_${time}_${n}_'
+    return '${sessionId}_${date}_${time}_$n'
         '${startMin.toString().padLeft(2,'0')}-${endMin.toString().padLeft(2,'0')}.mp4';
   }
 
@@ -101,6 +101,10 @@ class _PermanentFailure implements Exception {
   @override String toString() => message;
 }
 
+/// Thrown when WorkManager already uploaded this chunk.
+/// Signals caller to skip its own Firestore write — prevents double-write.
+class _AlreadyDone implements Exception {}
+
 // ─── ChunkUploadQueue ─────────────────────────────────────────────────────────
 class ChunkUploadQueue {
   static final ChunkUploadQueue _i = ChunkUploadQueue._();
@@ -124,7 +128,12 @@ class ChunkUploadQueue {
   bool _isWifi        = true;
   bool _cellularOk    = false;
   bool _wifiPreferred = true;
-  bool _allowMetered  = false; // Issue 1: persisted metered toggle
+  bool _allowMetered  = false;
+
+  // Real-time upload speed tracking
+  int    _speedWindowBytes = 0;   // bytes sent in current 1s window
+  int    _speedWindowStart = 0;  // window start timestamp (ms)
+  double _currentSpeedBps  = 0; // smoothed speed in bytes/sec
 
   // Issue 1: global hold — when true, ALL uploads stop until user taps Retry
   bool _globalHold    = false;
@@ -146,6 +155,53 @@ class ChunkUploadQueue {
     _ctrl.add(current);
     _persistDebounced();
     _updateForegroundService(); // update notification with latest state
+  }
+
+  /// Sync WorkManager upload progress from SQLite into UI state every 2s.
+  /// WorkManager runs in a separate isolate — this bridges the gap.
+  Future<void> _syncProgressFromDb() async {
+    if (_states.isEmpty) return;
+    try {
+      // Check ALL queue rows (including done) so we can clean up WM-finished chunks
+      final allRows = await UploadQueueDb.instance.db.then(
+          (db) => db.query('upload_queue',
+              columns: ['local_file_path', 'bytes_uploaded', 'file_size_bytes', 'status'],
+              where: 'chunk_id IN (${_states.keys.map((_) => '?').join(',')})',
+              whereArgs: _states.keys.toList()));
+
+      bool changed = false;
+      for (final row in allRows) {
+        final filePath = row['local_file_path'] as String? ?? '';
+        final bytesUp  = row['bytes_uploaded']  as int?    ?? 0;
+        final fileSize = row['file_size_bytes']  as int?    ?? 0;
+        final dbStatus = row['status']           as String? ?? '';
+        if (filePath.isEmpty) continue;
+
+        final state = _states[filePath];
+        if (state == null) continue;
+
+        if (dbStatus == 'done') {
+          // WorkManager finished this chunk — remove from UI immediately
+          // Also write Firestore if main queue hasn't yet
+          debugPrint('=== Queue: DB sync: ${state.chunk.cloudFileName} done by WM — removing from UI');
+          _writeChunkToFirestore(state.chunk).ignore();
+          await _deleteFiles(state.chunk).catchError((_) async {});
+          _states.remove(filePath);
+          _queue.removeWhere((c) => c.filePath == filePath);
+          changed = true;
+        } else if (dbStatus == 'uploading' && bytesUp > 0 && fileSize > 0) {
+          // WorkManager actively uploading — show live progress in UI
+          final progress = (bytesUp / fileSize).clamp(0.0, 1.0);
+          if ((progress - state.progress).abs() > 0.01) {
+            state.status   = ChunkStatus.uploading;
+            state.progress = progress;
+            state.message  = 'Uploading ${(progress * 100).toInt()}%';
+            changed = true;
+          }
+        }
+      }
+      if (changed) _ctrl.add(current);
+    } catch (_) {}
   }
 
   void _updateForegroundService() {
@@ -181,6 +237,25 @@ class ChunkUploadQueue {
   bool get isUploading    => _states.values.any((s) => s.status == ChunkStatus.uploading);
   bool get isWifi         => _isWifi;
   bool get isGlobalHold   => _globalHold;
+
+  /// Session IDs currently in the pending/uploading queue — used to hide from Uploaded Sessions
+  Set<String> get pendingSessionIds =>
+      _states.values.map((s) => s.chunk.sessionId).toSet();
+
+  /// Live upload speed in KB/s or MB/s (bytes-based, accurate)
+  String get uploadSpeedLabel {
+    if (!isUploading) return 'Idle';
+    if (_currentSpeedBps <= 0) return 'Starting...';
+    if (_currentSpeedBps >= 1024 * 1024) {
+      // Show MB/s
+      return '${(_currentSpeedBps / 1024 / 1024).toStringAsFixed(1)} MB/s';
+    }
+    if (_currentSpeedBps >= 1024) {
+      // Show KB/s
+      return '${(_currentSpeedBps / 1024).toStringAsFixed(0)} KB/s';
+    }
+    return '${_currentSpeedBps.toStringAsFixed(0)} B/s';
+  }
   int  get pendingSecs    => _states.values
       .where((s) => s.status != ChunkStatus.done)
       .fold(0, (sum, s) {
@@ -284,6 +359,9 @@ class ChunkUploadQueue {
   // ── Network monitor ───────────────────────────────────────────────────────
   void startNetworkMonitor({BuildContext? context}) {
     _loadPrefs(); // async — prefs available shortly after
+    // Poll SQLite every 2s to sync WorkManager upload progress into UI
+    // WorkManager runs in a separate isolate — progress only visible via DB
+    Timer.periodic(const Duration(seconds: 2), (_) => _syncProgressFromDb());
     Connectivity().onConnectivityChanged.listen((results) async {
       final wasWifi = _isWifi;
       final result  = results.isNotEmpty ? results.first : ConnectivityResult.none;
@@ -446,7 +524,6 @@ class ChunkUploadQueue {
   // Only removes done queue entries from memory — file itself was already
   // deleted by _deleteFiles() right after OneDrive confirmation.
   Future<void> cleanStaleFiles() async {
-    final cutoff    = DateTime.now().subtract(const Duration(days: _retentionDays));
     final staleKeys = <String>[];
 
     for (final entry in _states.entries) {
@@ -529,20 +606,45 @@ class ChunkUploadQueue {
     // Fix: always wrap in try/finally so _running is ALWAYS cleared,
     // even if an unexpected exception escapes the inner catch blocks
     try {
-    // Race guard: WorkManager may have already uploaded this chunk in background.
-    // Check SQLite before starting — if done, just clean up and move on.
-    final alreadyDone = await UploadQueueDb.instance
-        .isSessionFullyDone(next.sessionId).timeout(const Duration(seconds: 3),
-            onTimeout: () => false);
-    if (alreadyDone) {
-      debugPrint('=== Queue: ${next.cloudFileName} already done by WorkManager — skipping');
-      _states.remove(next.filePath);
-      _queue.remove(next);
-      _emit();
-      _running = false;
-      if (_canUpload) _processNext();
-      return;
-    }
+    // Race guard: check SQLite status before starting upload.
+    // WorkManager may already be uploading or have finished this chunk.
+    try {
+      final rows = await UploadQueueDb.instance.db.then(
+          (db) => db.query('upload_queue',
+              where: 'chunk_id = ?', whereArgs: [next!.filePath], limit: 1));
+      if (rows.isNotEmpty) {
+        final dbStatus = rows.first['status'] as String? ?? '';
+        if (dbStatus == 'done') {
+          debugPrint('=== Queue: ${next.cloudFileName} already done by WorkManager — skipping');
+          _states.remove(next.filePath);
+          _queue.remove(next);
+          _emit();
+          _running = false;
+          if (_canUpload) _processNext();
+          return;
+        }
+        if (dbStatus == 'uploading') {
+          // WorkManager is actively uploading — yield and keep polling until done
+          debugPrint('=== Queue: ${next.cloudFileName} WM uploading — waiting for WM to finish');
+          _running = false;
+          // Poll every 5s until WM finishes (status changes from 'uploading')
+          for (var i = 0; i < 60; i++) { // max 5 minutes wait
+            await Future.delayed(const Duration(seconds: 5));
+            try {
+              final r = await UploadQueueDb.instance.db.then(
+                  (db) => db.query('upload_queue',
+                      where: 'chunk_id = ?', whereArgs: [next!.filePath], limit: 1));
+              if (r.isEmpty) break; // row gone = done
+              final s = r.first['status'] as String? ?? '';
+              if (s == 'done' || s == 'failed') break; // WM finished
+              if (s != 'uploading') break;
+            } catch (_) { break; }
+          }
+          if (_canUpload) _processNext();
+          return;
+        }
+      }
+    } catch (_) {}
 
     final state = _states[next.filePath]!;
     state.status  = ChunkStatus.uploading;
@@ -561,7 +663,7 @@ class ChunkUploadQueue {
     for (int attempt = 0; attempt <= _maxRetries; attempt++) {
       try {
         if (attempt > 0) {
-          state.message = 'Retrying (${attempt}/${_maxRetries})...';
+          state.message = 'Retrying ($attempt/$_maxRetries)...';
           _emit();
           await Future.delayed(const Duration(seconds: 5));
           if (!_canUpload) break; // network may have died during delay
@@ -588,6 +690,11 @@ class ChunkUploadQueue {
           throw Exception('File not confirmed on OneDrive after upload');
         }
       } catch (e) {
+        if (e is _AlreadyDone) {
+          // WorkManager already handled this — skip Firestore write, treat as success
+          uploadSuccess = true;
+          break;
+        }
         debugPrint('=== Queue attempt $attempt failed: $e');
         next.lastUploadUrl = null; // always clear stale URL
         if (attempt < _maxRetries) {
@@ -599,14 +706,28 @@ class ChunkUploadQueue {
     }
 
     if (uploadSuccess) {
-      // ── Success: delete files, remove from queue ──────────────────────
+      // ── Success: verify SQLite status before writing Firestore ─────────
+      // If WorkManager already marked this done and wrote Firestore, skip.
+      bool wmAlreadyWrote = false;
+      try {
+        final rows = await UploadQueueDb.instance.db.then(
+            (db) => db.query('upload_queue',
+                columns: ['status'],
+                where: 'chunk_id = ?', whereArgs: [next.filePath], limit: 1));
+        wmAlreadyWrote = rows.isNotEmpty &&
+            (rows.first['status'] as String?) == 'done';
+      } catch (_) {}
+
       await _deleteFiles(next);
       _states.remove(next.filePath);
       _queue.remove(next);
       _emit();
-      debugPrint('=== Queue: ${next.cloudFileName} done ✓');
-      _writeChunkToFirestore(next).ignore();
-      // Mark done in SQLite (WorkManager also checks this)
+      debugPrint('=== Queue: ${next.cloudFileName} done ✓ (wmWrote=$wmAlreadyWrote)');
+      _currentSpeedBps = 0; _speedWindowBytes = 0; _speedWindowStart = 0;
+      // Only write Firestore if WorkManager didn't already do it
+      if (!wmAlreadyWrote) {
+        _writeChunkToFirestore(next).ignore();
+      }
       UploadQueueDb.instance.markDone(next.filePath).ignore();
 
       _running = false;
@@ -690,13 +811,15 @@ class ChunkUploadQueue {
           fileName:   chunk.cloudFileName,
         ).timeout(const Duration(seconds: 15), onTimeout: () => false);
         if (alreadyOnOD) {
-          // WorkManager uploaded it — treat as success
-          debugPrint('=== Queue: ${chunk.cloudFileName} found on OneDrive — marking done');
+          // WorkManager uploaded it — write Firestore once then throw special
+          // exception so caller skips its own _writeChunkToFirestore call
+          debugPrint('=== Queue: ${chunk.cloudFileName} found on OneDrive — marking done (WM)');
           _writeChunkToFirestore(chunk).ignore();
           UploadQueueDb.instance.markDone(chunk.filePath).ignore();
-          return; // caller's success path handles queue cleanup
+          throw _AlreadyDone(); // propagates to caller — skips double-write
         }
       } catch (e) {
+        if (e is _AlreadyDone) rethrow; // must propagate up to processNext
         debugPrint('=== Queue: OD check failed: $e');
       }
       throw _PermanentFailure('Both original and backup missing — re-record needed.');
@@ -725,6 +848,27 @@ class ChunkUploadQueue {
       onProgress: (p) {
         state.progress = p;
         state.message  = 'Uploading ${(p * 100).toStringAsFixed(0)}%';
+        // 1-second windowed speed measurement
+        // onProgress fires per 256KB slice — accumulate bytes in 1s buckets
+        try {
+          final fileSize  = File(chunk.bestFilePath).lengthSync();
+          final bytesNow  = (fileSize * p).round();
+          final nowMs     = DateTime.now().millisecondsSinceEpoch;
+          if (_speedWindowStart == 0) {
+            _speedWindowStart = nowMs;
+            _speedWindowBytes = bytesNow;
+          } else {
+            final elapsed = nowMs - _speedWindowStart;
+            final deltaB  = bytesNow - _speedWindowBytes;
+            if (elapsed >= 300 && deltaB > 0) { // 300ms window
+              final bps = (deltaB / elapsed) * 1000.0;
+              _currentSpeedBps = _currentSpeedBps == 0
+                  ? bps : _currentSpeedBps * 0.5 + bps * 0.5;
+              _speedWindowStart = nowMs;
+              _speedWindowBytes = bytesNow;
+            }
+          }
+        } catch (_) {}
         _emit();
       },
       onStatus: (s) { state.message = s; _emit(); },
@@ -832,7 +976,7 @@ class ChunkUploadQueue {
     try {
       await UploadQueueDb.instance.resetStuckUploading();
       final rows = await UploadQueueDb.instance.getPending();
-      debugPrint('=== SQLite recovery: ' + rows.length.toString() + ' pending chunks');
+      debugPrint('=== SQLite recovery: ${rows.length} pending chunks');
 
       for (final row in rows) {
         final filePath = row['local_file_path'] as String? ?? '';
@@ -840,7 +984,7 @@ class ChunkUploadQueue {
         if (_states.containsKey(filePath)) continue;
 
         if (!File(filePath).existsSync()) {
-          debugPrint('=== SQLite recovery: file gone — ' + filePath);
+          debugPrint('=== SQLite recovery: file gone — $filePath');
           await UploadQueueDb.instance.markFailed(row['chunk_id'] as String);
           continue;
         }
@@ -869,11 +1013,11 @@ class ChunkUploadQueue {
         cs.message  = 'Recovered — queued';
         _states[chunk.filePath] = cs;
         _queue.add(chunk);
-        debugPrint('=== SQLite recovery: restored ' + chunk.cloudFileName);
+        debugPrint('=== SQLite recovery: restored ${chunk.cloudFileName}');
       }
       if (_states.isNotEmpty) _emit();
     } catch (e) {
-      debugPrint('=== _recoverFromPersistence error: ' + e.toString());
+      debugPrint('=== _recoverFromPersistence error: $e');
     }
   }
 

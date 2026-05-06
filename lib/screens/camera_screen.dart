@@ -5,12 +5,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:intl/intl.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:intl/intl.dart';
 import 'package:flutter/foundation.dart';
 import '../services/beep_service.dart';
 import '../services/chunk_upload_queue.dart';
+import '../services/local_video_storage.dart';
+import '../services/user_service.dart';
 
 enum _S { init, detecting, countdown, recording, stopping, saved }
 
@@ -223,17 +226,65 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     return List.generate(6, (_) => chars[rng.nextInt(chars.length)]).join();
   }
 
-  // ── Backup path helper ─────────────────────────────────────────────────────
-  /// Computes the backup path for a chunk file.
-  /// The actual file copy is made inside ChunkUploadQueue.enqueue().
-  Future<String> _backupPathFor(String filePath) async {
-    final tmpDir    = await getTemporaryDirectory();
-    final backupDir = Directory('${tmpDir.path}/otn_backup');
-    if (!await backupDir.exists()) {
-      await backupDir.create(recursive: true);
+  // ── Structured backup path ─────────────────────────────────────────────────
+  // Copies camera temp chunk → persistent structured folder:
+  //   Android/media/com.otn.videorecorder/OTN/recordings/
+  //     DD-MM-YYYY/username/sessionId_date_startTime/part01.mp4
+  //
+  // This IS the backup. If upload fails, user can browse here via Files app.
+  // File is deleted only after OneDrive confirms it's present and complete.
+  Future<String> _moveChunkToBackup({
+    required String   tempPath,
+    required String   sessionId,
+    required int      partNumber,
+    required DateTime sessionDate,
+    required DateTime sessionStartTime,
+  }) async {
+    // Build session folder name — same as OneDrive folder name
+    final datePart  = DateFormat('yyyyMMdd').format(sessionDate);
+    final timePart  = DateFormat('HHmmss').format(sessionStartTime);
+    final sessionFolder = '${sessionId}_${datePart}_$timePart';
+
+    // Get username for folder
+    final username = await UserService().getDisplayName();
+
+    // Create structured dir:  recordings/DD-MM-YYYY/username/sessionFolder/
+    final storage = LocalVideoStorage();
+    final dir = await storage.sessionDir(
+      sessionDate,
+      '${username.toLowerCase().replaceAll(' ', '_')}@otn',
+      sessionFolder: sessionFolder,
+    );
+
+    // File name: sessionId_date_time_partNN_startMin-endMin.mp4
+    final nn       = partNumber.toString().padLeft(2, '0');
+    final fileName = '${sessionId}_${datePart}_${timePart}_part$nn.mp4';
+    final destPath = '${dir.path}/$fileName';
+
+    // Wait for camera to fully flush the file before copying.
+    // stopVideoRecording() can return before the OS finishes writing all bytes.
+    final src = File(tempPath);
+    int srcSize = 0;
+    for (var attempt = 0; attempt < 20; attempt++) {
+      await Future.delayed(const Duration(milliseconds: 200));
+      final sz = src.existsSync() ? src.lengthSync() : 0;
+      if (sz > 0 && sz == srcSize) break; // size stable = write complete
+      srcSize = sz;
     }
-    final fileName = filePath.split('/').last;
-    return '${backupDir.path}/$fileName';
+    if (srcSize == 0) throw Exception('Source file empty after wait: $tempPath');
+
+    // Copy from camera temp → structured backup
+    await src.copy(destPath);
+
+    // Verify copy succeeded
+    final destSize = File(destPath).existsSync() ? File(destPath).lengthSync() : 0;
+    if (destSize == 0) throw Exception('Backup copy is 0 bytes: $destPath');
+
+    // Remove camera temp file only after verified copy
+    try { await src.delete(); } catch (_) {}
+
+    debugPrint('=== Backup: $fileName (${destSize}B) → ${dir.path}');
+    return destPath;
   }
 
   // ── Start one chunk recording ─────────────────────────────────────────────
@@ -299,10 +350,25 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
       final startSec   = (capturedPart - 1) * _chunkSecs;
       final endSec     = capturedEnd.difference(capturedChunkStart).inSeconds + startSec;
-      // FIX: compute backupPath and await enqueue
-      final backupPath = await _backupPathFor(file.path);
+      // Move chunk from camera temp → structured backup folder
+      // If backup move fails (permission not yet granted), fall back to temp path
+      String backupPath;
+      try {
+        backupPath = await _moveChunkToBackup(
+          tempPath:         file.path,
+          sessionId:        capturedSessionId,
+          partNumber:       capturedPart,
+          sessionDate:      capturedStart0,
+          sessionStartTime: capturedStart0,
+        );
+        debugPrint('=== Backup: moved to $backupPath');
+      } catch (e) {
+        // Backup failed — use camera temp path directly so upload still works
+        backupPath = file.path;
+        debugPrint('=== Backup: FAILED ($e) — using temp path: $backupPath');
+      }
       await _queue.enqueue(PendingChunk(
-        filePath:         file.path,
+        filePath:         backupPath,
         backupPath:       backupPath,
         sessionId:        capturedSessionId,
         userId:           _userId,
@@ -365,10 +431,25 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
       final startSec   = (capturedPart - 1) * _chunkSecs;
       final endSec     = capturedEnd.difference(capturedChunkStart).inSeconds + startSec;
-      // FIX: compute backupPath and await enqueue
-      final backupPath = await _backupPathFor(file.path);
+      // Move chunk from camera temp → structured backup folder
+      // If backup move fails (permission not yet granted), fall back to temp path
+      String backupPath;
+      try {
+        backupPath = await _moveChunkToBackup(
+          tempPath:         file.path,
+          sessionId:        capturedSessionId,
+          partNumber:       capturedPart,
+          sessionDate:      capturedStart0,
+          sessionStartTime: capturedStart0,
+        );
+        debugPrint('=== Backup: moved to $backupPath');
+      } catch (e) {
+        // Backup failed — use camera temp path directly so upload still works
+        backupPath = file.path;
+        debugPrint('=== Backup: FAILED ($e) — using temp path: $backupPath');
+      }
       await _queue.enqueue(PendingChunk(
-        filePath:         file.path,
+        filePath:         backupPath,
         backupPath:       backupPath,
         sessionId:        capturedSessionId,
         userId:           _userId,
@@ -439,10 +520,25 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
       final startSec   = (capturedPart - 1) * _chunkSecs;
       final endSec     = capturedEnd.difference(capturedChunkStart).inSeconds + startSec;
-      // FIX: compute backupPath and await enqueue
-      final backupPath = await _backupPathFor(file.path);
+      // Move chunk from camera temp → structured backup folder
+      // If backup move fails (permission not yet granted), fall back to temp path
+      String backupPath;
+      try {
+        backupPath = await _moveChunkToBackup(
+          tempPath:         file.path,
+          sessionId:        capturedSessionId,
+          partNumber:       capturedPart,
+          sessionDate:      capturedStart0,
+          sessionStartTime: capturedStart0,
+        );
+        debugPrint('=== Backup: moved to $backupPath');
+      } catch (e) {
+        // Backup failed — use camera temp path directly so upload still works
+        backupPath = file.path;
+        debugPrint('=== Backup: FAILED ($e) — using temp path: $backupPath');
+      }
       await _queue.enqueue(PendingChunk(
-        filePath:         file.path,
+        filePath:         backupPath,
         backupPath:       backupPath,
         sessionId:        capturedSessionId,
         userId:           _userId,

@@ -142,6 +142,10 @@ class OneDriveService {
   // Uploads directly to: OTN Recorder/Attendance Reports/<fileName>
   // Uses the same resumable upload session as chunk uploads.
   // Overwrites existing file — so re-exporting same range updates the file.
+  // Track the active attendance upload session URL so we can cancel it
+  // if a new upload starts while the previous one is still in progress.
+  static String? _activeAttendanceSessionUrl;
+
   Future<void> uploadToAttendanceFolder({
     required String filePath,
     required String fileName,
@@ -154,33 +158,50 @@ class OneDriveService {
 
     onStatus('Preparing attendance upload...');
 
-    // Delete existing file to allow clean overwrite
+    // Cancel any in-progress attendance upload session before starting new one.
+    // This is why 409 happens: previous session is still "active" on OneDrive.
+    if (_activeAttendanceSessionUrl != null) {
+      debugPrint('=== OD: cancelling previous attendance session');
+      try {
+        await http.delete(Uri.parse(_activeAttendanceSessionUrl!),
+            headers: {'Content-Length': '0'})
+            .timeout(const Duration(seconds: 10));
+      } catch (_) {} // ignore cancel errors
+      _activeAttendanceSessionUrl = null;
+    }
+
+    // Delete any existing completed file so overwrite works cleanly
     await _deleteFileIfExists(folderPath: folderPath, fileName: fileName);
-    await Future.delayed(const Duration(milliseconds: 500));
+    await Future.delayed(const Duration(seconds: 2));
 
     onStatus('Creating upload session...');
     final uploadUrl = await _createFreshSession(
         folderPath: folderPath, fileName: fileName);
+    _activeAttendanceSessionUrl = uploadUrl;
 
     onStatus('Uploading attendance report...');
-    await _uploadInChunks(
-        uploadUrl: uploadUrl, file: file, onProgress: onProgress);
-
-    debugPrint('=== OD: attendance report uploaded → $folderPath/$fileName');
+    try {
+      await _uploadInChunks(
+          uploadUrl: uploadUrl, file: file, onProgress: onProgress);
+      _activeAttendanceSessionUrl = null; // clear on success
+      debugPrint('=== OD: attendance report uploaded → $folderPath/$fileName');
+    } catch (e) {
+      _activeAttendanceSessionUrl = null; // clear on failure too
+      rethrow;
+    }
   }
 
   // ─── Adaptive chunk sizing ────────────────────────────────────────────────
   // WiFi:   5MB chunks — fast pipe, large chunks = fewer round-trips
-  // Mobile: 1MB chunks — slower/unstable pipe, small chunks = faster recovery
-  //         if a chunk fails, you only lose 1MB not 5MB of progress
-  static const int _chunkBytesWifi   = 5 * 1024 * 1024;  // 5MB
-  static const int _chunkBytesMobile = 1 * 1024 * 1024;  // 1MB
-  static const int _maxChunkRetries  = 5;
+  // Mobile: 512KB chunks — very small for unstable 5G/4G handoffs
+  //         Smaller = faster recovery if connection drops mid-chunk
+  static const int _chunkBytesWifi   = 5 * 1024 * 1024;     // 5MB
+  static const int _chunkBytesMobile = 512 * 1024;            // 512KB
+  static const int _maxChunkRetries  = 8;                     // more retries for mobile
 
-  // Timeout per chunk — scaled by chunk size and network type
-  // Mobile timeout is shorter so dead connections are detected fast
-  static const Duration _timeoutWifi   = Duration(seconds: 120); // 5MB / ~0.5MBps
-  static const Duration _timeoutMobile = Duration(seconds: 60);  // 1MB / ~0.1MBps
+  // Timeout per chunk — mobile longer because 512KB can be slow on weak signal
+  static const Duration _timeoutWifi   = Duration(seconds: 120);
+  static const Duration _timeoutMobile = Duration(seconds: 90); // 512KB on weak 4G
 
   static Future<int> _getChunkSize() async {
     final results = await Connectivity().checkConnectivity();
@@ -242,6 +263,7 @@ class OneDriveService {
               ..contentLength = length;
 
             // Feed disk → sink in 256KB slices without awaiting all at once
+            // Also call onProgress per slice for smooth real-time progress bar
             const subSliceBytes = 256 * 1024;
             unawaited((() async {
               try {
@@ -254,6 +276,8 @@ class OneDriveService {
                   if (slice.isEmpty) break;
                   request.sink.add(slice);
                   sent += slice.length;
+                  // Real-time progress: offset + bytes sent so far / total file
+                  onProgress((offset + sent) / fileSize);
                 }
               } finally {
                 await request.sink.close();
@@ -273,6 +297,12 @@ class OneDriveService {
                 _cachedToken = null;
                 _tokenExpiry  = null;
                 throw Exception('PUT 401 — token cleared');
+              }
+              if (response.statusCode == 423) {
+                // OneDrive file locked by another session — wait longer before retry
+                debugPrint('=== OD: 423 Locked — waiting for lock release');
+                await Future.delayed(const Duration(seconds: 10));
+                throw Exception('PUT 423 at offset $offset');
               }
               if (response.statusCode == 200 ||
                   response.statusCode == 201 ||
