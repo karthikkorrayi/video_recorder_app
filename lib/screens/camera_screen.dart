@@ -12,6 +12,7 @@ import 'package:intl/intl.dart';
 import 'package:flutter/foundation.dart';
 import '../services/beep_service.dart';
 import '../services/chunk_upload_queue.dart';
+import '../services/upload_queue_db.dart';
 import '../services/local_video_storage.dart';
 import '../services/user_service.dart';
 
@@ -550,7 +551,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         endSec:           endSec,
       ));
 
-      debugPrint('=== Session $_sessionId stopped: $capturedPart parts queued');
+      // Set total_parts on all chunks — isSessionFullyDone now knows exact count
+      await UploadQueueDb.instance.setSessionTotalParts(
+          capturedSessionId, capturedPart);
+      debugPrint('=== Session $capturedSessionId stopped: $capturedPart parts queued '
+          '(totalParts=$capturedPart set in DB)');
 
       if (!mounted) return;
       setState(() { _state = _S.saved; _displaySecs = 0; });

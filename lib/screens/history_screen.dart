@@ -4,9 +4,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/cloud_cache_service.dart';
 import '../services/firestore_cache_service.dart';
-import '../services/onedrive_service.dart';
 import '../widgets/network_banner.dart';
-import '../services/chunk_upload_queue.dart';
 import '../widgets/chunk_popup.dart';
 
 class HistoryScreen extends StatefulWidget {
@@ -99,52 +97,47 @@ class _HistoryScreenState extends State<HistoryScreen> {
 
   @override
   Widget build(BuildContext context) => PopScope(
-    // Prevent back navigation while sync overlay is active
     canPop: !_refreshing,
     child: Stack(children: [
-    Scaffold(
-      backgroundColor: _bg,
-      appBar: AppBar(
-        backgroundColor: Colors.white,
-        foregroundColor: _text,
-        elevation: 0,
-        title: const Text('My Recordings',
-            style: TextStyle(fontWeight: FontWeight.bold)),
-        actions: [
-          _syncing
-              ? const Padding(padding: EdgeInsets.all(14),
-                  child: SizedBox(width: 20, height: 20,
-                      child: CircularProgressIndicator(
-                          strokeWidth: 2, color: _green)))
-              : IconButton(
-                  icon: const Icon(Icons.refresh),
-                  onPressed: () async {
-                    setState(() => _syncing = true);
-                    await _forceSync();
-                  }),
-        ],
-      ),
-    body: NetworkBannerWrapper(
-      child: RefreshIndicator(
-        color: _green,
-        onRefresh: _forceSync,
-        child: ListView(
-          padding: const EdgeInsets.all(12),
-          children: [
-            _sectionHeader(Icons.cloud_upload_outlined,
-                'Pending Uploads', _cache.lastSyncLabel),
-            const SizedBox(height: 8),
-            _buildUploadPanel(),
-            const SizedBox(height: 20),
-            _sectionHeader(Icons.cloud_done_outlined,
-                'Uploaded Sessions', _cache.lastSyncLabel),
-            const SizedBox(height: 10),
-            _buildFirestoreSessions(),
+      Scaffold(
+        backgroundColor: _bg,
+        appBar: AppBar(
+          backgroundColor: Colors.white,
+          foregroundColor: _text,
+          elevation: 0,
+          title: const Text('My Recordings',
+              style: TextStyle(fontWeight: FontWeight.bold)),
+          actions: [
+            _syncing
+                ? const Padding(padding: EdgeInsets.all(14),
+                    child: SizedBox(width: 20, height: 20,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: _green)))
+                : IconButton(
+                    icon: const Icon(Icons.refresh),
+                    onPressed: () async {
+                      setState(() => _syncing = true);
+                      await _forceSync();
+                    }),
           ],
         ),
+        body: NetworkBannerWrapper(
+          child: ListView(
+            padding: const EdgeInsets.all(12),
+            children: [
+              _sectionHeader(Icons.cloud_upload_outlined,
+                  'Pending Uploads', _cache.lastSyncLabel),
+              const SizedBox(height: 8),
+              _buildUploadPanel(),
+              const SizedBox(height: 20),
+              _sectionHeader(Icons.cloud_done_outlined,
+                  'Uploaded Sessions', _cache.lastSyncLabel),
+              const SizedBox(height: 10),
+              _buildFirestoreSessions(),
+            ],
+          ),
+        ),
       ),
-    ),
-  ),
     // Full-screen sync overlay — blocks all navigation while refreshing
     if (_refreshing) Positioned.fill(
       child: Container(
@@ -204,7 +197,8 @@ class _HistoryScreenState extends State<HistoryScreen> {
         )),
       ),
     ),
-  ]));
+    ]),
+  );
 
   Widget _sectionHeader(IconData icon, String label, String syncLabel) =>
       Row(children: [
@@ -568,14 +562,20 @@ class _HistoryScreenState extends State<HistoryScreen> {
 
     // Only 'synced' sessions — 'uploading' stay in Pending Uploads
     // until ALL chunks of that session are confirmed on cloud storage
+    // No .where('status') — that requires a composite index which doesn't exist.
+    // Filter in Dart instead (fast for small date-range result sets).
     final stream = col
         .where('sessionStartMs', isGreaterThanOrEqualTo: fromMs)
         .where('sessionStartMs', isLessThanOrEqualTo: todayEnd)
-        .where('status', isEqualTo: 'synced')
         .orderBy('sessionStartMs', descending: true)
         .snapshots()
-        .map((s) => _dedup(s.docs
-            .map((d) => SessionMeta.fromMap(d.id, d.data())).toList()));
+        .map((snap) {
+          final synced = snap.docs
+              .where((d) => (d.data()['status'] as String?) == 'synced')
+              .map((d) => SessionMeta.fromMap(d.id, d.data()))
+              .toList();
+          return _dedup(synced);
+        });
 
     return StreamBuilder<List<SessionMeta>>(
       // _streamKey forces a fresh Firestore query on each manual refresh
@@ -587,7 +587,10 @@ class _HistoryScreenState extends State<HistoryScreen> {
             snap.data == null) {
           return _buildReconnecting();
         }
-        if (snap.hasError) return _buildReconnecting();
+        if (snap.hasError) {
+          debugPrint('=== Session stream error: \${snap.error}');
+          return _buildStreamError();
+        }
         final sessions = snap.data ?? [];
         if (sessions.isEmpty && !_refreshing) return _buildEmptyCloud();
         if (sessions.isEmpty) return _buildReconnecting();
@@ -647,6 +650,28 @@ class _HistoryScreenState extends State<HistoryScreen> {
       ),
     );
   }
+
+  Widget _buildStreamError() => Center(child: Padding(
+    padding: const EdgeInsets.symmetric(vertical: 32),
+    child: Column(children: [
+      Icon(Icons.sync_problem, size: 48, color: Colors.orange[400]),
+      const SizedBox(height: 12),
+      const Text('Could not load sessions',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+      const SizedBox(height: 6),
+      const Text('Tap refresh to try again',
+          style: TextStyle(color: Color(0xFF888888), fontSize: 13)),
+      const SizedBox(height: 14),
+      OutlinedButton.icon(
+        onPressed: () => setState(() => _streamKey++),
+        icon: const Icon(Icons.refresh, size: 16),
+        label: const Text('Retry'),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: _green,
+          side: const BorderSide(color: _green)),
+      ),
+    ]),
+  ));
 
   Widget _buildReconnecting() => Center(child: Padding(
     padding: const EdgeInsets.symmetric(vertical: 40),

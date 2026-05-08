@@ -26,7 +26,15 @@ class UploadQueueDb {
     final path = p.join(dir, 'otn_upload_queue.db');
     return openDatabase(
       path,
-      version: 1,
+      version: 2,
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          // Add total_parts column for existing installs
+          await db.execute(
+              'ALTER TABLE upload_queue ADD COLUMN total_parts INTEGER NOT NULL DEFAULT 0');
+          debugPrint('=== DB migrated v1→v2: added total_parts column');
+        }
+      },
       onCreate: (db, _) async {
         await db.execute('''
           CREATE TABLE upload_queue (
@@ -37,6 +45,7 @@ class UploadQueueDb {
             file_name         TEXT NOT NULL,
             file_size_bytes   INTEGER NOT NULL DEFAULT 0,
             bytes_uploaded    INTEGER NOT NULL DEFAULT 0,
+            total_parts       INTEGER NOT NULL DEFAULT 0,
             upload_session_url TEXT,
             status            TEXT NOT NULL DEFAULT 'pending',
             retry_count       INTEGER NOT NULL DEFAULT 0,
@@ -192,12 +201,33 @@ class UploadQueueDb {
     final d = await db;
     final rows = await d.query(
       'upload_queue',
-      columns: ['status'],
+      columns: ['status', 'total_parts'],
       where: 'session_id = ?',
       whereArgs: [sessionId],
     );
-    if (rows.isEmpty) return true; // nothing queued = already cleared
-    return rows.every((r) => r['status'] == 'done');
+    if (rows.isEmpty) return false; // no rows = session not fully enqueued yet
+    // Get declared total parts (set when session stops recording)
+    final declaredTotal = (rows.first['total_parts'] as int? ?? 0);
+    final doneCount     = rows.where((r) => r['status'] == 'done').length;
+    if (declaredTotal > 0) {
+      // We know the total — use it for accurate completion check
+      return doneCount >= declaredTotal;
+    }
+    // Fallback: all currently-queued rows must be done AND at least 1 exists
+    return rows.isNotEmpty && rows.every((r) => r['status'] == 'done');
+  }
+
+  /// Sets total_parts on ALL chunks of a session when recording stops.
+  /// After this, isSessionFullyDone knows exactly how many chunks to expect.
+  Future<void> setSessionTotalParts(String sessionId, int totalParts) async {
+    final d = await db;
+    await d.update(
+      'upload_queue',
+      {'total_parts': totalParts, 'updated_at': DateTime.now().millisecondsSinceEpoch},
+      where: 'session_id = ?',
+      whereArgs: [sessionId],
+    );
+    debugPrint('=== DB: session $sessionId totalParts set to $totalParts');
   }
 
   Future<bool> sessionHasAnyPending(String sessionId) async {
