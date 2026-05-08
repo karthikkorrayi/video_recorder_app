@@ -189,13 +189,24 @@ class ChunkUploadQueue {
         if (state == null) continue;
 
         if (dbStatus == 'done') {
-          // WorkManager finished this chunk — remove from UI immediately
-          // Also write Firestore if main queue hasn't yet
-          debugPrint('=== Queue: DB sync: ${state.chunk.cloudFileName} done by WM — removing from UI');
-          _writeChunkToFirestore(state.chunk).ignore();
-          await _deleteFiles(state.chunk).catchError((_) async {});
-          _states.remove(filePath);
-          _queue.removeWhere((c) => c.filePath == filePath);
+          debugPrint('=== Queue: DB sync: ${state.chunk.cloudFileName} done by WM');
+          // Mark as done in UI — keep tile visible until whole session finishes
+          state.status   = ChunkStatus.done;
+          state.progress = 1.0;
+          state.message  = 'Done ✓';
+          // File kept — no auto-delete
+          // Only write Firestore + clear session UI when ALL chunks are done
+          final sessionDone = await UploadQueueDb.instance
+              .isSessionFullyDone(state.chunk.sessionId)
+              .timeout(const Duration(seconds: 5), onTimeout: () => false);
+          if (sessionDone) {
+            debugPrint('=== Queue: session ${state.chunk.sessionId} fully done (WM sync)');
+            _writeChunkToFirestore(state.chunk).ignore();
+            // Remove all chunks of this session from UI at once
+            final sid = state.chunk.sessionId;
+            _states.removeWhere((_, s) => s.chunk.sessionId == sid);
+            _queue.removeWhere((c) => c.sessionId == sid);
+          }
           changed = true;
         } else if (dbStatus == 'uploading' && bytesUp > 0 && fileSize > 0) {
           // WorkManager actively uploading — show live progress in UI
@@ -851,52 +862,46 @@ class ChunkUploadQueue {
 
   Future<void> _writeChunkToFirestore(PendingChunk chunk) async {
     try {
-      debugPrint('=== Firestore: writing session ${chunk.sessionId} (all chunks done)');
       final userFolder = await UserService().getDisplayName();
       final dateFolder = DateFormat('dd-MM-yyyy').format(chunk.sessionDate);
 
-      // Compute total duration from all chunks in this session via DB
-      final allRows = await UploadQueueDb.instance.db.then((db) =>
+      // Use only DONE chunks for accurate totals
+      final allRows  = await UploadQueueDb.instance.db.then((db) =>
           db.query('upload_queue',
               where: 'session_id = ?', whereArgs: [chunk.sessionId]));
-      final totalSecs = allRows.fold<int>(
-          0, (sum, r) {
-            final start = r['start_sec'] as int? ?? 0;
-            final end   = r['end_sec']   as int? ?? 0;
-            return sum + (end - start).clamp(0, 7200);
-          });
-      final totalChunks = allRows.length;
+      final doneRows = allRows
+          .where((r) => (r['status'] as String?) == 'done')
+          .toList();
 
-      // Write each chunk to Firestore so partDurations map is complete
-      for (var i = 0; i < allRows.length; i++) {
-        final r    = allRows[i];
-        final partNum = r['part_number'] as int? ?? (i + 1);
-        final start   = r['start_sec']  as int? ?? 0;
-        final end     = r['end_sec']    as int? ?? 0;
-        await FirestoreCacheService().recordChunkUploaded(
-          sessionId:         chunk.sessionId,
-          dateFolder:        dateFolder,
-          userFolder:        userFolder,
-          sessionFolder:     chunk.sessionFolderName,
-          chunkDurationSecs: (end - start).clamp(0, 7200),
-          chunkSizeBytes:    0,
-          partNumber:        partNum,
-          sessionStartMs:    chunk.sessionStartTime.millisecondsSinceEpoch,
-        );
+      int totalSecs  = 0;
+      final parts    = <int>[];
+      for (final r in doneRows) {
+        final s = r['start_sec'] as int? ?? 0;
+        final e = r['end_sec']   as int? ?? 0;
+        totalSecs += (e - s).clamp(0, 7200);
+        parts.add(r['part_number'] as int? ?? 1);
       }
-      debugPrint('=== Firestore: wrote session ${chunk.sessionId} '
-          '($totalChunks chunks, ${totalSecs}s total)');
+      parts.sort();
 
-      // Now mark the whole session as 'synced' — all chunks confirmed
-      // This is the moment it appears in Uploaded Sessions section
-      await FirestoreCacheService().markSessionSynced(chunk.sessionId);
-      debugPrint('=== Firestore: session ${chunk.sessionId} → synced ✓');
+      // Single atomic write — doc goes from nonexistent → status:'synced'
+      // This is the ONLY moment this session appears in Uploaded Sessions
+      await FirestoreCacheService().writeFullSession(
+        sessionId:      chunk.sessionId,
+        dateFolder:     dateFolder,
+        userFolder:     userFolder,
+        sessionFolder:  chunk.sessionFolderName,
+        sessionStartMs: chunk.sessionStartTime.millisecondsSinceEpoch,
+        chunksUploaded: doneRows.length,
+        totalSecs:      totalSecs,
+        parts:          parts,
+      );
+      debugPrint('=== Firestore: session \${chunk.sessionId} → synced ✓ '
+          '(\${doneRows.length} chunks, \${totalSecs}s)');
 
-      // Trigger Excel update
       AttendanceAutoSync().scheduleUpdate(dateFolder);
     } catch (e, st) {
-      debugPrint('=== Firestore write error (non-fatal): $e');
-      debugPrint('=== Firestore write stacktrace: $st');
+      debugPrint('=== Firestore write error (non-fatal): \$e');
+      debugPrint('=== Firestore write stacktrace: \$st');
     }
   }
 
@@ -919,9 +924,19 @@ class ChunkUploadQueue {
           // WorkManager uploaded it — write Firestore once then throw special
           // exception so caller skips its own _writeChunkToFirestore call
           debugPrint('=== Queue: ${chunk.cloudFileName} found on OneDrive — marking done (WM)');
-          _writeChunkToFirestore(chunk).ignore();
-          UploadQueueDb.instance.markDone(chunk.filePath).ignore();
-          throw _AlreadyDone(); // propagates to caller — skips double-write
+          await UploadQueueDb.instance.markDone(chunk.filePath);
+          // Keep chunk tile as done (green ✓), only clear session when all done
+          final alreadyState = _states[chunk.filePath];
+          if (alreadyState != null) {
+            alreadyState.status   = ChunkStatus.done;
+            alreadyState.progress = 1.0;
+            alreadyState.message  = 'Done ✓';
+          }
+          final sessionDone2 = await UploadQueueDb.instance
+              .isSessionFullyDone(chunk.sessionId)
+              .timeout(const Duration(seconds: 5), onTimeout: () => false);
+          if (sessionDone2) _writeChunkToFirestore(chunk).ignore();
+          throw _AlreadyDone();
         }
       } catch (e) {
         if (e is _AlreadyDone) rethrow; // must propagate up to processNext
