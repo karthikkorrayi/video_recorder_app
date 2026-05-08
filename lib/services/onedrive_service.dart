@@ -196,7 +196,7 @@ class OneDriveService {
   // Mobile: 512KB chunks — very small for unstable 5G/4G handoffs
   //         Smaller = faster recovery if connection drops mid-chunk
   static const int _chunkBytesWifi   = 5 * 1024 * 1024;     // 5MB
-  static const int _chunkBytesMobile = 512 * 1024;            // 512KB
+  static const int _chunkBytesMobile = 1 * 1024 * 1024;       // 1MB
   static const int _maxChunkRetries  = 8;                     // more retries for mobile
 
   // Timeout per chunk — mobile longer because 512KB can be slow on weak signal

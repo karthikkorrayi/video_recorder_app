@@ -76,25 +76,54 @@ class FirestoreCacheService {
         final dateStr    = segments[1]; // YYYYMMDD
         final timeStr    = segments[2]; // HHMMSS
 
-        // Check by sessionId doc AND by sessionFolder query
-        // (recordChunkUploaded writes by sessionId, backfill must match it)
+        // Always compute accurate values from OneDrive file list
+        final totalBytes   = parts.fold<int>(0,
+            (s, p) => s + ((p['size'] as int?) ?? 0));
+        final totalSecs    = parts.fold<int>(0,
+            (s, p) => s + _parseFileSecs(p['name'] as String? ?? ''));
+        final partNums     = parts.map((p) =>
+            _parsePartNumber(p['name'] as String? ?? '')).toList()
+            ..sort();
+
+        // Check if doc already exists — always UPDATE with fresh OD data
         final existing = await col.doc(sessionId).get();
         if (existing.exists) {
-          // Doc exists — update status to 'synced' if still 'uploading'
-          if ((existing.data()?['status'] as String?) == 'uploading') {
-            await col.doc(sessionId).update({'status': 'synced', 'backfilled': true});
+          final data = existing.data()!;
+          // Only overwrite with OD data if it has more/equal chunks than Firestore
+          // This fixes: 2-chunk session shown as 1 chunk after partial upload
+          final fsChunks = (data['chunksUploaded'] as num? ?? 0).toInt();
+          if (parts.length >= fsChunks) {
+            await col.doc(sessionId).update({
+              'chunksUploaded': parts.length,
+              'totalSecs':      totalSecs,
+              'totalBytes':     totalBytes,
+              'parts':          partNums,
+              'status':         'synced',
+              'updatedAt':      FieldValue.serverTimestamp(),
+              'backfilled':     true,
+            });
           }
           continue;
         }
-        // Also check by sessionFolder field to avoid duplicates from different write paths
+        // Also check by sessionFolder to avoid duplicates
         final byFolder = await col
             .where('sessionFolder', isEqualTo: sessionFolder)
             .limit(1)
             .get();
         if (byFolder.docs.isNotEmpty) {
           final existingDoc = byFolder.docs.first;
-          if ((existingDoc.data()['status'] as String?) == 'uploading') {
-            await existingDoc.reference.update({'status': 'synced', 'backfilled': true});
+          final data = existingDoc.data();
+          final fsChunks = (data['chunksUploaded'] as num? ?? 0).toInt();
+          if (parts.length >= fsChunks) {
+            await existingDoc.reference.update({
+              'chunksUploaded': parts.length,
+              'totalSecs':      totalSecs,
+              'totalBytes':     totalBytes,
+              'parts':          partNums,
+              'status':         'synced',
+              'updatedAt':      FieldValue.serverTimestamp(),
+              'backfilled':     true,
+            });
           }
           continue;
         }
@@ -113,12 +142,6 @@ class FirestoreCacheService {
         } catch (_) { continue; }
 
         final dateFolder   = DateFormat('dd-MM-yyyy').format(sessionDate);
-        final totalBytes   = parts.fold<int>(0,
-            (s, p) => s + ((p['size'] as int?) ?? 0));
-        final totalSecs    = parts.fold<int>(0,
-            (s, p) => s + _parseFileSecs(p['name'] as String? ?? ''));
-        final partNums     = parts.map((p) =>
-            _parsePartNumber(p['name'] as String? ?? '')).toList();
 
         await col.doc(sessionId).set({
           'sessionId':      sessionId,
@@ -143,29 +166,89 @@ class FirestoreCacheService {
     }
   }
 
+  /// Write or overwrite a complete session document.
+  /// Called when ALL chunks of a session are confirmed done.
+  Future<void> writeFullSession({
+    required String sessionId,
+    required String dateFolder,
+    required String userFolder,
+    required String sessionFolder,
+    required int    sessionStartMs,
+    required int    chunksUploaded,
+    required int    totalSecs,
+    required List<int> parts,
+  }) async {
+    try {
+      final col = _sessions;
+      if (col == null) return;
+      await col.doc(sessionId).set({
+        'sessionId':      sessionId,
+        'dateFolder':     dateFolder,
+        'userFolder':     userFolder,
+        'sessionFolder':  sessionFolder,
+        'sessionStartMs': sessionStartMs,
+        'chunksUploaded': chunksUploaded,
+        'totalSecs':      totalSecs,
+        'totalBytes':     0,
+        'parts':          parts,
+        'status':         'synced',
+        'updatedAt':      FieldValue.serverTimestamp(),
+      }, SetOptions(merge: false)); // overwrite fully for accuracy
+      debugPrint('=== Firestore: full session written — $sessionId '
+          '($chunksUploaded chunks, ${totalSecs}s)');
+    } catch (e) {
+      debugPrint('=== Firestore writeFullSession error: $e');
+    }
+  }
+
+  /// Force full re-scan — called on manual refresh.
+  /// Updates ALL sessions in Firestore with accurate chunk count + duration.
+  Future<void> forceRefreshFromOneDrive() async {
+    debugPrint('=== Firestore forceRefresh: starting full OD re-scan');
+    // backfillFromOneDrive now always updates existing docs, so just call it
+    await backfillFromOneDrive();
+    debugPrint('=== Firestore forceRefresh: complete');
+  }
+
+  /// Parse duration seconds from OneDrive filename.
+  /// Supports both formats:
+  ///   NEW: AOO7BQ_20260508_P01_S103045_E103210_165s.mp4  → 165s (exact)
+  ///   OLD: 3VCWW6_20260506_015642_0100-02.mp4            → (2-0)*60 = 120s
   static int _parseFileSecs(String name) {
-    // Actual format: SESSIONID_DATE_TIME_NNMM-MM.mp4
-    // NN = 2-digit part number, then startMin-endMin (2 digits each)
-    // e.g. 3VCWW6_20260506_015642_0100-02.mp4 → part01, min 00 to 02 = 120s
-    final m = RegExp(r'_\d{2}(\d{2})-(\d{2})\.mp4\$').firstMatch(name);
-    if (m != null) {
-      final s = int.parse(m.group(1)!);
-      final e = int.parse(m.group(2)!);
+    // NEW format: _DURs.mp4  e.g. _165s.mp4
+    final mNew = RegExp(r'_(\d+)s\.mp4$').firstMatch(name);
+    if (mNew != null) return int.parse(mNew.group(1)!);
+
+    // OLD format v2: _NNMM-MM.mp4  e.g. _0100-02.mp4 → (02-00)*60
+    final mOld = RegExp(r'_\d{2}(\d{2})-(\d{2})\.mp4$').firstMatch(name);
+    if (mOld != null) {
+      final s = int.parse(mOld.group(1)!);
+      final e = int.parse(mOld.group(2)!);
       return (e - s).abs() * 60;
     }
-    // Fallback: old format _MM-MM.mp4 without embedded part number
-    final m2 = RegExp(r'_(\d{2})-(\d{2})\.mp4\$').firstMatch(name);
-    if (m2 != null) {
-      return (int.parse(m2.group(2)!) - int.parse(m2.group(1)!)) * 60;
+
+    // OLD format v1: _MM-MM.mp4  e.g. _00-02.mp4 → (02-00)*60
+    final mV1 = RegExp(r'_(\d{2})-(\d{2})\.mp4$').firstMatch(name);
+    if (mV1 != null) {
+      return (int.parse(mV1.group(2)!) - int.parse(mV1.group(1)!)).abs() * 60;
     }
     return 0;
   }
 
+  /// Parse part number from OneDrive filename.
+  /// Supports both formats:
+  ///   NEW: AOO7BQ_20260508_P01_S103045_E103210_165s.mp4  → 1
+  ///   OLD: 3VCWW6_20260506_015642_0100-02.mp4            → 1
   static int _parsePartNumber(String name) {
-    // Format: _NNMM-MM.mp4 where NN = part number (2 digits)
-    final m = RegExp(r'_(\d{2})\d{2}-\d{2}\.mp4\$').firstMatch(name);
-    if (m == null) return 1;
-    return int.parse(m.group(1)!);
+    // NEW format: _PNN_  e.g. _P01_
+    final mNew = RegExp(r'_P(\d{2})_').firstMatch(name);
+    if (mNew != null) return int.parse(mNew.group(1)!);
+
+    // OLD format: _NNMM-MM.mp4  — NN is first 2 digits of the 4-digit block
+    final mOld = RegExp(r'_(\d{2})\d{2}-\d{2}\.mp4$').firstMatch(name);
+    if (mOld != null) return int.parse(mOld.group(1)!);
+
+    return 1;
   }
 
   // ── Sync deletions — remove Firestore docs for sessions deleted from OD ──
@@ -253,29 +336,25 @@ class FirestoreCacheService {
     final col = _sessions;
     if (col == null) return Stream.value(const DashMetrics(totalSecs: 0, sessionCount: 0));
 
-    // Build list of date folders in the range
-    final folders = <String>[];
-    var cur = DateTime(from.year, from.month, from.day);
-    final end = DateTime(to.year, to.month, to.day);
-    while (!cur.isAfter(end)) {
-      folders.add(DateFormat('dd-MM-yyyy').format(cur));
-      cur = cur.add(const Duration(days: 1));
-    }
-
-    if (folders.isEmpty) return Stream.value(const DashMetrics(totalSecs: 0, sessionCount: 0));
-
-    // Firestore 'whereIn' supports max 30 items
-    final limited = folders.take(30).toList();
+    // Use sessionStartMs range query — no 30-item limit like whereIn
+    // from = start of first day, to = end of last day
+    final fromMs = DateTime(from.year, from.month, from.day)
+        .millisecondsSinceEpoch;
+    final toMs   = DateTime(to.year, to.month, to.day, 23, 59, 59)
+        .millisecondsSinceEpoch;
 
     return col
-        .where('dateFolder', whereIn: limited)
+        .where('sessionStartMs', isGreaterThanOrEqualTo: fromMs)
+        .where('sessionStartMs', isLessThanOrEqualTo: toMs)
         .snapshots()
         .map((snap) {
-          int totalSecs = 0;
+          int totalSecs    = 0;
+          int sessionCount = 0;
           for (final doc in snap.docs) {
-            totalSecs += (doc.data()['totalSecs'] as num? ?? 0).toInt();
+            totalSecs    += (doc.data()['totalSecs'] as num? ?? 0).toInt();
+            sessionCount++;
           }
-          return DashMetrics(totalSecs: totalSecs, sessionCount: snap.docs.length);
+          return DashMetrics(totalSecs: totalSecs, sessionCount: sessionCount);
         })
         .handleError((e) {
           debugPrint('=== Firestore range stream error: $e');
@@ -317,7 +396,9 @@ class FirestoreCacheService {
             'totalBytes':     chunkSizeBytes,
             'parts':          [partNumber],
             'partDurations':  {'$partNumber': chunkDurationSecs},
-            'status':         'synced', // written only after OD confirms
+            // 'uploading' = partial session, still has chunks pending
+            // 'synced'    = all chunks confirmed on cloud storage
+            'status':         'uploading',
             'updatedAt':      FieldValue.serverTimestamp(),
           });
         } else {
@@ -337,15 +418,14 @@ class FirestoreCacheService {
               'totalBytes':     FieldValue.increment(chunkSizeBytes),
               'parts':          parts,
               'partDurations':  durations,
-              'status':         'synced',
+              // Keep 'uploading' — caller (_writeChunkToFirestore) sets
+              // 'synced' only after isSessionFullyDone check passes
+              'status':         'uploading',
               'updatedAt':      FieldValue.serverTimestamp(),
             });
           } else {
-            // Already recorded — just ensure synced status
-            tx.update(ref, {
-              'status':    'synced',
-              'updatedAt': FieldValue.serverTimestamp(),
-            });
+            // Part already recorded — no status change needed
+            tx.update(ref, { 'updatedAt': FieldValue.serverTimestamp() });
           }
         }
       });

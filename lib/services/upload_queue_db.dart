@@ -70,6 +70,18 @@ class UploadQueueDb {
     debugPrint('=== DB insert: ${row['chunk_id']}');
   }
 
+  // ── Update local file path (when file moved to alternate location) ─────────
+  Future<void> updateFilePath(String chunkId, String newPath) async {
+    final d = await db;
+    await d.update(
+      'upload_queue',
+      {'local_file_path': newPath, 'chunk_id': newPath,
+       'updated_at': DateTime.now().millisecondsSinceEpoch},
+      where: 'chunk_id = ?', whereArgs: [chunkId],
+    );
+    debugPrint('=== DB: updated file path for $chunkId → $newPath');
+  }
+
   // ── Update status ───────────────────────────────────────────────────────────
   Future<void> updateStatus(String chunkId, String status) async {
     final d = await db;
@@ -123,15 +135,19 @@ class UploadQueueDb {
   }
 
   // ── Reset any 'uploading' → 'pending' on app start ──────────────────────────
-  // If app was killed mid-upload, row would be stuck at 'uploading'
-  Future<void> resetStuckUploading() async {
+  // Keeps bytes_uploaded and upload_session_url for resume capability.
+  Future<void> resetStuckUploadingKeepProgress() async {
     final d = await db;
     final count = await d.rawUpdate(
-      "UPDATE upload_queue SET status = 'pending', bytes_uploaded = 0, "
-      "upload_session_url = NULL, updated_at = ? WHERE status = 'uploading'",
+      "UPDATE upload_queue SET status = 'pending', updated_at = ? "      "WHERE status = 'uploading'",
       [DateTime.now().millisecondsSinceEpoch],
     );
-    if (count > 0) debugPrint('=== DB reset $count stuck uploading → pending');
+    if (count > 0) debugPrint('=== DB reset $count stuck → pending (keeping progress)');
+  }
+
+  // Legacy version that resets progress (keep for compatibility)
+  Future<void> resetStuckUploading() async {
+    await resetStuckUploadingKeepProgress();
   }
 
   // ── Fetch all pending chunks ordered by session + part ──────────────────────
@@ -141,6 +157,23 @@ class UploadQueueDb {
       'upload_queue',
       where: "status = 'pending'",
       orderBy: 'session_date_ms ASC, session_id ASC, part_number ASC',
+    );
+  }
+
+  // ── Fetch every chunk in the DB (any status, any session) ──────────────
+  Future<List<Map<String, dynamic>>> getAllChunks() async {
+    final d = await db;
+    return d.query('upload_queue', orderBy: 'created_at ASC');
+  }
+
+  // ── Fetch all chunks for a session (any status) ──────────────────────────
+  Future<List<Map<String, dynamic>>> getSessionChunks(String sessionId) async {
+    final d = await db;
+    return d.query(
+      'upload_queue',
+      where: 'session_id = ?',
+      whereArgs: [sessionId],
+      orderBy: 'part_number ASC',
     );
   }
 
