@@ -758,49 +758,64 @@ class ChunkUploadQueue {
     }
 
     if (uploadSuccess) {
-      // ── Success: verify SQLite status before writing Firestore ─────────
-      // If WorkManager already marked this done and wrote Firestore, skip.
-      bool wmAlreadyWrote = false;
-      try {
-        final rows = await UploadQueueDb.instance.db.then(
-            (db) => db.query('upload_queue',
-                columns: ['status'],
-                where: 'chunk_id = ?', whereArgs: [next?.filePath], limit: 1));
-        wmAlreadyWrote = rows.isNotEmpty &&
-            (rows.first['status'] as String?) == 'done';
-      } catch (_) {}
-
-      // File is kept locally — user deletes manually from history screen
-      // await _deleteFiles(next); ← intentionally disabled
-      _states.remove(next.filePath);
-      _queue.remove(next);
-      _emit();
-      debugPrint('=== Queue: ${next.cloudFileName} done ✓ (wmWrote=$wmAlreadyWrote)');
+      // Mark SQLite done
+      await UploadQueueDb.instance.markDone(next.filePath);
       _currentSpeedBps = 0; _speedWindowBytes = 0; _speedWindowStart = 0;
-      // Auto-clear global hold if no more failed chunks remain
+
+      // ── KEEP chunk in _states as done — tile stays visible with ✓ ──────
+      // Only remove when the WHOLE session is confirmed done.
+      final doneState = _states[next.filePath];
+      if (doneState != null) {
+        doneState.status   = ChunkStatus.done;
+        doneState.progress = 1.0;
+        doneState.message  = 'Uploaded ✓';
+      }
       if (_globalHold && _states.values.every(
           (s) => s.status != ChunkStatus.failed)) {
         _globalHold = false;
       }
-      UploadQueueDb.instance.markDone(next.filePath).ignore();
+      _emit(); // re-render — chunk tile turns green with ✓
 
-      // Session-wise Firestore update: only write when ALL chunks of the session are done
-      // This prevents partial session showing in Uploaded Sessions section
-      if (!wmAlreadyWrote) {
-        final sessionDone = await UploadQueueDb.instance
-            .isSessionFullyDone(next.sessionId)
-            .timeout(const Duration(seconds: 5), onTimeout: () => false);
-        if (sessionDone) {
-          debugPrint('=== Queue: session ${next.sessionId} complete — writing to Firestore');
-          _writeChunkToFirestore(next).ignore();
-        } else {
-          debugPrint('=== Queue: chunk ${next.partNumber} done, session ${next.sessionId} still has pending chunks');
+      debugPrint('=== Queue: ${next.cloudFileName} done ✓');
+
+      // Check if WM already wrote Firestore for this session
+      bool wmAlreadyWrote = false;
+      try {
+        final col = FirestoreCacheService().sessionsCollection;
+        if (col != null) {
+          final doc = await col.doc(next.sessionId).get();
+          wmAlreadyWrote = doc.exists &&
+              (doc.data()?['status'] as String?) == 'synced';
         }
+      } catch (_) {}
+
+      // Session-wise: check if ALL chunks are now done
+      final sessionDone = await UploadQueueDb.instance
+          .isSessionFullyDone(next.sessionId)
+          .timeout(const Duration(seconds: 5), onTimeout: () => false);
+
+      if (sessionDone) {
+        // Write Firestore once — this makes session appear in Uploaded Sessions
+        if (!wmAlreadyWrote) {
+          debugPrint('=== Queue: session ${next.sessionId} all done → Firestore');
+          await _writeChunkToFirestore(next);
+        }
+        // NOW remove ALL chunks of this session from UI
+        final sid = next.sessionId;
+        _states.removeWhere((_, s) => s.chunk.sessionId == sid);
+        _queue.removeWhere((c) => c.sessionId == sid);
+        _emit(); // session disappears from Pending, appears in Uploaded
+        debugPrint('=== Queue: session $sid cleared from Pending Uploads');
+      } else {
+        debugPrint('=== Queue: chunk ${next.partNumber} done — '
+            'session ${next.sessionId} still has more chunks');
       }
 
       _running = false;
-      final hasMore = _states.values.any((s) => s.status == ChunkStatus.queued);
-      if (!hasMore) UploadForegroundService.stop().ignore();
+      if (_states.values.every((s) =>
+          s.status == ChunkStatus.done || s.status == ChunkStatus.failed)) {
+        UploadForegroundService.stop().ignore();
+      }
       if (_canUpload) _processNext();
       return;
 

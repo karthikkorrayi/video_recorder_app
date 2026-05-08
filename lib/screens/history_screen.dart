@@ -462,43 +462,83 @@ class _HistoryScreenState extends State<HistoryScreen> {
   }
 
   Widget _buildRectBar(ChunkState cs) {
+    final isDone      = cs.status == ChunkStatus.done;
     final isUploading = cs.status == ChunkStatus.uploading;
     final isFailed    = cs.status == ChunkStatus.failed;
     final isOnHold    = cs.status == ChunkStatus.queued &&
         cs.message == 'On hold — waiting for failed chunk';
-    final fill = isUploading ? _blue
-        : isFailed ? _red
-        : isOnHold ? _orange
+
+    // Colour logic
+    final Color fill = isDone      ? _green
+        : isUploading              ? _blue
+        : isFailed                 ? _red
+        : isOnHold                 ? _orange
         : const Color(0xFFBBBBBB);
-    final pct  = isUploading ? cs.progress.clamp(0.0, 1.0) : 0.0;
-    // All chunks are tappable — shows preview with play/delete/retry options
+
+    // Fill fraction: done = 100%, uploading = live progress, others = 0
+    final double pct = isDone      ? 1.0
+        : isUploading              ? cs.progress.clamp(0.0, 1.0)
+        : 0.0;
+
     final canTap = cs.chunk.hasAnyFile;
 
     return GestureDetector(
       onTap: canTap ? () => _showChunkPopup(cs) : null,
-      child: SizedBox(width: 48, height: 32,
+      child: SizedBox(width: 52, height: 38,
       child: Stack(children: [
-        Container(decoration: BoxDecoration(
-            color: Colors.grey[200],
-            borderRadius: BorderRadius.circular(7),
-            border: Border.all(color: fill.withValues(alpha: 0.5)))),
-        if (pct > 0) FractionallySizedBox(widthFactor: pct,
-          child: Container(decoration: BoxDecoration(
-              color: fill.withValues(alpha: 0.85),
-              borderRadius: BorderRadius.circular(7)))),
-        Center(child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
+        // ── Background ───────────────────────────────────────────────────
+        Container(
+          decoration: BoxDecoration(
+            color: isDone ? _green.withValues(alpha: 0.1) : Colors.grey[100],
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: fill.withValues(alpha: isDone ? 1.0 : 0.45),
+              width: isDone ? 1.5 : 1.0,
+            ),
+          ),
+        ),
+        // ── Blue/fill progress bar (uploading only) ───────────────────
+        if (!isDone && pct > 0)
+          FractionallySizedBox(
+            widthFactor: pct,
+            child: Container(
+              decoration: BoxDecoration(
+                color: fill.withValues(alpha: 0.85),
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+          ),
+        // ── Label ────────────────────────────────────────────────────────
+        Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
-          Text('P${cs.chunk.partNumber}', style: TextStyle(
-              fontSize: 9, fontWeight: FontWeight.bold,
-              color: pct > 0.5 ? Colors.white : fill)),
-          if (isUploading && cs.progress > 0)
-            Text('${(cs.progress * 100).toStringAsFixed(0)}%',
-                style: TextStyle(fontSize: 7,
-                    color: pct > 0.5 ? Colors.white : _blue)),
-          if (isOnHold) const Icon(Icons.pause, size: 8, color: _orange),
-          if (!canTap) const Icon(Icons.cloud_done, size: 8, color: _grey),
-        ])),
+              if (isDone) ...[
+                // Solid green tile: tick on top, part number below
+                const Icon(Icons.check_circle, size: 13, color: _green),
+                const SizedBox(height: 1),
+                Text('P${cs.chunk.partNumber}',
+                    style: const TextStyle(
+                        fontSize: 8,
+                        fontWeight: FontWeight.w700,
+                        color: _green)),
+              ] else ...[
+                Text('P${cs.chunk.partNumber}',
+                    style: TextStyle(
+                        fontSize: 9,
+                        fontWeight: FontWeight.bold,
+                        color: pct > 0.5 ? Colors.white : fill)),
+                if (isUploading && pct > 0)
+                  Text('${(pct * 100).toStringAsFixed(0)}%',
+                      style: TextStyle(
+                          fontSize: 7,
+                          color: pct > 0.5 ? Colors.white : _blue)),
+                if (isOnHold)
+                  const Icon(Icons.pause, size: 8, color: _orange),
+              ],
+            ],
+          ),
+        ),
       ]),
       ),
     );

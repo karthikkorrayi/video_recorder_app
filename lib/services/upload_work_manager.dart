@@ -103,10 +103,13 @@ void callbackDispatcher() {
           if (alreadyDone) {
             debugPrint('=== WorkManager: $fileName already on OD');
             await db.markDone(chunkId);
-            // File kept locally — user deletes manually from history screen
             anyUploaded = true;
-            await _writeFirestore(row, sessionId, dateFolder, userFolder,
-                sessionFolder, startSec, endSec, sessionStartMs);
+            // Only write Firestore when ALL chunks of session are done
+            final sessionDone = await db.isSessionFullyDone(sessionId);
+            if (sessionDone) {
+              await _writeFirestore(row, sessionId, dateFolder, userFolder,
+                  sessionFolder, startSec, endSec, sessionStartMs);
+            }
             continue;
           }
 
