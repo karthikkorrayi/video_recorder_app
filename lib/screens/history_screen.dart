@@ -81,11 +81,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
     if (!_hasNet) return;
     setState(() { _syncing = true; _refreshing = true; });
     try {
-      // Full re-scan: re-reads all sessions from OneDrive → updates Firestore
-      await FirestoreCacheService().forceRefreshFromOneDrive();
-      // Mark sync timestamp so "Just now" label updates
       await _cache.syncNow();
-      // Force fresh Firestore snapshot
       if (mounted) setState(() { _streamKey++; });
     } finally {
       if (mounted) setState(() { _syncing = false; _refreshing = false; });
@@ -638,14 +634,27 @@ class _HistoryScreenState extends State<HistoryScreen> {
                 '  ·  $dur',
                 style: TextStyle(color: Colors.grey[500], fontSize: 11)),
           ])),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-            decoration: BoxDecoration(
-                color: const Color(0xFFE8F5E9),
-                borderRadius: BorderRadius.circular(8)),
-            child: const Text('Synced ✓', style: TextStyle(
-                color: _green, fontSize: 10,
-                fontWeight: FontWeight.w600))),
+          Builder(builder: (_) {
+            final isSynced = s.status == 'synced';
+            return Container(
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+              decoration: BoxDecoration(
+                  color: isSynced
+                      ? const Color(0xFFE8F5E9)
+                      : Colors.blue.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                      color: isSynced
+                          ? _green.withValues(alpha: 0.3)
+                          : Colors.blue.withValues(alpha: 0.3))),
+              child: Text(
+                isSynced ? 'Synced ✓' : 'Uploading...',
+                style: TextStyle(
+                    color: isSynced ? _green : Colors.blue,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600)),
+            );
+          }),
         ]),
       ),
     );

@@ -55,6 +55,17 @@ class FirestoreCacheService {
 
       debugPrint('=== Firestore backfill: found ${files.length} files');
 
+      // Fix 1: Pre-load sessions that still have active (non-done) chunks in
+      // the local SQLite queue. These are mid-upload sessions — we must NOT
+      // mark them 'synced' even if some chunks are already on OneDrive.
+      final activeRows = await UploadQueueDb.instance.getActive();
+      final activeSessionIds = activeRows
+          .map((r) => r['session_id'] as String? ?? '')
+          .where((s) => s.isNotEmpty)
+          .toSet();
+      debugPrint('=== Firestore backfill: ${activeSessionIds.length} sessions '
+          'still uploading — will stay as "uploading" in Firestore');
+
       // Group by sessionFolder
       final sessionMap = <String, List<Map<String, dynamic>>>{};
       for (final f in files) {
@@ -87,6 +98,12 @@ class FirestoreCacheService {
 
         // Check if doc already exists — always UPDATE with fresh OD data
         final existing = await col.doc(sessionId).get();
+        // Fix 1: Only mark 'synced' if session has no active chunks in the
+        // local upload queue. Mid-upload sessions stay 'uploading' so they
+        // don't appear in the Uploaded section prematurely.
+        final isStillUploading = activeSessionIds.contains(sessionId);
+        final statusForExisting = isStillUploading ? 'uploading' : 'synced';
+
         if (existing.exists) {
           final data = existing.data()!;
           // Only overwrite with OD data if it has more/equal chunks than Firestore
@@ -98,7 +115,7 @@ class FirestoreCacheService {
               'totalSecs':      totalSecs,
               'totalBytes':     totalBytes,
               'parts':          partNums,
-              'status':         'synced',
+              'status':         statusForExisting, // Fix 1
               'updatedAt':      FieldValue.serverTimestamp(),
               'backfilled':     true,
             });
@@ -120,7 +137,7 @@ class FirestoreCacheService {
               'totalSecs':      totalSecs,
               'totalBytes':     totalBytes,
               'parts':          partNums,
-              'status':         'synced',
+              'status':         statusForExisting, // Fix 1
               'updatedAt':      FieldValue.serverTimestamp(),
               'backfilled':     true,
             });
@@ -153,7 +170,9 @@ class FirestoreCacheService {
           'totalSecs':      totalSecs,
           'totalBytes':     totalBytes,
           'parts':          partNums,
-          'status':         'synced',
+          // Fix 1: respect active upload queue — new docs from a partial
+          // OneDrive scan must not be written as 'synced' yet.
+          'status':         isStillUploading ? 'uploading' : 'synced',
           'updatedAt':      FieldValue.serverTimestamp(),
           'backfilled':     true,
         });

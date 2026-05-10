@@ -12,6 +12,7 @@ import 'firestore_cache_service.dart';
 import 'notification_service.dart';
 import 'upload_foreground_service.dart';
 import 'user_service.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 
 // ─── Duration formatter ────────────────────────────────────────────────────────
@@ -865,13 +866,16 @@ class ChunkUploadQueue {
       final userFolder = await UserService().getDisplayName();
       final dateFolder = DateFormat('dd-MM-yyyy').format(chunk.sessionDate);
 
-      // Use only DONE chunks for accurate totals
+      // Count only rows with status='done' in SQLite for accurate totals.
+      // Failed/pending chunks are NOT counted — they may retry and upload later.
       final allRows  = await UploadQueueDb.instance.db.then((db) =>
           db.query('upload_queue',
               where: 'session_id = ?', whereArgs: [chunk.sessionId]));
       final doneRows = allRows
           .where((r) => (r['status'] as String?) == 'done')
           .toList();
+
+      if (doneRows.isEmpty) return; // nothing to write yet
 
       int totalSecs  = 0;
       final parts    = <int>[];
@@ -883,20 +887,31 @@ class ChunkUploadQueue {
       }
       parts.sort();
 
-      // Single atomic write — doc goes from nonexistent → status:'synced'
-      // This is the ONLY moment this session appears in Uploaded Sessions
-      await FirestoreCacheService().writeFullSession(
-        sessionId:      chunk.sessionId,
-        dateFolder:     dateFolder,
-        userFolder:     userFolder,
-        sessionFolder:  chunk.sessionFolderName,
-        sessionStartMs: chunk.sessionStartTime.millisecondsSinceEpoch,
-        chunksUploaded: doneRows.length,
-        totalSecs:      totalSecs,
-        parts:          parts,
-      );
-      debugPrint('=== Firestore: session \${chunk.sessionId} → synced ✓ '
-          '(\${doneRows.length} chunks, \${totalSecs}s)');
+      // Check if ALL chunks of this session are done
+      final allDone = allRows.length == doneRows.length &&
+          allRows.isNotEmpty;
+
+      // Use merge:true so we only update the fields we know —
+      // avoids overwriting data from a concurrent WM write
+      final col = FirestoreCacheService().sessionsCollection;
+      if (col == null) return;
+      await col.doc(chunk.sessionId).set({
+        'sessionId':      chunk.sessionId,
+        'dateFolder':     dateFolder,
+        'userFolder':     userFolder,
+        'sessionFolder':  chunk.sessionFolderName,
+        'sessionStartMs': chunk.sessionStartTime.millisecondsSinceEpoch,
+        'chunksUploaded': doneRows.length,
+        'totalSecs':      totalSecs,
+        'parts':          parts,
+        // 'uploading' = some chunks still pending; 'synced' = all done
+        'status':         allDone ? 'synced' : 'uploading',
+        'updatedAt':      FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+
+      debugPrint('=== Firestore: \${chunk.sessionId} updated — '
+          '\${doneRows.length}/\${allRows.length} chunks, '
+          '\${totalSecs}s, status=\${allDone ? "synced" : "uploading"}');
 
       AttendanceAutoSync().scheduleUpdate(dateFolder);
     } catch (e, st) {
