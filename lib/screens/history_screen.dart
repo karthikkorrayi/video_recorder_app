@@ -344,26 +344,38 @@ class _HistoryScreenState extends State<HistoryScreen> {
       builder: (_, __) {
         final speed     = _queue.uploadSpeedLabel;
         final uploading = _queue.isUploading;
-        final color     = uploading ? _blue : _grey;
+        // Always show as active (green) — it's a live network metric,
+        // not an upload-active indicator. Blue only while actively uploading.
+        final hasReading = speed != 'Measuring...' && speed != 'No network';
+        final color = uploading ? _blue : hasReading ? _green : _grey;
+        final bgColor = uploading
+            ? _blue.withValues(alpha: 0.06)
+            : hasReading
+                ? _green.withValues(alpha: 0.04)
+                : const Color(0xFFF8F8F8);
+        final borderColor = uploading
+            ? _blue.withValues(alpha: 0.3)
+            : hasReading
+                ? _green.withValues(alpha: 0.25)
+                : _border;
         return Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
           decoration: BoxDecoration(
-              color: uploading
-                  ? _blue.withValues(alpha: 0.06)
-                  : const Color(0xFFF8F8F8),
+              color: bgColor,
               borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: uploading
-                  ? _blue.withValues(alpha: 0.3) : _border)),
+              border: Border.all(color: borderColor)),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(children: [
               Icon(Icons.speed_outlined, color: color, size: 18),
+              // Spinner only while actively uploading (not just measuring)
               if (uploading) ...[const SizedBox(width: 6),
                 SizedBox(width: 8, height: 8,
                   child: CircularProgressIndicator(
                       strokeWidth: 1.5, color: _blue))],
             ]),
             const SizedBox(height: 6),
-            Text('Upload Speed',
+            // Label changes based on state
+            Text(uploading ? 'Upload Speed' : 'Network Speed',
                 style: TextStyle(color: Colors.grey[500], fontSize: 11)),
             Text(speed, style: TextStyle(
                 color: color, fontWeight: FontWeight.bold, fontSize: 14)),

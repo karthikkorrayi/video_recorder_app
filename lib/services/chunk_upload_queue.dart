@@ -14,6 +14,7 @@ import 'upload_foreground_service.dart';
 import 'user_service.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
+import 'package:http/http.dart' as http;
 
 // ─── Duration formatter ────────────────────────────────────────────────────────
 String fmtDuration(int totalSecs) {
@@ -54,7 +55,24 @@ class PendingChunk {
     required this.endSec,
   });
 
-  int get durationSecs => (endSec - startSec).clamp(0, 7200);
+  int get durationSecs {
+    final raw = endSec - startSec;
+    if (raw > 0) return raw.clamp(0, 7200);
+    // Fallback: parse duration from the cloud filename suffix (_NNNs.mp4).
+    // This covers recovered/orphaned chunks where startSec/endSec are both 0
+    // because the filename could not be fully parsed at recovery time.
+    final m = RegExp(r'_(\d+)s\.mp4$').firstMatch(cloudFileName);
+    if (m != null) {
+      final parsed = int.tryParse(m.group(1)!);
+      if (parsed != null && parsed > 0) return parsed.clamp(0, 7200);
+    }
+    // Last resort: derive from actual file size (assume ~500KB/s for 1080p)
+    try {
+      final bytes = File(bestFilePath).lengthSync();
+      if (bytes > 0) return (bytes / (500 * 1024)).round().clamp(1, 7200);
+    } catch (_) {}
+    return 0;
+  }
   int get startMin     => startSec ~/ 60;
   int get endMin       => (endSec + 59) ~/ 60;
 
@@ -136,16 +154,25 @@ class ChunkUploadQueue {
   bool _allowMetered  = false;
   bool _globalHold    = false;
 
-  // Real-time upload speed tracking
+  // Real-time upload speed tracking (upload-based, bytes per second)
   int    _speedWindowBytes = 0;
   int    _speedWindowStart = 0;
   double _currentSpeedBps  = 0;
 
+  // Independent real-time network speed probe
+  // Runs every 3s regardless of whether an upload is active.
+  // Measures actual download throughput by fetching a small CDN payload.
+  Timer?  _netProbeTimer;
+  double  _netProbeBps   = 0;   // latest probe result in bytes/sec
+  bool    _probeRunning  = false;
+
   final _ctrl = StreamController<List<ChunkState>>.broadcast();
   Stream<List<ChunkState>> get stream => _ctrl.stream;
 
-  List<ChunkState> get current => _states.values
-      .where((s) => s.status != ChunkStatus.done).toList()
+  // ALL chunks (including done) — so done chunks stay visible in the UI
+  // as green tiles until the ENTIRE session is confirmed and removed at once.
+  // Previously filtered out done chunks which caused them to disappear mid-session.
+  List<ChunkState> get current => _states.values.toList()
       ..sort((a, b) {
         final sid = a.chunk.sessionId.compareTo(b.chunk.sessionId);
         return sid != 0 ? sid : a.chunk.partNumber.compareTo(b.chunk.partNumber);
@@ -235,20 +262,32 @@ class ChunkUploadQueue {
   Set<String> get pendingSessionIds =>
       _states.values.map((s) => s.chunk.sessionId).toSet();
 
+  // Returns the best available speed reading at any moment:
+  //   • While uploading: live measured upload throughput (byte-counted)
+  //   • Between chunks / idle: last measured network probe speed
+  // This means the widget ALWAYS shows a meaningful number — it is a
+  // real-time network metric, not an "upload is happening" indicator.
   String get uploadSpeedLabel {
-    if (isUploading) {
-      if (_currentSpeedBps <= 0) return 'Starting...';
-      if (_currentSpeedBps >= 1024 * 1024) {
-        return '${(_currentSpeedBps / 1024 / 1024).toStringAsFixed(1)} MB/s';
-      }
-      if (_currentSpeedBps >= 1024) {
-        return '${(_currentSpeedBps / 1024).toStringAsFixed(0)} KB/s';
-      }
-      return '${_currentSpeedBps.toStringAsFixed(0)} B/s';
+    // Prefer live upload measurement while actively uploading
+    if (isUploading && _currentSpeedBps > 0) {
+      return _formatBps(_currentSpeedBps);
     }
-    if (_running) return 'Uploading...';
-    return 'Idle';
+    // Use network probe speed (available even when idle)
+    if (_netProbeBps > 0) return _formatBps(_netProbeBps);
+    // Fallback labels
+    if (!_hasNetwork) return 'No network';
+    if (isUploading)  return 'Measuring...';
+    return 'Measuring...';
   }
+
+  static String _formatBps(double bps) {
+    if (bps >= 1024 * 1024) return '${(bps / 1024 / 1024).toStringAsFixed(1)} MB/s';
+    if (bps >= 1024)        return '${(bps / 1024).toStringAsFixed(0)} KB/s';
+    return '${bps.toStringAsFixed(0)} B/s';
+  }
+
+  // Always true — speed widget shows network quality at all times
+  bool get isShowingSpeed => _netProbeBps > 0 || isUploading;
 
   int get pendingSecs => _states.values
       .where((s) => s.status != ChunkStatus.done)
@@ -333,11 +372,57 @@ class ChunkUploadQueue {
     await prefs.setBool(_meteredPrefKey, value);
   }
 
+  // ── Real-time network speed probe ────────────────────────────────────────
+  // Fetches a ~100KB payload from Cloudflare's CDN every 3 seconds.
+  // This is independent of upload state — gives a live network quality
+  // reading even when no upload is happening.
+  // Probe URL is intentionally a no-auth static asset so it works globally.
+  static const _probeUrl =
+      'https://speed.cloudflare.com/__down?bytes=102400'; // 100KB
+
+  void _startNetProbe() {
+    _netProbeTimer?.cancel();
+    _netProbeTimer = Timer.periodic(const Duration(seconds: 3), (_) => _runProbe());
+    _runProbe(); // run immediately on start
+  }
+
+  Future<void> _runProbe() async {
+    if (_probeRunning || !_hasNetwork) return;
+    _probeRunning = true;
+    try {
+      final start    = DateTime.now().millisecondsSinceEpoch;
+      final response = await http.get(Uri.parse(_probeUrl))
+          .timeout(const Duration(seconds: 6));
+      final elapsed  = DateTime.now().millisecondsSinceEpoch - start;
+      if (response.statusCode == 200 && elapsed > 0) {
+        final bytes   = response.bodyBytes.length;
+        final bps     = (bytes / elapsed) * 1000.0; // bytes per second
+        // Exponential moving average: 30% new sample, 70% history
+        // Prevents jittery readings from single-probe variance
+        _netProbeBps = _netProbeBps == 0
+            ? bps
+            : _netProbeBps * 0.7 + bps * 0.3;
+        _emit();
+      }
+    } catch (_) {
+      // Probe failed (timeout/network) — keep last known value, don't reset
+    } finally {
+      _probeRunning = false;
+    }
+  }
+
+  void _stopNetProbe() {
+    _netProbeTimer?.cancel();
+    _netProbeTimer = null;
+  }
+
   // ── Network monitor ───────────────────────────────────────────────────────
   void startNetworkMonitor({BuildContext? context}) {
     _loadPrefs();
     // Poll SQLite every 2s to sync WorkManager upload progress into UI
     Timer.periodic(const Duration(seconds: 2), (_) => _syncProgressFromDb());
+    // Start real-time network speed probe — runs independently of uploads
+    _startNetProbe();
 
     Connectivity().onConnectivityChanged.listen((results) async {
       final wasWifi = _isWifi;
@@ -674,7 +759,11 @@ class ChunkUploadQueue {
 
       if (uploadSuccess) {
         await UploadQueueDb.instance.markDone(next.filePath);
-        _currentSpeedBps = 0; _speedWindowBytes = 0; _speedWindowStart = 0;
+        // Do NOT zero speed here — carry the last measured speed forward
+        // so the UI shows the real measured speed between chunks instead
+        // of flashing "Starting..." every time a chunk boundary is crossed.
+        // Speed window is reset only when ALL uploads finish (see below).
+        _speedWindowBytes = 0; _speedWindowStart = 0; // reset window only, keep _currentSpeedBps
 
         final doneState = _states[next.filePath];
         if (doneState != null) {
@@ -723,6 +812,8 @@ class ChunkUploadQueue {
         if (_states.values.every((s) =>
             s.status == ChunkStatus.done || s.status == ChunkStatus.failed)) {
           UploadForegroundService.stop().ignore();
+          // All uploads done — zero upload-based speed so probe takes over
+          _currentSpeedBps = 0; _speedWindowBytes = 0; _speedWindowStart = 0;
         }
         if (_canUpload) _processNext();
         return;
