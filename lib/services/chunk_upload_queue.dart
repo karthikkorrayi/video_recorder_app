@@ -38,7 +38,8 @@ class PendingChunk {
   final DateTime sessionEndTime;
   final int      startSec;
   final int      endSec;
-  String?        lastUploadUrl;
+  // No longer stored in-memory — session URL lives in SQLite only.
+  // This prevents stale in-memory URLs from being reused after expiry.
 
   PendingChunk({
     required this.filePath,
@@ -51,7 +52,6 @@ class PendingChunk {
     required this.sessionEndTime,
     required this.startSec,
     required this.endSec,
-    this.lastUploadUrl,
   });
 
   int get durationSecs => (endSec - startSec).clamp(0, 7200);
@@ -59,16 +59,13 @@ class PendingChunk {
   int get endMin       => (endSec + 59) ~/ 60;
 
   String get cloudFileName {
-    final n        = partNumber.toString().padLeft(2, '0');
-    final date     = DateFormat('yyyyMMdd').format(sessionDate);
-    // Chunk actual start/end as absolute timestamps
+    final n          = partNumber.toString().padLeft(2, '0');
+    final date       = DateFormat('yyyyMMdd').format(sessionDate);
     final chunkStart = sessionStartTime.add(Duration(seconds: startSec));
     final chunkEnd   = sessionStartTime.add(Duration(seconds: endSec));
     final sFmt = DateFormat('HHmmss').format(chunkStart);
     final eFmt = DateFormat('HHmmss').format(chunkEnd);
     final dur  = (endSec - startSec).clamp(0, 7200);
-    // Format: SESSIONID_YYYYMMDD_PNN_SHHMMSS_EHHMMSS_DURs.mp4
-    // e.g.    AOO7BQ_20260508_P01_S103045_E103210_165s.mp4
     return '${sessionId}_${date}_P$n'
         '_S${sFmt}_E${eFmt}_${dur}s.mp4';
   }
@@ -94,7 +91,7 @@ class ChunkState {
   ChunkStatus status;
   double      progress;
   String      message;
-  int         retryCount; // Issue 1: track retries
+  int         retryCount;
   DateTime?   failedAt;
 
   ChunkState(this.chunk)
@@ -111,7 +108,6 @@ class _PermanentFailure implements Exception {
 }
 
 /// Thrown when WorkManager already uploaded this chunk.
-/// Signals caller to skip its own Firestore write — prevents double-write.
 class _AlreadyDone implements Exception {}
 
 // ─── ChunkUploadQueue ─────────────────────────────────────────────────────────
@@ -120,13 +116,13 @@ class ChunkUploadQueue {
   factory ChunkUploadQueue() => _i;
   ChunkUploadQueue._();
 
-  static const _rootFolder    = 'OTN Recorder';
-  static const _wifiPrefKey   = 'upload_wifi_only';
+  static const _rootFolder     = 'OTN Recorder';
+  static const _wifiPrefKey    = 'upload_wifi_only';
   static const _meteredPrefKey = 'upload_allow_metered';
   static const _backupDirName  = 'otn_backup';
   static const _chunkDirName   = 'otn_upload_chunks';
   static const _retentionDays  = 7;
-  static const _maxRetries     = 1; // Issue 1: retry once, then hold ALL
+  static const _maxRetries     = 1;
 
   final _onedrive = OneDriveService();
   final _states   = <String, ChunkState>{};
@@ -138,14 +134,12 @@ class ChunkUploadQueue {
   bool _cellularOk    = false;
   bool _wifiPreferred = true;
   bool _allowMetered  = false;
+  bool _globalHold    = false;
 
   // Real-time upload speed tracking
-  int    _speedWindowBytes = 0;   // bytes sent in current 1s window
-  int    _speedWindowStart = 0;  // window start timestamp (ms)
-  double _currentSpeedBps  = 0; // smoothed speed in bytes/sec
-
-  // Issue 1: global hold — when true, ALL uploads stop until user taps Retry
-  bool _globalHold    = false;
+  int    _speedWindowBytes = 0;
+  int    _speedWindowStart = 0;
+  double _currentSpeedBps  = 0;
 
   final _ctrl = StreamController<List<ChunkState>>.broadcast();
   Stream<List<ChunkState>> get stream => _ctrl.stream;
@@ -162,16 +156,13 @@ class ChunkUploadQueue {
 
   void _emit() {
     _ctrl.add(current);
-    _persistDebounced();
-    _updateForegroundService(); // update notification with latest state
+    _updateForegroundService();
   }
 
-  /// Sync WorkManager upload progress from SQLite into UI state every 2s.
-  /// WorkManager runs in a separate isolate — this bridges the gap.
+  // ── DB → UI sync (WorkManager progress bridge) ────────────────────────────
   Future<void> _syncProgressFromDb() async {
     if (_states.isEmpty) return;
     try {
-      // Check ALL queue rows (including done) so we can clean up WM-finished chunks
       final allRows = await UploadQueueDb.instance.db.then(
           (db) => db.query('upload_queue',
               columns: ['local_file_path', 'bytes_uploaded', 'file_size_bytes', 'status'],
@@ -190,27 +181,20 @@ class ChunkUploadQueue {
         if (state == null) continue;
 
         if (dbStatus == 'done') {
-          debugPrint('=== Queue: DB sync: ${state.chunk.cloudFileName} done by WM');
-          // Mark as done in UI — keep tile visible until whole session finishes
           state.status   = ChunkStatus.done;
           state.progress = 1.0;
           state.message  = 'Done ✓';
-          // File kept — no auto-delete
-          // Only write Firestore + clear session UI when ALL chunks are done
           final sessionDone = await UploadQueueDb.instance
               .isSessionFullyDone(state.chunk.sessionId)
               .timeout(const Duration(seconds: 5), onTimeout: () => false);
           if (sessionDone) {
-            debugPrint('=== Queue: session ${state.chunk.sessionId} fully done (WM sync)');
             _writeChunkToFirestore(state.chunk).ignore();
-            // Remove all chunks of this session from UI at once
             final sid = state.chunk.sessionId;
             _states.removeWhere((_, s) => s.chunk.sessionId == sid);
             _queue.removeWhere((c) => c.sessionId == sid);
           }
           changed = true;
         } else if (dbStatus == 'uploading' && bytesUp > 0 && fileSize > 0) {
-          // WorkManager actively uploading — show live progress in UI
           final progress = (bytesUp / fileSize).clamp(0.0, 1.0);
           if ((progress - state.progress).abs() > 0.01) {
             state.status   = ChunkStatus.uploading;
@@ -240,16 +224,6 @@ class ChunkUploadQueue {
     ).ignore();
   }
 
-  void _persistDebounced() {
-    _persistDebounce?.cancel();
-    _persistDebounce = Timer(const Duration(seconds: 2), _persistToDisk);
-  }
-
-  void _persistToDisk() {
-    // SQLite is updated in-place per operation — nothing to batch write here.
-    // This is kept as a no-op so call sites don't need to change.
-  }
-
   // ── Metrics ──────────────────────────────────────────────────────────────
   int  get pendingCount   => _states.values.where((s) => s.status == ChunkStatus.queued).length;
   int  get uploadingCount => _states.values.where((s) => s.status == ChunkStatus.uploading).length;
@@ -258,13 +232,10 @@ class ChunkUploadQueue {
   bool get isWifi         => _isWifi;
   bool get isGlobalHold   => _globalHold;
 
-  /// Session IDs currently in the pending/uploading queue — used to hide from Uploaded Sessions
   Set<String> get pendingSessionIds =>
       _states.values.map((s) => s.chunk.sessionId).toSet();
 
-  /// Live upload speed in KB/s or MB/s (bytes-based, accurate)
   String get uploadSpeedLabel {
-    // Show speed if actively uploading in main queue
     if (isUploading) {
       if (_currentSpeedBps <= 0) return 'Starting...';
       if (_currentSpeedBps >= 1024 * 1024) {
@@ -275,36 +246,31 @@ class ChunkUploadQueue {
       }
       return '${_currentSpeedBps.toStringAsFixed(0)} B/s';
     }
-    // _running = true but no state marked uploading = WM running in background
     if (_running) return 'Uploading...';
     return 'Idle';
   }
-  int  get pendingSecs    => _states.values
+
+  int get pendingSecs => _states.values
       .where((s) => s.status != ChunkStatus.done)
       .fold(0, (sum, s) {
         if (s.status == ChunkStatus.uploading) {
-          // For uploading chunks, subtract already-uploaded portion
           final remaining = (s.chunk.durationSecs * (1.0 - s.progress)).round();
           return sum + remaining;
         }
         return sum + s.chunk.durationSecs;
       });
 
-  /// Number of unique sessions with any pending/uploading/failed chunks.
   int get pendingSessionCount => _states.values
       .where((s) => s.status != ChunkStatus.done)
       .map((s) => s.chunk.sessionId)
       .toSet()
       .length;
 
-  /// Total seconds actively uploading right now (for real-time progress).
   int get uploadingProgressSecs => _states.values
       .where((s) => s.status == ChunkStatus.uploading)
       .fold(0, (sum, s) =>
           sum + (s.chunk.durationSecs * s.progress.clamp(0.0, 1.0)).round());
 
-  // ── Session grouping for Issue 3 ─────────────────────────────────────────
-  /// Groups current non-done chunks by sessionId, sorted by session then part.
   Map<String, List<ChunkState>> get groupedBySesion {
     final map = <String, List<ChunkState>>{};
     for (final s in current) {
@@ -316,11 +282,9 @@ class ChunkUploadQueue {
     return map;
   }
 
-  // ── Backup helpers ────────────────────────────────────────────────────────
-  // CRITICAL: Use Android/media persistent path — NOT getTemporaryDirectory().
-  // Temp/cache is wiped by Android overnight or on low storage.
-  // Android/media/<pkg>/ is persistent and survives until app uninstall.
-  static const _persistentBase = '/storage/emulated/0/Android/media/com.otn.videorecorder/OTN';
+  // ── Persistent base path ──────────────────────────────────────────────────
+  static const _persistentBase =
+      '/storage/emulated/0/Android/media/com.otn.videorecorder/OTN';
 
   static Future<Directory> _backupDir() async {
     final dir = Directory('$_persistentBase/$_backupDirName');
@@ -334,17 +298,9 @@ class ChunkUploadQueue {
     return dir;
   }
 
-  static Future<String> _ensureBackup(String filePath) async {
-    // The structured backup path IS the file path — camera_screen already
-    // moved the chunk to the structured folder before enqueue.
-    // This method is kept for recovery path compatibility only.
-    return filePath;
-  }
+  static Future<String> _ensureBackup(String filePath) async => filePath;
 
-  // ── Verified delete — only removes local file after OneDrive confirms ─────
-  // Called after fileExistsAndComplete() returns true.
   static Future<void> _deleteFiles(PendingChunk chunk) async {
-    // filePath and backupPath are the same structured path — delete once
     final paths = {chunk.filePath, chunk.backupPath};
     for (final path in paths) {
       try {
@@ -355,7 +311,6 @@ class ChunkUploadQueue {
         }
       } catch (e) {
         debugPrint('=== LocalBackup: delete failed for $path — $e');
-        // Non-fatal: file stays as backup, user can manually remove
       }
     }
   }
@@ -365,7 +320,6 @@ class ChunkUploadQueue {
     final prefs    = await SharedPreferences.getInstance();
     _wifiPreferred = prefs.getBool(_wifiPrefKey) ?? true;
     _allowMetered  = prefs.getBool(_meteredPrefKey) ?? false;
-    // Fix: after loading prefs, attempt upload if conditions now met
     if (_canUpload && _states.values.any(
         (s) => s.status == ChunkStatus.queued)) {
       _processNext();
@@ -381,10 +335,10 @@ class ChunkUploadQueue {
 
   // ── Network monitor ───────────────────────────────────────────────────────
   void startNetworkMonitor({BuildContext? context}) {
-    _loadPrefs(); // async — prefs available shortly after
+    _loadPrefs();
     // Poll SQLite every 2s to sync WorkManager upload progress into UI
-    // WorkManager runs in a separate isolate — progress only visible via DB
     Timer.periodic(const Duration(seconds: 2), (_) => _syncProgressFromDb());
+
     Connectivity().onConnectivityChanged.listen((results) async {
       final wasWifi = _isWifi;
       final result  = results.isNotEmpty ? results.first : ConnectivityResult.none;
@@ -392,16 +346,13 @@ class ChunkUploadQueue {
       _hasNetwork = result != ConnectivityResult.none;
 
       if (!_hasNetwork) {
-        // Network lost — pause and notify user
         _updateAllQueued('Waiting for network...');
         _emit();
         return;
       }
 
-      // Network came back — show alert if on cellular and toggle is off
       if (!_isWifi && !_allowMetered) {
-        // Show snackbar alert — do NOT auto-upload on cellular without consent
-        _emit(); // update UI to show network state
+        _emit();
         if (context != null && context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
             content: const Row(children: [
@@ -423,15 +374,15 @@ class ChunkUploadQueue {
             ),
           ));
         }
-        return; // Do NOT start upload — wait for user to enable toggle
+        return;
       }
 
-      // WiFi connected or cellular is allowed — resume/start uploads
       if (wasWifi == false && _isWifi) {
-        debugPrint('=== Queue: WiFi reconnected — resuming uploads');
+        debugPrint('=== Queue: WiFi reconnected — forcing WM reschedule');
+        // REPLACE so upload starts immediately on new connection
+        await UploadWorkManager.scheduleUploadForced();
       }
-      // Watchdog: if _running is stuck (upload threw before finally ran),
-      // give it 3s then force-clear so uploads can resume
+
       if (_running) {
         Future.delayed(const Duration(seconds: 3), () {
           if (_running && !isUploading) {
@@ -450,7 +401,7 @@ class ChunkUploadQueue {
   bool get _canUpload =>
       _hasNetwork && (_isWifi || _allowMetered) && !_globalHold;
 
-  // ── Issue 1: Metered Connection Dialog (matches screenshot style) ──────────
+  // ── Metered connection dialog ─────────────────────────────────────────────
   Future<void> showMeteredConnectionDialog(BuildContext context) async {
     bool toggleValue = _allowMetered;
     final result = await showDialog<bool>(
@@ -462,7 +413,6 @@ class ChunkUploadQueue {
           child: Padding(
             padding: const EdgeInsets.all(24),
             child: Column(mainAxisSize: MainAxisSize.min, children: [
-              // Wi-Fi icon in blue circle
               Container(
                 width: 64, height: 64,
                 decoration: BoxDecoration(
@@ -472,15 +422,10 @@ class ChunkUploadQueue {
                 child: const Icon(Icons.wifi, color: Colors.blue, size: 32),
               ),
               const SizedBox(height: 16),
-
-              // Title
               const Text('Metered Connection Uploads',
                   textAlign: TextAlign.center,
-                  style: TextStyle(
-                      fontSize: 18, fontWeight: FontWeight.bold)),
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
               const SizedBox(height: 12),
-
-              // Description
               const Text(
                 'By default, uploads only happen on Wi-Fi. '
                 'If Wi-Fi is unavailable, you can allow uploads '
@@ -489,8 +434,6 @@ class ChunkUploadQueue {
                 style: TextStyle(fontSize: 13, color: Colors.grey),
               ),
               const SizedBox(height: 16),
-
-              // Warning box
               Container(
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
@@ -511,8 +454,6 @@ class ChunkUploadQueue {
                 ]),
               ),
               const SizedBox(height: 20),
-
-              // Toggle row
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
                 child: Row(children: [
@@ -520,12 +461,10 @@ class ChunkUploadQueue {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       const Text('Allow metered connections',
-                          style: TextStyle(
-                              fontWeight: FontWeight.w600, fontSize: 14)),
+                          style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
                       const SizedBox(height: 2),
                       Text('Upload on cellular and metered Wi-Fi',
-                          style: TextStyle(
-                              fontSize: 12, color: Colors.grey[600])),
+                          style: TextStyle(fontSize: 12, color: Colors.grey[600])),
                     ],
                   )),
                   Switch(
@@ -536,8 +475,6 @@ class ChunkUploadQueue {
                 ]),
               ),
               const SizedBox(height: 16),
-
-              // Done button
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton(
@@ -563,13 +500,11 @@ class ChunkUploadQueue {
 
     if (result != null) {
       await _saveMeteredPref(result);
-      // result ignored — use toggle
       if (_canUpload) _processNext();
       _emit();
     }
   }
 
-  // Called from history_screen "No Wi-Fi" tap
   Future<void> approveCellular(BuildContext context) async {
     await showMeteredConnectionDialog(context);
   }
@@ -580,53 +515,32 @@ class ChunkUploadQueue {
     }
   }
 
-  // ── Stale file cleanup — NEVER deletes failed chunks ─────────────────────
-  // Failed chunks stay on disk permanently as manual recovery backups.
-  // The user can copy them via Files app if upload never completes.
-  // Only removes done queue entries from memory — file itself was already
-  // deleted by _deleteFiles() right after OneDrive confirmation.
+  // ── Stale file cleanup ────────────────────────────────────────────────────
   Future<void> cleanStaleFiles() async {
     final staleKeys = <String>[];
-
     for (final entry in _states.entries) {
       final s = entry.value;
-      // Only evict DONE entries from memory after retention window.
-      // FAILED entries stay in queue so user can see them and retry.
-      // Done entries have no timestamp — evict from memory after retention window
-      // using chunk enqueue time approximated by sessionDate.
-      // File is already deleted from disk at this point (deleted on OD confirm).
       if (s.status == ChunkStatus.done) {
         final sessionAge = DateTime.now().difference(s.chunk.sessionDate);
         if (sessionAge.inDays >= _retentionDays) staleKeys.add(entry.key);
       }
     }
-
     for (final k in staleKeys) {
-      // Done entries: file already deleted after OneDrive confirm.
-      // Just evict from in-memory queue.
       _states.remove(k);
       _queue.removeWhere((c) => c.filePath == k);
     }
     if (staleKeys.isNotEmpty) _emit();
-
-    // Do NOT scan or delete from the structured backup folder.
-    // That folder is the user's manual recovery backup.
-    // Files there are ONLY deleted via _deleteFiles() after OneDrive confirms.
     debugPrint('=== cleanStaleFiles: evicted ${staleKeys.length} done entries from memory');
   }
 
   // ── Enqueue ───────────────────────────────────────────────────────────────
   Future<void> enqueue(PendingChunk chunk) async {
     debugPrint('=== Queue: enqueue ${chunk.cloudFileName}');
-    if (!File(chunk.backupPath).existsSync()) {
-      await _ensureBackup(chunk.filePath);
-    }
     _states[chunk.filePath] = ChunkState(chunk);
     _queue.add(chunk);
 
-    // Write to SQLite immediately — survives app kill
     await UploadQueueDb.instance.insertChunk({
-      'chunk_id':          chunk.filePath, // unique per chunk
+      'chunk_id':          chunk.filePath,
       'session_id':        chunk.sessionId,
       'local_file_path':   chunk.filePath,
       'onedrive_path':     chunk.sessionFolderName,
@@ -644,20 +558,20 @@ class ChunkUploadQueue {
       'user_id':           chunk.userId,
     });
 
-    // Schedule WorkManager job — Android manages it even if app dies
+    // Use KEEP policy — avoid creating duplicate WM jobs when multiple
+    // chunks enqueue in rapid succession after recording stops
     await UploadWorkManager.scheduleUpload();
 
     _emit();
     if (_canUpload) _processNext();
   }
 
-  // ── Issue 1: Process — retry once, then global hold ───────────────────────
+  // ── Main upload loop ──────────────────────────────────────────────────────
   Future<void> _processNext() async {
     if (_running) return;
     if (!_canUpload) return;
     if (_globalHold) return;
 
-    // Only pick genuinely queued chunks (not failed — those need user action)
     PendingChunk? next;
     try {
       next = _queue.firstWhere(
@@ -665,198 +579,173 @@ class ChunkUploadQueue {
     } catch (_) { return; }
 
     _running = true;
-    // Fix: always wrap in try/finally so _running is ALWAYS cleared,
-    // even if an unexpected exception escapes the inner catch blocks
     try {
-    // Race guard: check SQLite status before starting upload.
-    // WorkManager may already be uploading or have finished this chunk.
-    try {
-      final rows = await UploadQueueDb.instance.db.then(
-          (db) => db.query('upload_queue',
-              where: 'chunk_id = ?', whereArgs: [next!.filePath], limit: 1));
-      if (rows.isNotEmpty) {
-        final dbStatus = rows.first['status'] as String? ?? '';
-        if (dbStatus == 'done') {
-          debugPrint('=== Queue: ${next.cloudFileName} already done by WorkManager — skipping');
-          _states.remove(next.filePath);
-          _queue.remove(next);
-          _emit();
-          _running = false;
-          if (_canUpload) _processNext();
-          return;
-        }
-        if (dbStatus == 'uploading') {
-          // WorkManager is actively uploading — yield and keep polling until done
-          debugPrint('=== Queue: ${next.cloudFileName} WM uploading — waiting for WM to finish');
-          _running = false;
-          // Poll every 5s until WM finishes (status changes from 'uploading')
-          for (var i = 0; i < 60; i++) { // max 5 minutes wait
-            await Future.delayed(const Duration(seconds: 5));
-            try {
-              final fp = next?.filePath;
-              if (fp == null) break;
-              final r = await UploadQueueDb.instance.db.then(
-                  (db) => db.query('upload_queue',
-                      where: 'chunk_id = ?', whereArgs: [fp], limit: 1));
-              if (r.isEmpty) break; // row gone = done
-              final s = r.first['status'] as String? ?? '';
-              if (s == 'done' || s == 'failed') break; // WM finished
-              if (s != 'uploading') break;
-            } catch (_) { break; }
+      // Race guard: check DB status before starting
+      try {
+        final rows = await UploadQueueDb.instance.db.then(
+            (db) => db.query('upload_queue',
+                where: 'chunk_id = ?', whereArgs: [next!.filePath], limit: 1));
+        if (rows.isNotEmpty) {
+          final dbStatus = rows.first['status'] as String? ?? '';
+          if (dbStatus == 'done') {
+            debugPrint('=== Queue: ${next.cloudFileName} already done by WorkManager — skipping');
+            _states.remove(next.filePath);
+            _queue.remove(next);
+            _emit();
+            _running = false;
+            if (_canUpload) _processNext();
+            return;
           }
-          if (_canUpload) _processNext();
-          return;
-        }
-      }
-    } catch (_) {}
-
-    final state = _states[next.filePath]!;
-    state.status  = ChunkStatus.uploading;
-    state.message = 'Starting...';
-    _emit();
-    // Start foreground service so upload continues in background
-    final pendingTotal = _states.length;
-    UploadForegroundService.start(
-      progressText: 'Uploading Part ${next.partNumber} of ${next.sessionId}',
-      chunksText:   '$pendingTotal chunk${pendingTotal == 1 ? '' : 's'} pending',
-    ).ignore();
-
-    bool uploadSuccess = false;
-
-    // ── Issue 1: attempt up to (1 + _maxRetries) times ─────────────────────
-    for (int attempt = 0; attempt <= _maxRetries; attempt++) {
-      try {
-        if (attempt > 0) {
-          state.message = 'Retrying ($attempt/$_maxRetries)...';
-          _emit();
-          await Future.delayed(const Duration(seconds: 5));
-          if (!_canUpload) break; // network may have died during delay
-        }
-
-        await _uploadChunk(next, state);
-
-        // Verify on OneDrive
-        final userFolder = await UserService().getDisplayName();
-        final dateFolder = DateFormat('dd-MM-yyyy').format(next.sessionDate);
-        final folderPath = '$_rootFolder/$dateFolder/$userFolder/${next.sessionFolderName}';
-        state.message = 'Verifying...';
-        _emit();
-
-        final verified = await _onedrive.fileExistsAndComplete(
-            folderPath: folderPath, fileName: next.cloudFileName);
-
-        if (verified) {
-          uploadSuccess = true;
-          break; // success — exit retry loop
-        } else {
-          // Not on OneDrive yet — treat as soft failure
-          next.lastUploadUrl = null;
-          throw Exception('File not confirmed on OneDrive after upload');
-        }
-      } catch (e) {
-        if (e is _AlreadyDone) {
-          // WorkManager already handled this — skip Firestore write, treat as success
-          uploadSuccess = true;
-          break;
-        }
-        debugPrint('=== Queue attempt $attempt failed: $e');
-        next.lastUploadUrl = null; // always clear stale URL
-        if (attempt < _maxRetries) {
-          // Will retry — continue loop
-          continue;
-        }
-        // Exhausted retries — fall through to failure handling
-      }
-    }
-
-    if (uploadSuccess) {
-      // Mark SQLite done
-      await UploadQueueDb.instance.markDone(next.filePath);
-      _currentSpeedBps = 0; _speedWindowBytes = 0; _speedWindowStart = 0;
-
-      // ── KEEP chunk in _states as done — tile stays visible with ✓ ──────
-      // Only remove when the WHOLE session is confirmed done.
-      final doneState = _states[next.filePath];
-      if (doneState != null) {
-        doneState.status   = ChunkStatus.done;
-        doneState.progress = 1.0;
-        doneState.message  = 'Uploaded ✓';
-      }
-      if (_globalHold && _states.values.every(
-          (s) => s.status != ChunkStatus.failed)) {
-        _globalHold = false;
-      }
-      _emit(); // re-render — chunk tile turns green with ✓
-
-      debugPrint('=== Queue: ${next.cloudFileName} done ✓');
-
-      // Check if WM already wrote Firestore for this session
-      bool wmAlreadyWrote = false;
-      try {
-        final col = FirestoreCacheService().sessionsCollection;
-        if (col != null) {
-          final doc = await col.doc(next.sessionId).get();
-          wmAlreadyWrote = doc.exists &&
-              (doc.data()?['status'] as String?) == 'synced';
+          if (dbStatus == 'uploading') {
+            debugPrint('=== Queue: ${next.cloudFileName} WM uploading — yielding');
+            _running = false;
+            for (var i = 0; i < 60; i++) {
+              await Future.delayed(const Duration(seconds: 5));
+              try {
+                final fp = next?.filePath;
+                if (fp == null) break;
+                final r = await UploadQueueDb.instance.db.then(
+                    (db) => db.query('upload_queue',
+                        where: 'chunk_id = ?', whereArgs: [fp], limit: 1));
+                if (r.isEmpty) break;
+                final s = r.first['status'] as String? ?? '';
+                if (s == 'done' || s == 'failed') break;
+                if (s != 'uploading') break;
+              } catch (_) { break; }
+            }
+            if (_canUpload) _processNext();
+            return;
+          }
         }
       } catch (_) {}
 
-      // Session-wise: check if ALL chunks are now done
-      final sessionDone = await UploadQueueDb.instance
-          .isSessionFullyDone(next.sessionId)
-          .timeout(const Duration(seconds: 5), onTimeout: () => false);
-
-      if (sessionDone) {
-        // Write Firestore once — this makes session appear in Uploaded Sessions
-        if (!wmAlreadyWrote) {
-          debugPrint('=== Queue: session ${next.sessionId} all done → Firestore');
-          await _writeChunkToFirestore(next);
-        }
-        // NOW remove ALL chunks of this session from UI
-        final sid = next.sessionId;
-        _states.removeWhere((_, s) => s.chunk.sessionId == sid);
-        _queue.removeWhere((c) => c.sessionId == sid);
-        _emit(); // session disappears from Pending, appears in Uploaded
-        debugPrint('=== Queue: session $sid cleared from Pending Uploads');
-      } else {
-        debugPrint('=== Queue: chunk ${next.partNumber} done — '
-            'session ${next.sessionId} still has more chunks');
-      }
-
-      _running = false;
-      if (_states.values.every((s) =>
-          s.status == ChunkStatus.done || s.status == ChunkStatus.failed)) {
-        UploadForegroundService.stop().ignore();
-      }
-      if (_canUpload) _processNext();
-      return;
-
-    } else {
-      // ── Issue 1: Failure after retries — GLOBAL HOLD ─────────────────
-      // All other chunks stop. User must tap Retry All.
-      state.status   = ChunkStatus.failed;
-      state.progress = 0.0;
-      state.failedAt = DateTime.now();
-      state.message  = 'Failed after ${_maxRetries + 1} attempt(s)';
-      _globalHold = true; // STOP everything
-
-      // Mark all other queued chunks as "on hold"
-      for (final s in _states.values) {
-        if (s.status == ChunkStatus.queued) {
-          s.message = 'On hold — waiting for failed chunk';
-        }
-      }
+      final state = _states[next.filePath]!;
+      state.status  = ChunkStatus.uploading;
+      state.message = 'Starting...';
       _emit();
 
-      UploadForegroundService.stop().ignore();
-      NotificationService().showUploadFailed(
-          'Part ${next.partNumber} of ${next.sessionId} failed. '
-          'Open app and tap Retry All to continue.');
+      final pendingTotal = _states.length;
+      UploadForegroundService.start(
+        progressText: 'Uploading Part ${next.partNumber} of ${next.sessionId}',
+        chunksText:   '$pendingTotal chunk${pendingTotal == 1 ? '' : 's'} pending',
+      ).ignore();
 
-      // _running cleared in finally
-    }
+      bool uploadSuccess = false;
+
+      for (int attempt = 0; attempt <= _maxRetries; attempt++) {
+        try {
+          if (attempt > 0) {
+            state.message = 'Retrying ($attempt/$_maxRetries)...';
+            _emit();
+            await Future.delayed(const Duration(seconds: 5));
+            if (!_canUpload) break;
+          }
+
+          await _uploadChunk(next, state);
+
+          final userFolder = await UserService().getDisplayName();
+          final dateFolder = DateFormat('dd-MM-yyyy').format(next.sessionDate);
+          final folderPath = '$_rootFolder/$dateFolder/$userFolder/${next.sessionFolderName}';
+          state.message = 'Verifying...';
+          _emit();
+
+          final verified = await _onedrive.fileExistsAndComplete(
+              folderPath: folderPath, fileName: next.cloudFileName);
+
+          if (verified) {
+            uploadSuccess = true;
+            break;
+          } else {
+            // Clear stale session so next attempt starts fresh
+            await UploadQueueDb.instance.clearUploadSession(next.filePath);
+            throw Exception('File not confirmed on OneDrive after upload');
+          }
+        } catch (e) {
+          if (e is _AlreadyDone) {
+            uploadSuccess = true;
+            break;
+          }
+          debugPrint('=== Queue attempt $attempt failed: $e');
+          // Clear session URL — may have expired or be invalid
+          await UploadQueueDb.instance.clearUploadSession(next.filePath);
+          if (attempt < _maxRetries) continue;
+        }
+      }
+
+      if (uploadSuccess) {
+        await UploadQueueDb.instance.markDone(next.filePath);
+        _currentSpeedBps = 0; _speedWindowBytes = 0; _speedWindowStart = 0;
+
+        final doneState = _states[next.filePath];
+        if (doneState != null) {
+          doneState.status   = ChunkStatus.done;
+          doneState.progress = 1.0;
+          doneState.message  = 'Uploaded ✓';
+        }
+        if (_globalHold && _states.values.every(
+            (s) => s.status != ChunkStatus.failed)) {
+          _globalHold = false;
+        }
+        _emit();
+
+        debugPrint('=== Queue: ${next.cloudFileName} done ✓');
+
+        bool wmAlreadyWrote = false;
+        try {
+          final col = FirestoreCacheService().sessionsCollection;
+          if (col != null) {
+            final doc = await col.doc(next.sessionId).get();
+            wmAlreadyWrote = doc.exists &&
+                (doc.data()?['status'] as String?) == 'synced';
+          }
+        } catch (_) {}
+
+        final sessionDone = await UploadQueueDb.instance
+            .isSessionFullyDone(next.sessionId)
+            .timeout(const Duration(seconds: 5), onTimeout: () => false);
+
+        if (sessionDone) {
+          if (!wmAlreadyWrote) {
+            debugPrint('=== Queue: session ${next.sessionId} all done → Firestore');
+            await _writeChunkToFirestore(next);
+          }
+          final sid = next.sessionId;
+          _states.removeWhere((_, s) => s.chunk.sessionId == sid);
+          _queue.removeWhere((c) => c.sessionId == sid);
+          _emit();
+          debugPrint('=== Queue: session $sid cleared from Pending Uploads');
+        } else {
+          debugPrint('=== Queue: chunk ${next.partNumber} done — '
+              'session ${next.sessionId} still has more chunks');
+        }
+
+        _running = false;
+        if (_states.values.every((s) =>
+            s.status == ChunkStatus.done || s.status == ChunkStatus.failed)) {
+          UploadForegroundService.stop().ignore();
+        }
+        if (_canUpload) _processNext();
+        return;
+      } else {
+        state.status   = ChunkStatus.failed;
+        state.progress = 0.0;
+        state.failedAt = DateTime.now();
+        state.message  = 'Failed after ${_maxRetries + 1} attempt(s)';
+        _globalHold = true;
+
+        for (final s in _states.values) {
+          if (s.status == ChunkStatus.queued) {
+            s.message = 'On hold — waiting for failed chunk';
+          }
+        }
+        _emit();
+
+        UploadForegroundService.stop().ignore();
+        NotificationService().showUploadFailed(
+            'Part ${next.partNumber} of ${next.sessionId} failed. '
+            'Open app and tap Retry All to continue.');
+      }
     } finally {
-      // Fix: ALWAYS clear _running, no matter what happens
       _running = false;
     }
   }
@@ -866,8 +755,6 @@ class ChunkUploadQueue {
       final userFolder = await UserService().getDisplayName();
       final dateFolder = DateFormat('dd-MM-yyyy').format(chunk.sessionDate);
 
-      // Count only rows with status='done' in SQLite for accurate totals.
-      // Failed/pending chunks are NOT counted — they may retry and upload later.
       final allRows  = await UploadQueueDb.instance.db.then((db) =>
           db.query('upload_queue',
               where: 'session_id = ?', whereArgs: [chunk.sessionId]));
@@ -875,7 +762,7 @@ class ChunkUploadQueue {
           .where((r) => (r['status'] as String?) == 'done')
           .toList();
 
-      if (doneRows.isEmpty) return; // nothing to write yet
+      if (doneRows.isEmpty) return;
 
       int totalSecs  = 0;
       final parts    = <int>[];
@@ -887,12 +774,8 @@ class ChunkUploadQueue {
       }
       parts.sort();
 
-      // Check if ALL chunks of this session are done
-      final allDone = allRows.length == doneRows.length &&
-          allRows.isNotEmpty;
+      final allDone = allRows.length == doneRows.length && allRows.isNotEmpty;
 
-      // Use merge:true so we only update the fields we know —
-      // avoids overwriting data from a concurrent WM write
       final col = FirestoreCacheService().sessionsCollection;
       if (col == null) return;
       await col.doc(chunk.sessionId).set({
@@ -904,19 +787,18 @@ class ChunkUploadQueue {
         'chunksUploaded': doneRows.length,
         'totalSecs':      totalSecs,
         'parts':          parts,
-        // 'uploading' = some chunks still pending; 'synced' = all done
         'status':         allDone ? 'synced' : 'uploading',
         'updatedAt':      FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
 
-      debugPrint('=== Firestore: \${chunk.sessionId} updated — '
-          '\${doneRows.length}/\${allRows.length} chunks, '
-          '\${totalSecs}s, status=\${allDone ? "synced" : "uploading"}');
+      debugPrint('=== Firestore: ${chunk.sessionId} updated — '
+          '${doneRows.length}/${allRows.length} chunks, '
+          '${totalSecs}s, status=${allDone ? "synced" : "uploading"}');
 
       AttendanceAutoSync().scheduleUpdate(dateFolder);
     } catch (e, st) {
-      debugPrint('=== Firestore write error (non-fatal): \$e');
-      debugPrint('=== Firestore write stacktrace: \$st');
+      debugPrint('=== Firestore write error (non-fatal): $e');
+      debugPrint('=== Firestore write stacktrace: $st');
     }
   }
 
@@ -927,8 +809,6 @@ class ChunkUploadQueue {
     final folderPath    = '$_rootFolder/$dateFolder/$userFolder/$sessionFolder';
 
     if (!chunk.hasAnyFile) {
-      // File missing locally — but WorkManager may have already uploaded it.
-      // Check OneDrive before declaring permanent failure.
       debugPrint('=== Queue: ${chunk.cloudFileName} file missing — checking OneDrive...');
       try {
         final alreadyOnOD = await OneDriveService().fileExistsAndComplete(
@@ -936,11 +816,8 @@ class ChunkUploadQueue {
           fileName:   chunk.cloudFileName,
         ).timeout(const Duration(seconds: 15), onTimeout: () => false);
         if (alreadyOnOD) {
-          // WorkManager uploaded it — write Firestore once then throw special
-          // exception so caller skips its own _writeChunkToFirestore call
           debugPrint('=== Queue: ${chunk.cloudFileName} found on OneDrive — marking done (WM)');
           await UploadQueueDb.instance.markDone(chunk.filePath);
-          // Keep chunk tile as done (green ✓), only clear session when all done
           final alreadyState = _states[chunk.filePath];
           if (alreadyState != null) {
             alreadyState.status   = ChunkStatus.done;
@@ -954,7 +831,7 @@ class ChunkUploadQueue {
           throw _AlreadyDone();
         }
       } catch (e) {
-        if (e is _AlreadyDone) rethrow; // must propagate up to processNext
+        if (e is _AlreadyDone) rethrow;
         debugPrint('=== Queue: OD check failed: $e');
       }
       throw _PermanentFailure('Both original and backup missing — re-record needed.');
@@ -972,6 +849,26 @@ class ChunkUploadQueue {
     state.message = 'Uploading...';
     _emit();
 
+    // ── Expiry-aware session URL retrieval ───────────────────────────────
+    // Only reuse a saved session URL if it is still valid.
+    // If expired or missing, pass null — OneDriveService creates a fresh session.
+    String? resumeUrl;
+    final hasValid = await UploadQueueDb.instance.hasValidSession(chunk.filePath);
+    if (hasValid) {
+      final rows = await UploadQueueDb.instance.db.then(
+          (db) => db.query('upload_queue',
+              columns: ['upload_session_url'],
+              where: 'chunk_id = ?',
+              whereArgs: [chunk.filePath],
+              limit: 1));
+      if (rows.isNotEmpty) {
+        resumeUrl = rows.first['upload_session_url'] as String?;
+        debugPrint('=== Queue: resuming ${chunk.cloudFileName} with saved session URL');
+      }
+    } else {
+      debugPrint('=== Queue: no valid session for ${chunk.cloudFileName} — fresh start');
+    }
+
     await _onedrive.uploadFileInSession(
       filePath:          chunk.bestFilePath,
       fileName:          chunk.cloudFileName,
@@ -979,12 +876,16 @@ class ChunkUploadQueue {
       userFolder:        userFolder,
       sessionFolder:     sessionFolder,
       rootFolder:        _rootFolder,
-      existingUploadUrl: chunk.lastUploadUrl,
+      existingUploadUrl: resumeUrl,
+      // Save new session URL + expiry to DB as soon as OneDrive returns it
+      onSessionCreated: (url) async {
+        final expiry = DateTime.now().add(const Duration(hours: 23));
+        await UploadQueueDb.instance.saveUploadSession(chunk.filePath, url, expiry);
+        debugPrint('=== Queue: saved session URL for ${chunk.cloudFileName}');
+      },
       onProgress: (p) {
         state.progress = p;
         state.message  = 'Uploading ${(p * 100).toStringAsFixed(0)}%';
-        // 1-second windowed speed measurement
-        // onProgress fires per 256KB slice — accumulate bytes in 1s buckets
         try {
           final fileSize  = File(chunk.bestFilePath).lengthSync();
           final bytesNow  = (fileSize * p).round();
@@ -995,7 +896,7 @@ class ChunkUploadQueue {
           } else {
             final elapsed = nowMs - _speedWindowStart;
             final deltaB  = bytesNow - _speedWindowBytes;
-            if (elapsed >= 300 && deltaB > 0) { // 300ms window
+            if (elapsed >= 300 && deltaB > 0) {
               final bps = (deltaB / elapsed) * 1000.0;
               _currentSpeedBps = _currentSpeedBps == 0
                   ? bps : _currentSpeedBps * 0.5 + bps * 0.5;
@@ -1011,11 +912,9 @@ class ChunkUploadQueue {
   }
 
   // ── Public controls ───────────────────────────────────────────────────────
-
-  /// Issue 1: Manual retry — clears global hold, re-queues ALL failed chunks
   void retryFailed() {
-    _globalHold = false; // release the hold
-    _running    = false; // Fix: force-clear stuck _running from previous attempt
+    _globalHold = false;
+    _running    = false;
     for (final s in _states.values) {
       if (s.status == ChunkStatus.failed) {
         if (s.chunk.hasAnyFile) {
@@ -1024,24 +923,23 @@ class ChunkUploadQueue {
           s.message    = 'Retrying...';
           s.failedAt   = null;
           s.retryCount = 0;
-          s.chunk.lastUploadUrl = null;
         } else {
-          // File missing — WorkManager may have already uploaded.
-          // _uploadChunk will verify OneDrive before declaring permanent failure.
-          // Re-queue it so _uploadChunk can do the OD check.
           s.status     = ChunkStatus.queued;
           s.progress   = 0.0;
           s.message    = 'Checking OneDrive...';
           s.failedAt   = null;
           s.retryCount = 0;
         }
+        // Clear DB session URL on retry — may have expired during failure window
+        UploadQueueDb.instance.clearUploadSession(s.chunk.filePath).ignore();
       }
-      // Also unblock chunks that were on hold
       if (s.status == ChunkStatus.queued &&
           s.message == 'On hold — waiting for failed chunk') {
         s.message = 'Queued';
       }
     }
+    // Also reset in SQLite so WM can pick them up
+    UploadQueueDb.instance.retryAllFailed().ignore();
     _emit();
     if (_canUpload) _processNext();
   }
@@ -1055,16 +953,15 @@ class ChunkUploadQueue {
       _emit();
       return;
     }
-    // Single chunk retry also releases global hold
-    _globalHold           = false;
-    _running              = false; // Fix: force-clear stuck _running
-    s.status              = ChunkStatus.queued;
-    s.progress            = 0.0;
-    s.message             = 'Retrying...';
-    s.retryCount          = 0;
-    s.failedAt            = null;
-    chunk.lastUploadUrl   = null;
-    // Unblock other held chunks
+    _globalHold  = false;
+    _running     = false;
+    s.status     = ChunkStatus.queued;
+    s.progress   = 0.0;
+    s.message    = 'Retrying...';
+    s.retryCount = 0;
+    s.failedAt   = null;
+    // Clear expired session URL
+    UploadQueueDb.instance.clearUploadSession(chunk.filePath).ignore();
     for (final other in _states.values) {
       if (other.status == ChunkStatus.queued &&
           other.message == 'On hold — waiting for failed chunk') {
@@ -1081,20 +978,12 @@ class ChunkUploadQueue {
     _emit();
   }
 
-  // ── abandonChunk — removes from queue but KEEPS local file ─────────────
-  // The structured backup file is kept on disk for manual recovery.
-  // User can copy it via Files app. File is not deleted here.
   void abandonChunk(String filePath) {
-    // Remove from in-memory queue
     _states.remove(filePath);
     _queue.removeWhere((c) => c.filePath == filePath);
-
-    // CRITICAL: Mark as failed in SQLite so it doesn't reappear on app restart
-    // Without this, _recoverFromPersistence loads it back on next launch
     UploadQueueDb.instance.markFailed(filePath).ignore();
     debugPrint('=== Queue: abandoned $filePath — marked failed in DB');
 
-    // If we just deleted the failed chunk, release hold so others can proceed
     if (_globalHold && _states.values.none((s) => s.status == ChunkStatus.failed)) {
       _globalHold = false;
       for (final other in _states.values) {
@@ -1111,7 +1000,6 @@ class ChunkUploadQueue {
       .any((s) => s.chunk.sessionId == sessionId && s.status != ChunkStatus.done);
 
   // ── Recovery ──────────────────────────────────────────────────────────────
-  // ── Recovery from SQLite (replaces JSON persistence) ─────────────────────
   Future<void> _recoverFromPersistence() async {
     try {
       await UploadQueueDb.instance.resetStuckUploadingKeepProgress();
@@ -1123,22 +1011,16 @@ class ChunkUploadQueue {
         if (filePath.isEmpty) continue;
         if (_states.containsKey(filePath)) continue;
 
-        // If primary path is missing, search alternate storage locations
         if (!File(filePath).existsSync()) {
           final fileName = filePath.split('/').last;
-          // Search all known base paths for this file
           final searchPaths = [
-            // Android/data path
             '/storage/emulated/0/Android/data/com.otn.videorecorder/files',
-            // Android/media path
             '/storage/emulated/0/Android/media/com.otn.videorecorder/OTN/recordings',
-            // App documents
             (await getApplicationDocumentsDirectory()).path,
           ];
 
           String? foundPath;
           for (final basePath in searchPaths) {
-            // Walk directories looking for this filename
             try {
               final baseDir = Directory(basePath);
               if (!baseDir.existsSync()) continue;
@@ -1154,18 +1036,13 @@ class ChunkUploadQueue {
 
           if (foundPath != null) {
             debugPrint('=== SQLite recovery: found at new path $foundPath');
-            // Update DB with correct path
             await UploadQueueDb.instance.updateFilePath(
                 row['chunk_id'] as String, foundPath);
             filePath = foundPath;
           } else {
             debugPrint('=== SQLite recovery: file not found anywhere — $filePath');
-            // File missing locally — check OneDrive before giving up
-            // WorkManager will handle OD check on next run
-            // Keep as pending so WM can verify and mark done if on OD
             await UploadQueueDb.instance.updateStatus(
                 row['chunk_id'] as String, 'pending');
-            // Add to UI as 'missing file' state for visibility
             final sessionDateMs2  = (row['session_date_ms']  as int? ?? 0);
             final sessionStartMs2 = (row['session_start_ms'] as int? ?? 0);
             final sessionDate2    = DateTime.fromMillisecondsSinceEpoch(sessionDateMs2);
@@ -1225,16 +1102,8 @@ class ChunkUploadQueue {
   }
 
   Future<void> recoverFromCache() async {
-    // Step 1: Restore from SQLite (most reliable — survives app clear)
     await _recoverFromPersistence();
 
-    // Step 2: Scan ALL local recording directories for orphaned mp4 files
-    // that are NOT in SQLite (e.g. recorded offline then app was force-closed
-    // before enqueue completed, or DB was corrupted).
-    //
-    // Scans the ACTUAL backup location used by camera_screen:
-    //   Android/data/<pkg>/files/OTN/recordings/DD-MM-YYYY/user/sessionFolder/
-    // Also scans legacy paths for backward compat.
     final scanRoots = <String>[
       '/storage/emulated/0/Android/data/com.otn.videorecorder/files/OTN/recordings',
       '/storage/emulated/0/Android/media/com.otn.videorecorder/OTN/recordings',
@@ -1242,8 +1111,7 @@ class ChunkUploadQueue {
       '/storage/emulated/0/Android/media/com.otn.videorecorder/OTN/otn_chunks',
     ];
 
-    // Collect all mp4 files across all roots, keyed by filename
-    final allFiles = <String, String>{}; // filename → full path
+    final allFiles = <String, String>{};
     for (final root in scanRoots) {
       final dir = Directory(root);
       if (!dir.existsSync()) continue;
@@ -1251,7 +1119,6 @@ class ChunkUploadQueue {
         for (final entity in dir.listSync(recursive: true).whereType<File>()) {
           if (!entity.path.endsWith('.mp4')) continue;
           final name = entity.path.split('/').last;
-          // Prefer Android/data path over legacy paths
           if (!allFiles.containsKey(name) ||
               entity.path.contains('Android/data')) {
             allFiles[name] = entity.path;
@@ -1264,36 +1131,28 @@ class ChunkUploadQueue {
 
     debugPrint('=== recoverFromCache: found ${allFiles.length} mp4 files on disk');
 
-    // Build set of filenames already tracked in memory (from Step 1)
     final trackedNames = _states.values
         .map((s) => s.chunk.cloudFileName)
         .toSet();
 
-    // Also build set of filenames already in SQLite (any status) to avoid
-    // creating duplicate entries for chunks already tracked but not yet recovered
-    final dbRows    = await UploadQueueDb.instance.getAllChunks();
+    final dbRows      = await UploadQueueDb.instance.getAllChunks();
     final dbFileNames = dbRows
         .map((r) => (r['file_name'] as String? ?? ''))
         .where((n) => n.isNotEmpty)
         .toSet();
 
-    // Filename parsers — support both formats
-    // Cloud filename NEW: SESSIONID_DATE_PNN_SHHMMSS_EHHMMSS_DURs.mp4
     final namePatternNew = RegExp(
-        r'^([A-Z0-9]{6,7})_([0-9]{8})_P([0-9]{2})_S([0-9]{6})_E([0-9]{6})_([0-9]+)s\.mp4\$');
-    // Cloud filename OLD: SESSIONID_DATE_TIME_NNMM-MM.mp4
+        r'^([A-Z0-9]{6,7})_([0-9]{8})_P([0-9]{2})_S([0-9]{6})_E([0-9]{6})_([0-9]+)s\.mp4$');
     final namePatternOld = RegExp(
-        r'^([A-Z0-9]{6,7})_([0-9]{8})_([0-9]{6})_([0-9]{2})([0-9]{2})-([0-9]{2})\.mp4\$');
-    // LOCAL backup filename: SESSIONID_DATE_TIME_partNN.mp4 (generated by camera_screen)
+        r'^([A-Z0-9]{6,7})_([0-9]{8})_([0-9]{6})_([0-9]{2})([0-9]{2})-([0-9]{2})\.mp4$');
     final namePatternLocal = RegExp(
-        r'^([A-Z0-9]{6,7})_([0-9]{8})_([0-9]{6})_part([0-9]{2})\.mp4\$');
+        r'^([A-Z0-9]{6,7})_([0-9]{8})_([0-9]{6})_part([0-9]{2})\.mp4$');
 
     int recovered = 0;
     for (final entry in allFiles.entries) {
       final name     = entry.key;
       final fullPath = entry.value;
 
-      // Skip if already tracked in memory or in SQLite
       if (trackedNames.contains(name)) continue;
       if (dbFileNames.contains(name))  continue;
 
@@ -1311,7 +1170,6 @@ class ChunkUploadQueue {
       final int partNum, startSec, endSec;
 
       if (mLocal != null) {
-        // Local backup: SESSIONID_DATE_TIME_partNN.mp4
         sessionId = mLocal.group(1)!;
         final ds  = mLocal.group(2)!;
         final ts  = mLocal.group(3)!;
@@ -1322,7 +1180,7 @@ class ChunkUploadQueue {
             int.parse(ts.substring(4,6)));
         partNum  = int.parse(mLocal.group(4)!);
         startSec = 0;
-        endSec   = 0; // unknown from filename — will use DB startSec/endSec if in DB
+        endSec   = 0;
       } else if (mNew != null) {
         sessionId = mNew.group(1)!;
         final ds  = mNew.group(2)!;
@@ -1355,7 +1213,7 @@ class ChunkUploadQueue {
 
       final chunk = PendingChunk(
         filePath:         fullPath,
-        backupPath:       fullPath, // already in structured backup location
+        backupPath:       fullPath,
         sessionId:        sessionId,
         userId:           '',
         partNumber:       partNum,
@@ -1366,7 +1224,6 @@ class ChunkUploadQueue {
         endSec:           endSec,
       );
 
-      // Add to SQLite so it persists across future app clears
       await UploadQueueDb.instance.insertChunk({
         'chunk_id':          fullPath,
         'local_file_path':   fullPath,
@@ -1378,11 +1235,10 @@ class ChunkUploadQueue {
         'session_start_ms':  st.millisecondsSinceEpoch,
         'start_sec':         startSec,
         'end_sec':           endSec,
-        'onedrive_path':     '${sessionId}_${mNew != null ? mNew.group(2)! : mOld!.group(2)!}_${st.hour.toString().padLeft(2,'0')}${st.minute.toString().padLeft(2,'0')}${st.second.toString().padLeft(2,'0')}',
+        'onedrive_path':     chunk.sessionFolderName,
         'status':            'pending',
         'retry_count':       0,
         'bytes_uploaded':    0,
-        'upload_session_url': null,
       });
 
       _states[fullPath] = ChunkState(chunk);
@@ -1398,7 +1254,6 @@ class ChunkUploadQueue {
     }
   }
 
-  /// Called from history_screen when the persistent toggle changes
   void setMeteredAllowed(bool value) {
     _allowMetered = value;
     _emit();

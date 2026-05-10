@@ -26,37 +26,45 @@ class UploadQueueDb {
     final path = p.join(dir, 'otn_upload_queue.db');
     return openDatabase(
       path,
-      version: 2,
+      // ── VERSION 3: adds upload_session_expiry column ──────────────────
+      version: 3,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
-          // Add total_parts column for existing installs
           await db.execute(
               'ALTER TABLE upload_queue ADD COLUMN total_parts INTEGER NOT NULL DEFAULT 0');
           debugPrint('=== DB migrated v1→v2: added total_parts column');
+        }
+        if (oldVersion < 3) {
+          // Expiry timestamp (ms) for OneDrive upload sessions.
+          // NULL = no session URL stored (safe default).
+          await db.execute(
+              'ALTER TABLE upload_queue ADD COLUMN upload_session_expiry INTEGER');
+          debugPrint('=== DB migrated v2→v3: added upload_session_expiry column');
         }
       },
       onCreate: (db, _) async {
         await db.execute('''
           CREATE TABLE upload_queue (
-            chunk_id          TEXT PRIMARY KEY,
-            session_id        TEXT NOT NULL,
-            local_file_path   TEXT NOT NULL,
-            onedrive_path     TEXT NOT NULL,
-            file_name         TEXT NOT NULL,
-            file_size_bytes   INTEGER NOT NULL DEFAULT 0,
-            bytes_uploaded    INTEGER NOT NULL DEFAULT 0,
-            total_parts       INTEGER NOT NULL DEFAULT 0,
-            upload_session_url TEXT,
-            status            TEXT NOT NULL DEFAULT 'pending',
-            retry_count       INTEGER NOT NULL DEFAULT 0,
-            part_number       INTEGER NOT NULL DEFAULT 1,
-            start_sec         INTEGER NOT NULL DEFAULT 0,
-            end_sec           INTEGER NOT NULL DEFAULT 0,
-            session_date_ms   INTEGER NOT NULL DEFAULT 0,
-            session_start_ms  INTEGER NOT NULL DEFAULT 0,
-            user_id           TEXT NOT NULL DEFAULT '',
-            created_at        INTEGER NOT NULL,
-            updated_at        INTEGER NOT NULL
+            chunk_id               TEXT PRIMARY KEY,
+            session_id             TEXT NOT NULL,
+            local_file_path        TEXT NOT NULL,
+            onedrive_path          TEXT NOT NULL,
+            file_name              TEXT NOT NULL,
+            file_size_bytes        INTEGER NOT NULL DEFAULT 0,
+            bytes_uploaded         INTEGER NOT NULL DEFAULT 0,
+            total_parts            INTEGER NOT NULL DEFAULT 0,
+            upload_session_url     TEXT,
+            upload_session_expiry  INTEGER,
+            status                 TEXT NOT NULL DEFAULT 'pending',
+            retry_count            INTEGER NOT NULL DEFAULT 0,
+            part_number            INTEGER NOT NULL DEFAULT 1,
+            start_sec              INTEGER NOT NULL DEFAULT 0,
+            end_sec                INTEGER NOT NULL DEFAULT 0,
+            session_date_ms        INTEGER NOT NULL DEFAULT 0,
+            session_start_ms       INTEGER NOT NULL DEFAULT 0,
+            user_id                TEXT NOT NULL DEFAULT '',
+            created_at             INTEGER NOT NULL,
+            updated_at             INTEGER NOT NULL
           )
         ''');
         await db.execute(
@@ -102,17 +110,70 @@ class UploadQueueDb {
     );
   }
 
-  // ── Update bytes uploaded (for resume) ─────────────────────────────────────
+  // ── Update bytes uploaded + optional session URL + expiry (for resume) ──────
   Future<void> updateProgress(String chunkId,
-      {required int bytesUploaded, String? uploadSessionUrl}) async {
+      {required int bytesUploaded,
+      String? uploadSessionUrl,
+      DateTime? uploadSessionExpiry}) async {
     final d = await db;
     final vals = <String, dynamic>{
       'bytes_uploaded': bytesUploaded,
       'updated_at': DateTime.now().millisecondsSinceEpoch,
     };
     if (uploadSessionUrl != null) vals['upload_session_url'] = uploadSessionUrl;
+    if (uploadSessionExpiry != null) {
+      vals['upload_session_expiry'] = uploadSessionExpiry.millisecondsSinceEpoch;
+    }
     await d.update('upload_queue', vals,
         where: 'chunk_id = ?', whereArgs: [chunkId]);
+  }
+
+  // ── Save / clear upload session URL + expiry atomically ─────────────────────
+  Future<void> saveUploadSession(
+      String chunkId, String url, DateTime expiry) async {
+    final d = await db;
+    await d.update(
+      'upload_queue',
+      {
+        'upload_session_url':    url,
+        'upload_session_expiry': expiry.millisecondsSinceEpoch,
+        'updated_at':            DateTime.now().millisecondsSinceEpoch,
+      },
+      where: 'chunk_id = ?',
+      whereArgs: [chunkId],
+    );
+  }
+
+  Future<void> clearUploadSession(String chunkId) async {
+    final d = await db;
+    await d.update(
+      'upload_queue',
+      {
+        'upload_session_url':    null,
+        'upload_session_expiry': null,
+        'bytes_uploaded':        0,
+        'updated_at':            DateTime.now().millisecondsSinceEpoch,
+      },
+      where: 'chunk_id = ?',
+      whereArgs: [chunkId],
+    );
+  }
+
+  // ── Returns true if stored session URL is still valid (not expired) ─────────
+  Future<bool> hasValidSession(String chunkId) async {
+    final d = await db;
+    final rows = await d.query('upload_queue',
+        columns: ['upload_session_url', 'upload_session_expiry'],
+        where: 'chunk_id = ?',
+        whereArgs: [chunkId],
+        limit: 1);
+    if (rows.isEmpty) return false;
+    final url    = rows.first['upload_session_url'] as String?;
+    final expiry = rows.first['upload_session_expiry'] as int?;
+    if (url == null || url.isEmpty) return false;
+    if (expiry == null) return false;
+    // Consider expired if within 10 minutes of actual expiry
+    return DateTime.now().millisecondsSinceEpoch < expiry - 600000;
   }
 
   // ── Increment retry count ───────────────────────────────────────────────────
@@ -145,13 +206,15 @@ class UploadQueueDb {
 
   // ── Reset any 'uploading' → 'pending' on app start ──────────────────────────
   // Keeps bytes_uploaded and upload_session_url for resume capability.
+  // Expiry is also kept — hasValidSession() decides whether to reuse or recreate.
   Future<void> resetStuckUploadingKeepProgress() async {
     final d = await db;
     final count = await d.rawUpdate(
-      "UPDATE upload_queue SET status = 'pending', updated_at = ? "      "WHERE status = 'uploading'",
+      "UPDATE upload_queue SET status = 'pending', updated_at = ? "
+      "WHERE status = 'uploading'",
       [DateTime.now().millisecondsSinceEpoch],
     );
-    if (count > 0) debugPrint('=== DB reset $count stuck → pending (keeping progress)');
+    if (count > 0) debugPrint('=== DB reset $count stuck → pending (keeping progress + session)');
   }
 
   // Legacy version that resets progress (keep for compatibility)
@@ -205,20 +268,15 @@ class UploadQueueDb {
       where: 'session_id = ?',
       whereArgs: [sessionId],
     );
-    if (rows.isEmpty) return false; // no rows = session not fully enqueued yet
-    // Get declared total parts (set when session stops recording)
+    if (rows.isEmpty) return false;
     final declaredTotal = (rows.first['total_parts'] as int? ?? 0);
     final doneCount     = rows.where((r) => r['status'] == 'done').length;
     if (declaredTotal > 0) {
-      // We know the total — use it for accurate completion check
       return doneCount >= declaredTotal;
     }
-    // Fallback: all currently-queued rows must be done AND at least 1 exists
     return rows.isNotEmpty && rows.every((r) => r['status'] == 'done');
   }
 
-  /// Sets total_parts on ALL chunks of a session when recording stops.
-  /// After this, isSessionFullyDone knows exactly how many chunks to expect.
   Future<void> setSessionTotalParts(String sessionId, int totalParts) async {
     final d = await db;
     await d.update(
@@ -244,9 +302,11 @@ class UploadQueueDb {
   // ── Retry all failed ────────────────────────────────────────────────────────
   Future<void> retryAllFailed() async {
     final d = await db;
+    // Also clear session URLs — they may have expired during the failure window
     await d.rawUpdate(
       "UPDATE upload_queue SET status = 'pending', retry_count = 0, "
-      "bytes_uploaded = 0, upload_session_url = NULL, updated_at = ? "
+      "bytes_uploaded = 0, upload_session_url = NULL, "
+      "upload_session_expiry = NULL, updated_at = ? "
       "WHERE status = 'failed'",
       [DateTime.now().millisecondsSinceEpoch],
     );

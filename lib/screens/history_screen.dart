@@ -566,8 +566,18 @@ class _HistoryScreenState extends State<HistoryScreen> {
         .orderBy('sessionStartMs', descending: true)
         .snapshots()
         .map((snap) {
+          // Double-gate: only show sessions that are BOTH:
+          //   1. Marked 'synced' in Firestore (all chunks written)
+          //   2. NOT still tracked in the in-memory pending queue
+          //
+          // This prevents the race where Firestore writes 'synced' before
+          // the queue's _states map has been cleared, causing a session to
+          // flash briefly in both sections simultaneously.
+          final pendingIds = _queue.pendingSessionIds;
           final synced = snap.docs
-              .where((d) => (d.data()['status'] as String?) == 'synced')
+              .where((d) =>
+                  (d.data()['status'] as String?) == 'synced' &&
+                  !pendingIds.contains(d.id))
               .map((d) => SessionMeta.fromMap(d.id, d.data()))
               .toList();
           return _dedup(synced);

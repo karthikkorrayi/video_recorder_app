@@ -67,7 +67,11 @@ class OneDriveService {
     required String rootFolder,
     required void Function(double) onProgress,
     required void Function(String) onStatus,
-    String? existingUploadUrl, // kept for API compat, no longer used
+    String? existingUploadUrl,
+    // NEW: called as soon as OneDrive returns the upload session URL.
+    // Callers save this to SQLite for expiry-aware resume across app restarts.
+    // Signature: (uploadUrl) async { ... }
+    Future<void> Function(String url)? onSessionCreated,
   }) async {
     final folderPath = '$rootFolder/$dateFolder/$userFolder/$sessionFolder';
 
@@ -79,17 +83,21 @@ class OneDriveService {
     }
 
     // Step 2: Delete any incomplete/partial file to clear the way.
-    // This is the key fix — prevents 409 CONFLICT on retry.
+    // Prevents 409 CONFLICT on retry when existingUploadUrl is not provided.
     onStatus('Preparing...');
     await _deleteFileIfExists(folderPath: folderPath, fileName: fileName);
-    // Small delay to let OneDrive propagate the delete
     await Future.delayed(const Duration(milliseconds: 800));
 
     // Step 3: Create a fresh upload session.
-    // Use 'replace' as belt-and-suspenders in case delete hasn't propagated.
     onStatus('Creating session...');
     final uploadUrl = await _createFreshSession(
         folderPath: folderPath, fileName: fileName);
+
+    // Notify caller immediately so session URL + expiry can be persisted.
+    // This ensures we can resume even if the app is killed mid-upload.
+    if (onSessionCreated != null) {
+      try { await onSessionCreated(uploadUrl); } catch (_) {}
+    }
 
     // Step 4: Upload in chunks.
     onStatus('Uploading...');
