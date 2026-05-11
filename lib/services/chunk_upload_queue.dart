@@ -181,9 +181,29 @@ class ChunkUploadQueue {
   List<ChunkState> get all => _states.values.toList();
   Timer? _persistDebounce;
 
+  // Debounced emit: batches rapid consecutive updates into a single UI rebuild.
+  // Without this, operations like "mark 5 chunks done in quick succession"
+  // trigger 5 separate StreamBuilder rebuilds causing visible jank.
+  // The 16ms window (~1 frame at 60fps) coalesces same-frame updates.
+  Timer? _emitDebounce;
   void _emit() {
-    _ctrl.add(current);
-    _updateForegroundService();
+    _emitDebounce?.cancel();
+    _emitDebounce = Timer(const Duration(milliseconds: 16), () {
+      if (!_ctrl.isClosed) {
+        _ctrl.add(current);
+        _updateForegroundService();
+      }
+    });
+  }
+
+  // Immediate emit — used only when UI correctness requires no delay
+  // (e.g. after network state changes where the user is watching)
+  void _emitNow() {
+    _emitDebounce?.cancel();
+    if (!_ctrl.isClosed) {
+      _ctrl.add(current);
+      _updateForegroundService();
+    }
   }
 
   // ── DB → UI sync (WorkManager progress bridge) ────────────────────────────
@@ -211,12 +231,24 @@ class ChunkUploadQueue {
           state.status   = ChunkStatus.done;
           state.progress = 1.0;
           state.message  = 'Done ✓';
-          final sessionDone = await UploadQueueDb.instance
-              .isSessionFullyDone(state.chunk.sessionId)
-              .timeout(const Duration(seconds: 5), onTimeout: () => false);
-          if (sessionDone) {
+          // Check session completion using _states (in-memory), NOT DB.
+          // DB may be ahead of UI (WM wrote done before all states updated).
+          // Only remove the session when every chunk in _states is done —
+          // this ensures all tiles show green briefly before the session disappears.
+          final sid = state.chunk.sessionId;
+          final allInMemoryDone = _states.values
+              .where((s) => s.chunk.sessionId == sid)
+              .every((s) => s.status == ChunkStatus.done);
+          if (allInMemoryDone) {
             _writeChunkToFirestore(state.chunk).ignore();
-            final sid = state.chunk.sessionId;
+            // Delete local files + DB rows before removing from states
+            final toDelete = _states.values
+                .where((s) => s.chunk.sessionId == sid)
+                .toList();
+            for (final s in toDelete) {
+              _deleteFiles(s.chunk).ignore();
+              UploadQueueDb.instance.deleteChunk(s.chunk.filePath).ignore();
+            }
             _states.removeWhere((_, s) => s.chunk.sessionId == sid);
             _queue.removeWhere((c) => c.sessionId == sid);
           }
@@ -259,8 +291,14 @@ class ChunkUploadQueue {
   bool get isWifi         => _isWifi;
   bool get isGlobalHold   => _globalHold;
 
-  Set<String> get pendingSessionIds =>
-      _states.values.map((s) => s.chunk.sessionId).toSet();
+  // Sessions that are genuinely still in progress (not yet all-done).
+  // Used by history_screen to gate Firestore 'synced' sessions from showing
+  // in the Uploaded section while they're still in the Pending section.
+  // Excludes sessions where every chunk is done — those are being cleaned up.
+  Set<String> get pendingSessionIds => _states.values
+      .where((s) => s.status != ChunkStatus.done)
+      .map((s) => s.chunk.sessionId)
+      .toSet();
 
   // Returns the best available speed reading at any moment:
   //   • While uploading: live measured upload throughput (byte-counted)
@@ -432,7 +470,7 @@ class ChunkUploadQueue {
 
       if (!_hasNetwork) {
         _updateAllQueued('Waiting for network...');
-        _emit();
+        _emitNow(); // immediate — user just saw network drop
         return;
       }
 
@@ -479,7 +517,7 @@ class ChunkUploadQueue {
       } else {
         if (_canUpload) _processNext();
       }
-      _emit();
+      _emitNow(); // immediate — user just reconnected
     });
   }
 
@@ -799,10 +837,18 @@ class ChunkUploadQueue {
             await _writeChunkToFirestore(next);
           }
           final sid = next.sessionId;
+          // Delete local mp4s + DB rows — prevents ghost re-enqueue on next login
+          final toDelete = _states.values
+              .where((s) => s.chunk.sessionId == sid)
+              .toList();
+          for (final s in toDelete) {
+            await _deleteFiles(s.chunk);
+            await UploadQueueDb.instance.deleteChunk(s.chunk.filePath);
+          }
           _states.removeWhere((_, s) => s.chunk.sessionId == sid);
           _queue.removeWhere((c) => c.sessionId == sid);
           _emit();
-          debugPrint('=== Queue: session $sid cleared from Pending Uploads');
+          debugPrint('=== Queue: session $sid cleaned + cleared from Pending Uploads');
         } else {
           debugPrint('=== Queue: chunk ${next.partNumber} done — '
               'session ${next.sessionId} still has more chunks');
@@ -1192,7 +1238,51 @@ class ChunkUploadQueue {
     }
   }
 
+  // ── Lightweight refresh: SQLite-only, no disk scan ──────────────────────
+  // Called by the history screen refresh button. Runs in ~5ms vs recoverFromCache
+  // which does a full filesystem scan (can take 200-500ms on large storage).
+  // Only re-adds genuinely pending rows that aren't already tracked in _states.
+  // Never touches done rows — they're cleaned up by the upload completion path.
+  Future<void> recoverPendingOnly() async {
+    try {
+      await UploadQueueDb.instance.resetStuckUploadingKeepProgress();
+      final rows = await UploadQueueDb.instance.getPending();
+      bool added = false;
+      for (final row in rows) {
+        final filePath = row['local_file_path'] as String? ?? '';
+        if (filePath.isEmpty) continue;
+        if (_states.containsKey(filePath)) continue;
+        if (!File(filePath).existsSync()) continue; // skip missing files silently
+        final dt = DateTime.fromMillisecondsSinceEpoch(row['session_date_ms']  as int? ?? 0);
+        final st = DateTime.fromMillisecondsSinceEpoch(row['session_start_ms'] as int? ?? 0);
+        final chunk = PendingChunk(
+          filePath:         filePath,
+          backupPath:       filePath,
+          sessionId:        row['session_id']  as String? ?? '',
+          userId:           row['user_id']     as String? ?? '',
+          partNumber:       row['part_number'] as int? ?? 1,
+          sessionDate:      dt,
+          sessionStartTime: st,
+          sessionEndTime:   st,
+          startSec:         row['start_sec'] as int? ?? 0,
+          endSec:           row['end_sec']   as int? ?? 0,
+        );
+        final cs = ChunkState(chunk)
+          ..status  = ChunkStatus.queued
+          ..message = 'Recovered';
+        _states[filePath] = cs;
+        _queue.add(chunk);
+        added = true;
+      }
+      if (added) { _emit(); if (_canUpload) _processNext(); }
+    } catch (e) { debugPrint('=== recoverPendingOnly error: $e'); }
+  }
+
   Future<void> recoverFromCache() async {
+    // Purge stale done rows first — cleans up old app versions that didn't
+    // call deleteChunk() at upload time. Runs fast (indexed status + updated_at).
+    await UploadQueueDb.instance.purgeDoneRows(olderThanDays: 2);
+
     await _recoverFromPersistence();
 
     final scanRoots = <String>[
@@ -1222,14 +1312,28 @@ class ChunkUploadQueue {
 
     debugPrint('=== recoverFromCache: found ${allFiles.length} mp4 files on disk');
 
-    final trackedNames = _states.values
-        .map((s) => s.chunk.cloudFileName)
+    final trackedPaths = _states.values
+        .map((s) => s.chunk.filePath)
         .toSet();
 
-    final dbRows      = await UploadQueueDb.instance.getAllChunks();
+    final dbRows = await UploadQueueDb.instance.getAllChunks();
+
+    // Set 1: cloud filenames in DB (for new-format orphan check)
     final dbFileNames = dbRows
         .map((r) => (r['file_name'] as String? ?? ''))
         .where((n) => n.isNotEmpty)
+        .toSet();
+
+    // Set 2: local file paths of DONE rows — these were already uploaded.
+    // Local filenames differ from cloud filenames, so dbFileNames never matches
+    // what's on disk. This set checks by local path and base filename instead.
+    final doneLocalPaths = dbRows
+        .where((r) => (r['status'] as String?) == 'done')
+        .map((r) => r['local_file_path'] as String? ?? '')
+        .where((p) => p.isNotEmpty)
+        .toSet();
+    final doneLocalNames = doneLocalPaths
+        .map((p) => p.split('/').last)
         .toSet();
 
     final namePatternNew = RegExp(
@@ -1244,8 +1348,10 @@ class ChunkUploadQueue {
       final name     = entry.key;
       final fullPath = entry.value;
 
-      if (trackedNames.contains(name)) continue;
-      if (dbFileNames.contains(name))  continue;
+      if (trackedPaths.contains(fullPath)) continue;  // already tracked in memory
+      if (dbFileNames.contains(name))       continue;  // has a DB row (any status)
+      if (doneLocalPaths.contains(fullPath)) continue;  // local path is done in DB
+      if (doneLocalNames.contains(name))    continue;  // base name is done in DB
 
       final mNew   = namePatternNew.firstMatch(name);
       final mOld   = mNew   == null ? namePatternOld.firstMatch(name)   : null;

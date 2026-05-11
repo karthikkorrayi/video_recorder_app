@@ -204,6 +204,25 @@ class UploadQueueDb {
         where: 'chunk_id = ?', whereArgs: [chunkId]);
   }
 
+  // ── Purge all done rows older than [days] days ───────────────────────────
+  // Called once on app start to clean up any done rows left behind by older
+  // versions of the app that didn't delete rows on upload completion.
+  // This is the safety net for the ghost-session bug — even if deleteChunk()
+  // wasn't called at upload time, done rows get cleaned up within [days] days.
+  Future<int> purgeDoneRows({int olderThanDays = 2}) async {
+    final d       = await db;
+    final cutoff  = DateTime.now()
+        .subtract(Duration(days: olderThanDays))
+        .millisecondsSinceEpoch;
+    final count   = await d.delete(
+      'upload_queue',
+      where: "status = 'done' AND updated_at < ?",
+      whereArgs: [cutoff],
+    );
+    if (count > 0) debugPrint('=== DB: purged $count stale done rows');
+    return count;
+  }
+
   // ── Reset any 'uploading' → 'pending' on app start ──────────────────────────
   // Keeps bytes_uploaded and upload_session_url for resume capability.
   // Expiry is also kept — hasValidSession() decides whether to reuse or recreate.

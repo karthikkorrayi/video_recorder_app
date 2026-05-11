@@ -27,7 +27,6 @@ class _HistoryScreenState extends State<HistoryScreen> {
   final _cache     = CloudCacheService();
 
   bool _syncing    = false;
-  bool _refreshing = false; // full-screen loading overlay
   bool _isWifi     = true;
   bool _hasNet     = true;
   StreamSubscription? _connSub;
@@ -78,13 +77,17 @@ class _HistoryScreenState extends State<HistoryScreen> {
   }
 
   Future<void> _forceSync() async {
-    if (!_hasNet) return;
-    setState(() { _syncing = true; _refreshing = true; });
+    // Refresh = SQLite-only check (fast) + Firestore stream rebuild.
+    // Does NOT call OneDrive listUserFiles() — that was slow (full folder scan)
+    // and unnecessary since upload state is sourced from Firestore snapshots,
+    // not from OneDrive. The Firestore stream is already live and self-updating.
+    if (_syncing) return;
+    setState(() => _syncing = true);
     try {
-      await _cache.syncNow();
-      if (mounted) setState(() { _streamKey++; });
+      await _queue.recoverPendingOnly();
+      if (mounted) setState(() => _streamKey++);
     } finally {
-      if (mounted) setState(() { _syncing = false; _refreshing = false; });
+      if (mounted) setState(() => _syncing = false);
     }
   }
 
@@ -93,107 +96,43 @@ class _HistoryScreenState extends State<HistoryScreen> {
 
   @override
   Widget build(BuildContext context) => PopScope(
-    canPop: !_refreshing,
-    child: Stack(children: [
-      Scaffold(
-        backgroundColor: _bg,
-        appBar: AppBar(
-          backgroundColor: Colors.white,
-          foregroundColor: _text,
-          elevation: 0,
-          title: const Text('My Recordings',
-              style: TextStyle(fontWeight: FontWeight.bold)),
-          actions: [
-            _syncing
-                ? const Padding(padding: EdgeInsets.all(14),
-                    child: SizedBox(width: 20, height: 20,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2, color: _green)))
-                : IconButton(
-                    icon: const Icon(Icons.refresh),
-                    onPressed: () async {
-                      setState(() => _syncing = true);
-                      await _forceSync();
-                    }),
-          ],
-        ),
-        body: NetworkBannerWrapper(
-          child: ListView(
-            padding: const EdgeInsets.all(12),
-            children: [
-              _sectionHeader(Icons.cloud_upload_outlined,
-                  'Pending Uploads', _cache.lastSyncLabel),
-              const SizedBox(height: 8),
-              _buildUploadPanel(),
-              const SizedBox(height: 20),
-              _sectionHeader(Icons.cloud_done_outlined,
-                  'Uploaded Sessions', _cache.lastSyncLabel),
-              const SizedBox(height: 10),
-              _buildFirestoreSessions(),
-            ],
-          ),
-        ),
+    canPop: true,
+    child: Scaffold(
+      backgroundColor: _bg,
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        foregroundColor: _text,
+        elevation: 0,
+        title: const Text('My Recordings',
+            style: TextStyle(fontWeight: FontWeight.bold)),
+        actions: [
+          _syncing
+              ? const Padding(padding: EdgeInsets.all(14),
+                  child: SizedBox(width: 20, height: 20,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: _green)))
+              : IconButton(
+                  icon: const Icon(Icons.refresh),
+                  onPressed: _forceSync),
+        ],
       ),
-    // Full-screen sync overlay — blocks all navigation while refreshing
-    if (_refreshing) Positioned.fill(
-      child: Container(
-        color: Colors.black.withValues(alpha: 0.55),
-        child: Center(child: Column(
-          mainAxisSize: MainAxisSize.min,
+      body: NetworkBannerWrapper(
+        child: ListView(
+          padding: const EdgeInsets.all(12),
           children: [
-            Container(
-              width: 260,
-              padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 32),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(20),
-                boxShadow: [BoxShadow(
-                  color: _green.withValues(alpha: 0.15),
-                  blurRadius: 24, spreadRadius: 2)],
-              ),
-              child: Column(mainAxisSize: MainAxisSize.min, children: [
-                // OTN brand icon
-                Container(
-                  width: 56, height: 56,
-                  decoration: BoxDecoration(
-                    color: Colors.black,
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                  child: const Center(child: Text('OTN',
-                      style: TextStyle(color: _green,
-                          fontWeight: FontWeight.bold, fontSize: 14))),
-                ),
-                const SizedBox(height: 20),
-                const Text('Syncing Sessions',
-                    style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 17,
-                        letterSpacing: 0.2,
-                        color: Color(0xFF111111))),
-                const SizedBox(height: 6),
-                const Text('Retrieving your session data...',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                        color: Color(0xFF888888),
-                        fontSize: 12,
-                        height: 1.5)),
-                const SizedBox(height: 18),
-                // Progress bar
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(6),
-                  child: const LinearProgressIndicator(
-                    color: _green,
-                    backgroundColor: Color(0xFFE8F5E9),
-                    minHeight: 5,
-                  ),
-                ),
-              ]),
-            ),
+            _sectionHeader(Icons.cloud_upload_outlined,
+                'Pending Uploads', _cache.lastSyncLabel),
+            const SizedBox(height: 8),
+            _buildUploadPanel(),
+            const SizedBox(height: 20),
+            _sectionHeader(Icons.cloud_done_outlined,
+                'Uploaded Sessions', _cache.lastSyncLabel),
+            const SizedBox(height: 10),
+            _buildFirestoreSessions(),
           ],
-        )),
+        ),
       ),
     ),
-    ]),
   );
 
   Widget _sectionHeader(IconData icon, String label, String syncLabel) =>
@@ -610,7 +549,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
           return _buildStreamError();
         }
         final sessions = snap.data ?? [];
-        if (sessions.isEmpty && !_refreshing) return _buildEmptyCloud();
+        if (sessions.isEmpty) return _buildEmptyCloud();
         if (sessions.isEmpty) return _buildReconnecting();
         return Column(children: sessions.map(_buildSessionCard).toList());
       },
