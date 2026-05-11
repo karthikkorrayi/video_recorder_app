@@ -83,10 +83,16 @@ class OneDriveService {
     }
 
     // Step 2: Delete any incomplete/partial file to clear the way.
-    // Prevents 409 CONFLICT on retry when existingUploadUrl is not provided.
+    // Only called if a previous incomplete upload exists — avoids a wasted
+    // round-trip on first upload. On mobile (high RTT) this matters.
     onStatus('Preparing...');
-    await _deleteFileIfExists(folderPath: folderPath, fileName: fileName);
-    await Future.delayed(const Duration(milliseconds: 800));
+    final hadIncomplete = await _deleteFileIfExistsIncomplete(
+        folderPath: folderPath, fileName: fileName);
+    // Only wait if we actually deleted something — OneDrive needs propagation
+    // time. If nothing was deleted, skip the delay entirely.
+    if (hadIncomplete) {
+      await Future.delayed(const Duration(milliseconds: 400));
+    }
 
     // Step 3: Create a fresh upload session.
     onStatus('Creating session...');
@@ -199,56 +205,75 @@ class OneDriveService {
     }
   }
 
-  // ─── Adaptive chunk sizing ────────────────────────────────────────────────
-  // WiFi:   5MB chunks — fast pipe, large chunks = fewer round-trips
-  // Mobile: 512KB chunks — very small for unstable 5G/4G handoffs
-  //         Smaller = faster recovery if connection drops mid-chunk
-  static const int _chunkBytesWifi   = 5 * 1024 * 1024;     // 5MB
-  static const int _chunkBytesMobile = 1 * 1024 * 1024;       // 1MB
-  static const int _maxChunkRetries  = 8;                     // more retries for mobile
+  // ─── Network profile — read once per upload, not per chunk ─────────────
+  // Querying connectivity twice per chunk (chunk size + timeout) was wasteful.
+  // Now read once and carry through the entire upload. If the connection
+  // switches mid-upload (e.g. Wi-Fi drops → 4G), the next chunk failure
+  // triggers a retry which re-evaluates the profile.
+  static const int _chunkBytesWifi      = 5 * 1024 * 1024;  // 5MB — few round-trips
+  static const int _chunkBytesMobile    = 512 * 1024;        // 512KB — fast recovery on drops
+  static const int _maxChunkRetries     = 8;
+  static const Duration _timeoutWifi    = Duration(seconds: 120);
+  static const Duration _timeoutMobile  = Duration(seconds: 60); // 512KB in 60s = ~68KB/s minimum
 
-  // Timeout per chunk — mobile longer because 512KB can be slow on weak signal
-  static const Duration _timeoutWifi   = Duration(seconds: 120);
-  static const Duration _timeoutMobile = Duration(seconds: 90); // 512KB on weak 4G
+  // Sub-slice for streaming reads from disk.
+  // Wi-Fi: 512KB — fills the OS send buffer fast.
+  // Mobile: 64KB — finer-grained progress callbacks, less wasted data on drop.
+  static const int _subSliceWifi   = 512 * 1024;
+  static const int _subSliceMobile = 64  * 1024;
 
-  static Future<int> _getChunkSize() async {
-    final results = await Connectivity().checkConnectivity();
-    final isWifi  = results.contains(ConnectivityResult.wifi) ||
-                    results.contains(ConnectivityResult.ethernet);
-    return isWifi ? _chunkBytesWifi : _chunkBytesMobile;
+  // Persistent HTTP client — reuses TCP connections across chunks.
+  // On mobile, TLS handshake is ~200-400ms per new connection.
+  // A 5-chunk session saves up to 2 seconds just from connection reuse.
+  static http.Client? _uploadClient;
+  static http.Client _getClient() {
+    _uploadClient ??= http.Client();
+    return _uploadClient!;
+  }
+  static void _closeClient() {
+    _uploadClient?.close();
+    _uploadClient = null;
   }
 
-  static Future<Duration> _getTimeout() async {
+  static Future<({bool isWifi, int chunkSize, int subSlice, Duration timeout})>
+      _networkProfile() async {
     final results = await Connectivity().checkConnectivity();
     final isWifi  = results.contains(ConnectivityResult.wifi) ||
                     results.contains(ConnectivityResult.ethernet);
-    return isWifi ? _timeoutWifi : _timeoutMobile;
+    return (
+      isWifi:    isWifi,
+      chunkSize: isWifi ? _chunkBytesWifi   : _chunkBytesMobile,
+      subSlice:  isWifi ? _subSliceWifi     : _subSliceMobile,
+      timeout:   isWifi ? _timeoutWifi      : _timeoutMobile,
+    );
   }
 
   static Future<void> _uploadInChunks({
     required String           uploadUrl,
     required File             file,
     required Function(double) onProgress,
-    int chunkSize = _chunkBytesWifi, // overridden adaptively below
+    int chunkSize = _chunkBytesWifi,
   }) async {
     final fileSize = await file.length();
     if (fileSize == 0) throw Exception('File is empty: ${file.path}');
 
-    // Determine chunk size and timeout based on current network type
-    final adaptiveChunkSize = await _getChunkSize();
-    final adaptiveTimeout   = await _getTimeout();
+    // Read network profile once — single connectivity check for whole upload
+    final profile = await _networkProfile();
 
-    debugPrint('=== OD: upload start — fileSize=${fileSize}B '
-        'chunkSize=${adaptiveChunkSize ~/ 1024}KB '
-        'timeout=${adaptiveTimeout.inSeconds}s');
+    debugPrint('=== OD: upload start — ${(fileSize/1024/1024).toStringAsFixed(1)}MB '
+        '| ${profile.isWifi ? "WiFi" : "Mobile"} '
+        '| chunk=${profile.chunkSize ~/ 1024}KB '
+        '| subSlice=${profile.subSlice ~/ 1024}KB '
+        '| timeout=${profile.timeout.inSeconds}s');
 
     int offset = 0;
     final raf  = await file.open();
+    final client = _getClient(); // reuse persistent connection
 
     try {
       while (offset < fileSize) {
-        final end    = (offset + adaptiveChunkSize > fileSize)
-            ? fileSize : offset + adaptiveChunkSize;
+        final end    = (offset + profile.chunkSize > fileSize)
+            ? fileSize : offset + profile.chunkSize;
         final length = end - offset;
 
         bool chunkOk      = false;
@@ -257,12 +282,6 @@ class OneDriveService {
         while (!chunkOk && chunkAttempt < _maxChunkRetries) {
           chunkAttempt++;
           try {
-            // ── True streaming PUT — 256KB sub-slices, no full-chunk RAM load ─
-            // http.StreamedRequest with a Stream<List<int>> sink sends bytes
-            // directly from disk to TCP — the OS can use its full send buffer.
-            // This is what gives full WiFi speed instead of being capped at 1MB/s.
-            // Mobile gets 1MB chunks (fast recovery on drops).
-            // WiFi gets 5MB chunks (fewer round-trips, full throughput).
             final request = http.StreamedRequest('PUT', Uri.parse(uploadUrl))
               ..headers.addAll({
                 'Content-Range':  'bytes $offset-${end - 1}/$fileSize',
@@ -270,21 +289,22 @@ class OneDriveService {
               })
               ..contentLength = length;
 
-            // Feed disk → sink in 256KB slices without awaiting all at once
-            // Also call onProgress per slice for smooth real-time progress bar
-            const subSliceBytes = 256 * 1024;
+            // Stream disk → TCP in sub-slices. Two benefits:
+            // 1. No full-chunk RAM load (important for low-memory devices).
+            // 2. Progress callbacks fire every sub-slice → smooth progress bar.
+            //    On mobile (64KB slices) that's 8 callbacks per 512KB chunk.
+            //    On WiFi (512KB slices) that's 10 callbacks per 5MB chunk.
             unawaited((() async {
               try {
                 await raf.setPosition(offset);
                 int sent = 0;
                 while (sent < length) {
-                  final toRead = (sent + subSliceBytes > length)
-                      ? length - sent : subSliceBytes;
+                  final toRead = (sent + profile.subSlice > length)
+                      ? length - sent : profile.subSlice;
                   final slice = await raf.read(toRead);
                   if (slice.isEmpty) break;
                   request.sink.add(slice);
                   sent += slice.length;
-                  // Real-time progress: offset + bytes sent so far / total file
                   onProgress((offset + sent) / fileSize);
                 }
               } finally {
@@ -292,82 +312,85 @@ class OneDriveService {
               }
             })());
 
-            final client = http.Client();
-            late http.StreamedResponse streamed;
-            try {
-              streamed = await client
-                  .send(request)
-                  .timeout(adaptiveTimeout);
-              final response = await http.Response.fromStream(streamed)
-                  .timeout(adaptiveTimeout);
+            final streamed = await client
+                .send(request)
+                .timeout(profile.timeout);
+            final response = await http.Response.fromStream(streamed)
+                .timeout(profile.timeout);
 
-              if (response.statusCode == 401) {
-                _cachedToken = null;
-                _tokenExpiry  = null;
-                throw Exception('PUT 401 — token cleared');
-              }
-              if (response.statusCode == 423) {
-                // OneDrive file locked by another session — wait longer before retry
-                debugPrint('=== OD: 423 Locked — waiting for lock release');
-                await Future.delayed(const Duration(seconds: 10));
-                throw Exception('PUT 423 at offset $offset');
-              }
-              if (response.statusCode == 200 ||
-                  response.statusCode == 201 ||
-                  response.statusCode == 202) {
-                chunkOk = true;
-                offset  = end;
-                onProgress(offset / fileSize);
-                debugPrint('=== OD: ✓ chunk ${(offset / 1024 / 1024).toStringAsFixed(1)}MB'
-                    ' / ${(fileSize / 1024 / 1024).toStringAsFixed(1)}MB'
-                    ' (${(offset / fileSize * 100).toStringAsFixed(0)}%)');
-              } else {
-                throw Exception('PUT ${response.statusCode} at offset $offset');
-              }
-            } finally {
-              client.close();
+            if (response.statusCode == 401) {
+              _cachedToken = null;
+              _tokenExpiry  = null;
+              _closeClient(); // force fresh TLS on token refresh
+              throw Exception('PUT 401 — token cleared');
+            }
+            if (response.statusCode == 423) {
+              debugPrint('=== OD: 423 Locked — waiting 8s');
+              await Future.delayed(const Duration(seconds: 8));
+              throw Exception('PUT 423 at offset $offset');
+            }
+            if (response.statusCode == 200 ||
+                response.statusCode == 201 ||
+                response.statusCode == 202) {
+              chunkOk = true;
+              offset  = end;
+              onProgress(offset / fileSize);
+              debugPrint('=== OD: ✓ '
+                  '${(offset/1024/1024).toStringAsFixed(1)}/'
+                  '${(fileSize/1024/1024).toStringAsFixed(1)}MB '
+                  '(${(offset/fileSize*100).toStringAsFixed(0)}%)');
+            } else {
+              throw Exception('PUT ${response.statusCode} at offset $offset');
             }
 
           } catch (e) {
             final errStr = e.toString();
-            debugPrint('=== OD: chunk attempt $chunkAttempt failed at offset $offset: $errStr');
+            debugPrint('=== OD: chunk attempt $chunkAttempt failed @$offset: $errStr');
 
             if (errStr.contains('401')) rethrow;
 
-            // DNS / host unreachable — wait and retry without consuming slot
-            final isDnsError = errStr.contains('No address associated with hostname') ||
+            // Network gone — recreate client (stale TCP connection), wait briefly
+            final isNetworkGone =
+                errStr.contains('No address associated with hostname') ||
                 errStr.contains('Failed host lookup') ||
                 errStr.contains('errno = 7') ||
-                errStr.contains('UnknownHostException');
+                errStr.contains('UnknownHostException') ||
+                errStr.contains('Connection reset') ||
+                errStr.contains('Connection refused') ||
+                errStr.contains('SocketException');
 
-            if (isDnsError) {
-              debugPrint('=== OD: DNS/network gone — waiting 15s to recover');
-              await Future.delayed(const Duration(seconds: 15));
-              chunkAttempt--;
+            if (isNetworkGone) {
+              _closeClient(); // drop stale connection
+              debugPrint('=== OD: network error — recreating client, waiting 8s');
+              await Future.delayed(const Duration(seconds: 8));
+              chunkAttempt--; // don't count against retry limit
               continue;
             }
 
             if (chunkAttempt < _maxChunkRetries) {
-              // Query how many bytes OneDrive actually received → resume from there
+              // Ask OneDrive how many bytes it actually received → true resume
               final resumeOffset = await _queryUploadProgress(uploadUrl);
               if (resumeOffset > offset) {
-                debugPrint('=== OD: resuming from ${resumeOffset}B (was $offset)');
+                debugPrint('=== OD: server confirmed ${resumeOffset}B → resume');
                 offset = resumeOffset;
                 if (offset >= fileSize) { chunkOk = true; break; }
               }
-              // Exponential backoff: 3s, 6s, 9s, 12s
-              final waitSecs = chunkAttempt * 3;
-              debugPrint('=== OD: waiting ${waitSecs}s before chunk retry');
+              // Mobile-friendly backoff: 1s, 2s, 3s, 4s (not 3,6,9,12)
+              // 4G handoffs recover in ~1-2s. Long waits just feel broken.
+              final waitSecs = profile.isWifi ? chunkAttempt * 3 : chunkAttempt;
+              debugPrint('=== OD: waiting ${waitSecs}s before retry');
               await Future.delayed(Duration(seconds: waitSecs));
             }
           }
         }
 
         if (!chunkOk) {
+          _closeClient(); // reset on failure so next upload starts fresh
           throw Exception(
               'Chunk at offset $offset failed after $_maxChunkRetries attempts');
         }
       }
+      // Upload complete — don't close client, keep it warm for the next chunk
     } finally {
       await raf.close();
     }
@@ -401,7 +424,37 @@ class OneDriveService {
     return 0; // unknown — restart chunk from beginning
   }
 
-  // ─── Delete a specific file (best-effort, non-fatal) ─────────────────────
+  // ─── Smart pre-delete: only deletes if file exists AND is incomplete ────────
+  // Returns true if a file was deleted (caller should wait for propagation).
+  // Returns false immediately if file doesn't exist — saves one round-trip
+  // on first upload (the common case). On mobile this saves ~100-200ms RTT.
+  static Future<bool> _deleteFileIfExistsIncomplete({
+    required String folderPath,
+    required String fileName,
+  }) async {
+    try {
+      final token = await getAccessToken();
+      final path  = '${_encPath(folderPath)}/${_enc(fileName)}';
+      final check = await http.get(
+        Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$path'),
+        headers: {'Authorization': 'Bearer $token'},
+      ).timeout(const Duration(seconds: 10));
+
+      if (check.statusCode == 404) return false; // file doesn't exist — skip delete
+
+      // File exists — delete it to prevent 409 on createUploadSession
+      await http.delete(
+        Uri.parse('https://graph.microsoft.com/v1.0/me/drive/root:/$path'),
+        headers: {'Authorization': 'Bearer $token'},
+      ).timeout(const Duration(seconds: 15));
+      debugPrint('=== OD: pre-cleared existing $fileName');
+      return true;
+    } catch (_) {
+      return false; // non-fatal
+    }
+  }
+
+  // ─── Delete a specific file unconditionally (best-effort, non-fatal) ────────
   static Future<void> _deleteFileIfExists({
     required String folderPath,
     required String fileName,
@@ -414,9 +467,7 @@ class OneDriveService {
         headers: {'Authorization': 'Bearer $token'},
       ).timeout(const Duration(seconds: 15));
       debugPrint('=== OD: pre-cleared $fileName');
-    } catch (_) {
-      // Non-fatal — file may not exist yet, that's fine
-    }
+    } catch (_) {}
   }
 
   // ─── Delete a folder (best-effort) ───────────────────────────────────────

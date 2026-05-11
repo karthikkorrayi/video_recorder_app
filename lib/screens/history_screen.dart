@@ -226,7 +226,11 @@ class _HistoryScreenState extends State<HistoryScreen> {
                     failed > 0 ? _red : _green)),
               ]),
             ),
-            if (globalHold) Padding(
+            // Show paused banner only when there are genuinely failed/pending
+            // chunks. If _states is empty and globalHold is stuck true
+            // (e.g. WorkManager handled uploads without going through foreground
+            // queue's reset path), suppress the banner to avoid confusing users.
+            if (globalHold && (failed > 0 || pending > 0 || uploading > 0)) Padding(
                 padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),

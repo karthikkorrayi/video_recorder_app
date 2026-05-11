@@ -13,6 +13,7 @@ import 'notification_service.dart';
 import 'upload_foreground_service.dart';
 import 'user_service.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
 import 'package:http/http.dart' as http;
 
@@ -133,6 +134,27 @@ class ChunkUploadQueue {
   static final ChunkUploadQueue _i = ChunkUploadQueue._();
   factory ChunkUploadQueue() => _i;
   ChunkUploadQueue._();
+
+  /// Current Firebase Auth UID — used to scope DB reads to the logged-in user.
+  String get _uid => FirebaseAuth.instance.currentUser?.uid ?? '';
+
+  /// Call this on logout BEFORE FirebaseAuth.signOut().
+  /// Clears in-memory queue state and pending DB rows for [userId] so the
+  /// next user to log in on the same device starts with a clean queue.
+  Future<void> clearForUser(String userId) async {
+    debugPrint('=== Queue: clearForUser — flushing state for $userId');
+    _emitDebounce?.cancel();
+    _netProbeTimer?.cancel();
+    _running         = false;
+    _globalHold      = false;
+    _currentSpeedBps = 0;
+    _netProbeBps     = 0;
+    _states.clear();
+    _queue.clear();
+    await UploadQueueDb.instance.clearPendingForUser(userId);
+    if (!_ctrl.isClosed) _ctrl.add([]);
+    debugPrint('=== Queue: clearForUser done');
+  }
 
   static const _rootFolder     = 'OTN Recorder';
   static const _wifiPrefKey    = 'upload_wifi_only';

@@ -150,9 +150,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
       ])),
       IconButton(
         icon: const Icon(Icons.logout, color: Colors.grey),
-        onPressed: () {
+        onPressed: () async {
+          // Clear in-memory queue + pending DB rows for this user BEFORE sign-out.
+          // Without this, the next user to log in on the same device inherits
+          // the previous user's pending sessions in Pending Uploads.
+          final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
+          await ChunkUploadQueue().clearForUser(uid);
           UserService().clearCache();
-          FirebaseAuth.instance.signOut();
+          await FirebaseAuth.instance.signOut();
         }),
     ]),
   );

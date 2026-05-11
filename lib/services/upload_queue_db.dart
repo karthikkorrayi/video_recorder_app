@@ -204,6 +204,19 @@ class UploadQueueDb {
         where: 'chunk_id = ?', whereArgs: [chunkId]);
   }
 
+  /// Removes pending/uploading/failed rows for [userId] on logout.
+  /// Done rows are already cleaned up at upload time so are not touched.
+  Future<void> clearPendingForUser(String userId) async {
+    if (userId.isEmpty) return;
+    final d     = await db;
+    final count = await d.delete(
+      'upload_queue',
+      where: "user_id = ? AND status IN ('pending','uploading','failed')",
+      whereArgs: [userId],
+    );
+    debugPrint('=== DB: clearPendingForUser: removed $count rows for $userId');
+  }
+
   // ── Purge all done rows older than [days] days ───────────────────────────
   // Called once on app start to clean up any done rows left behind by older
   // versions of the app that didn't delete rows on upload completion.
