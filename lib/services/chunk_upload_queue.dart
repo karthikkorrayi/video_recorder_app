@@ -135,22 +135,15 @@ class ChunkUploadQueue {
   factory ChunkUploadQueue() => _i;
   ChunkUploadQueue._();
 
-  /// Current Firebase Auth UID — used to scope DB reads to the logged-in user.
   String get _uid => FirebaseAuth.instance.currentUser?.uid ?? '';
 
-  /// Call this on logout BEFORE FirebaseAuth.signOut().
-  /// Clears in-memory queue state and pending DB rows for [userId] so the
-  /// next user to log in on the same device starts with a clean queue.
   Future<void> clearForUser(String userId) async {
     debugPrint('=== Queue: clearForUser — flushing state for $userId');
     _emitDebounce?.cancel();
     _netProbeTimer?.cancel();
-    _running         = false;
-    _globalHold      = false;
-    _currentSpeedBps = 0;
-    _netProbeBps     = 0;
-    _states.clear();
-    _queue.clear();
+    _running = false; _globalHold = false;
+    _currentSpeedBps = 0; _netProbeBps = 0;
+    _states.clear(); _queue.clear();
     await UploadQueueDb.instance.clearPendingForUser(userId);
     if (!_ctrl.isClosed) _ctrl.add([]);
     debugPrint('=== Queue: clearForUser done');
@@ -448,6 +441,18 @@ class ChunkUploadQueue {
 
   Future<void> _runProbe() async {
     if (_probeRunning || !_hasNetwork) return;
+    // Pause probe while actively uploading — the upload IS the bandwidth test.
+    // Running a 100KB probe download simultaneously wastes mobile data and
+    // competes with the upload for the TCP window (typically 1-4MB on 4G).
+    if (isUploading) {
+      // During active upload, derive speed from upload progress instead.
+      // _currentSpeedBps is already being measured per-chunk in the queue.
+      if (_currentSpeedBps > 0) {
+        _netProbeBps = _currentSpeedBps;
+        // No _emit() here — upload progress already emits frequently
+      }
+      return;
+    }
     _probeRunning = true;
     try {
       final start    = DateTime.now().millisecondsSinceEpoch;
@@ -455,17 +460,14 @@ class ChunkUploadQueue {
           .timeout(const Duration(seconds: 6));
       final elapsed  = DateTime.now().millisecondsSinceEpoch - start;
       if (response.statusCode == 200 && elapsed > 0) {
-        final bytes   = response.bodyBytes.length;
-        final bps     = (bytes / elapsed) * 1000.0; // bytes per second
-        // Exponential moving average: 30% new sample, 70% history
-        // Prevents jittery readings from single-probe variance
-        _netProbeBps = _netProbeBps == 0
-            ? bps
-            : _netProbeBps * 0.7 + bps * 0.3;
+        final bytes = response.bodyBytes.length;
+        final bps   = (bytes / elapsed) * 1000.0;
+        // EMA: 30% new / 70% history — smooths probe variance
+        _netProbeBps = _netProbeBps == 0 ? bps : _netProbeBps * 0.7 + bps * 0.3;
         _emit();
       }
     } catch (_) {
-      // Probe failed (timeout/network) — keep last known value, don't reset
+      // Probe failed — keep last known value
     } finally {
       _probeRunning = false;
     }

@@ -205,26 +205,12 @@ class OneDriveService {
     }
   }
 
-  // ─── Network profile — read once per upload, not per chunk ─────────────
-  // Querying connectivity twice per chunk (chunk size + timeout) was wasteful.
-  // Now read once and carry through the entire upload. If the connection
-  // switches mid-upload (e.g. Wi-Fi drops → 4G), the next chunk failure
-  // triggers a retry which re-evaluates the profile.
-  static const int _chunkBytesWifi      = 5 * 1024 * 1024;  // 5MB — few round-trips
-  static const int _chunkBytesMobile    = 512 * 1024;        // 512KB — fast recovery on drops
-  static const int _maxChunkRetries     = 8;
-  static const Duration _timeoutWifi    = Duration(seconds: 120);
-  static const Duration _timeoutMobile  = Duration(seconds: 60); // 512KB in 60s = ~68KB/s minimum
+  // ─── Upload constants ────────────────────────────────────────────────────
+  static const int _maxChunkRetries = 8;
 
-  // Sub-slice for streaming reads from disk.
-  // Wi-Fi: 512KB — fills the OS send buffer fast.
-  // Mobile: 64KB — finer-grained progress callbacks, less wasted data on drop.
-  static const int _subSliceWifi   = 512 * 1024;
-  static const int _subSliceMobile = 64  * 1024;
-
-  // Persistent HTTP client — reuses TCP connections across chunks.
-  // On mobile, TLS handshake is ~200-400ms per new connection.
-  // A 5-chunk session saves up to 2 seconds just from connection reuse.
+  // Persistent HTTP client — reuses TCP/TLS connections across chunks.
+  // On 4G, TLS handshake is ~200-400ms per new connection.
+  // Keeping it alive across all chunks of a session saves seconds.
   static http.Client? _uploadClient;
   static http.Client _getClient() {
     _uploadClient ??= http.Client();
@@ -233,6 +219,45 @@ class OneDriveService {
   static void _closeClient() {
     _uploadClient?.close();
     _uploadClient = null;
+  }
+
+  // ─── Adaptive network profile ─────────────────────────────────────────────
+  // Key insight for 70-100MB files on mobile:
+  //
+  // WiFi:   5MB chunks   → ~20 round-trips per 100MB file
+  // Mobile: 2MB chunks   → ~50 round-trips per 100MB file (was 200 at 512KB!)
+  //
+  // Why 512KB was wrong: at 80-150ms RTT on 4G, 200 round-trips = 16-30 seconds
+  // of pure overhead. 2MB chunks cut that to 4-7 seconds.
+  //
+  // Why not 5MB on mobile? 4G TCP window fills at ~1-2MB. Above that you're
+  // just increasing the amount you have to re-send on a drop.
+  //
+  // Timeout: sized for minimum viable throughput, not wall time.
+  //   WiFi:   5MB in 90s  = minimum ~56KB/s (well above any usable WiFi)
+  //   Mobile: 2MB in 120s = minimum ~17KB/s (works on weak 4G/3G edge)
+  //
+  // Sub-slice: how often progress callback fires (disk read granularity).
+  //   WiFi:   256KB → 20 callbacks per 5MB chunk   → smooth bar
+  //   Mobile: 64KB  → 32 callbacks per 2MB chunk   → very smooth bar
+  static const int _chunkBytesWifi   = 5 * 1024 * 1024;  // 5MB
+  static const int _chunkBytesMobile = 2 * 1024 * 1024;  // 2MB (was 512KB)
+  static const int _subSliceWifi     = 256 * 1024;        // 256KB
+  static const int _subSliceMobile   = 64  * 1024;        // 64KB
+  static const Duration _timeoutWifi   = Duration(seconds: 90);
+  static const Duration _timeoutMobile = Duration(seconds: 120); // 2MB / 17KB/s
+
+  // Speed-adaptive chunk size: measured mid-upload, adjusts for next chunk.
+  // Keeps mobile upload chunk size proportional to actual throughput.
+  // Clamps between 512KB (absolute minimum) and 5MB (maximum).
+  static int _adaptiveChunkSize(int currentChunkBytes, double measuredBps) {
+    if (measuredBps <= 0) return currentChunkBytes;
+    // Target: each chunk takes ~8 seconds to upload
+    // This gives responsive progress feedback while minimising round-trips
+    final targetBytes = (measuredBps * 8).round().clamp(512 * 1024, 5 * 1024 * 1024);
+    // Smooth: move 25% toward target each chunk (prevents thrashing)
+    return ((currentChunkBytes * 0.75) + (targetBytes * 0.25)).round()
+        .clamp(512 * 1024, 5 * 1024 * 1024);
   }
 
   static Future<({bool isWifi, int chunkSize, int subSlice, Duration timeout})>
@@ -257,25 +282,32 @@ class OneDriveService {
     final fileSize = await file.length();
     if (fileSize == 0) throw Exception('File is empty: ${file.path}');
 
-    // Read network profile once — single connectivity check for whole upload
-    final profile = await _networkProfile();
+    final profile        = await _networkProfile();
+    int currentChunkSize = profile.chunkSize;
+    double lastBps       = 0;
 
     debugPrint('=== OD: upload start — ${(fileSize/1024/1024).toStringAsFixed(1)}MB '
         '| ${profile.isWifi ? "WiFi" : "Mobile"} '
-        '| chunk=${profile.chunkSize ~/ 1024}KB '
+        '| chunk=${currentChunkSize ~/ 1024}KB '
         '| subSlice=${profile.subSlice ~/ 1024}KB '
         '| timeout=${profile.timeout.inSeconds}s');
 
-    int offset = 0;
-    final raf  = await file.open();
-    final client = _getClient(); // reuse persistent connection
+    int    offset = 0;
+    final  raf    = await file.open();
+    final  client = _getClient();
 
     try {
       while (offset < fileSize) {
-        final end    = (offset + profile.chunkSize > fileSize)
-            ? fileSize : offset + profile.chunkSize;
-        final length = end - offset;
+        // Adaptive chunk size: adjust each iteration based on measured throughput.
+        // Mobile only — WiFi chunk size is fixed at 5MB (already optimal).
+        if (!profile.isWifi && lastBps > 0) {
+          currentChunkSize = _adaptiveChunkSize(currentChunkSize, lastBps);
+          debugPrint('=== OD: adaptive chunk → ${currentChunkSize ~/ 1024}KB '
+              '(measured ${(lastBps/1024).toStringAsFixed(0)} KB/s)');
+        }
 
+        final end    = (offset + currentChunkSize > fileSize) ? fileSize : offset + currentChunkSize;
+        final length = end - offset;
         bool chunkOk      = false;
         int  chunkAttempt = 0;
 
@@ -289,11 +321,11 @@ class OneDriveService {
               })
               ..contentLength = length;
 
-            // Stream disk → TCP in sub-slices. Two benefits:
-            // 1. No full-chunk RAM load (important for low-memory devices).
-            // 2. Progress callbacks fire every sub-slice → smooth progress bar.
-            //    On mobile (64KB slices) that's 8 callbacks per 512KB chunk.
-            //    On WiFi (512KB slices) that's 10 callbacks per 5MB chunk.
+            // Stream disk → TCP in sub-slices:
+            //   - No full-chunk RAM allocation (important on 1GB RAM devices)
+            //   - Progress callbacks fire per sub-slice → smooth bar on mobile
+            //   - Mobile: 64KB slices = 32 callbacks per 2MB chunk
+            final chunkStartMs = DateTime.now().millisecondsSinceEpoch;
             unawaited((() async {
               try {
                 await raf.setPosition(offset);
@@ -312,33 +344,33 @@ class OneDriveService {
               }
             })());
 
-            final streamed = await client
-                .send(request)
-                .timeout(profile.timeout);
-            final response = await http.Response.fromStream(streamed)
-                .timeout(profile.timeout);
+            // Single timeout for the full chunk send — covers streaming + server ack.
+            // Response drain has its own short timeout (OneDrive 202 body is tiny).
+            final streamed  = await client.send(request).timeout(profile.timeout);
+            final response  = await http.Response.fromStream(streamed)
+                .timeout(const Duration(seconds: 15));
 
             if (response.statusCode == 401) {
-              _cachedToken = null;
-              _tokenExpiry  = null;
-              _closeClient(); // force fresh TLS on token refresh
+              _cachedToken = null; _tokenExpiry = null; _closeClient();
               throw Exception('PUT 401 — token cleared');
             }
             if (response.statusCode == 423) {
-              debugPrint('=== OD: 423 Locked — waiting 8s');
-              await Future.delayed(const Duration(seconds: 8));
+              debugPrint('=== OD: 423 Locked — waiting 5s');
+              await Future.delayed(const Duration(seconds: 5));
               throw Exception('PUT 423 at offset $offset');
             }
             if (response.statusCode == 200 ||
                 response.statusCode == 201 ||
                 response.statusCode == 202) {
+              final elapsedMs = DateTime.now().millisecondsSinceEpoch - chunkStartMs;
+              if (elapsedMs > 0) lastBps = (length / elapsedMs) * 1000.0;
               chunkOk = true;
               offset  = end;
               onProgress(offset / fileSize);
-              debugPrint('=== OD: ✓ '
-                  '${(offset/1024/1024).toStringAsFixed(1)}/'
+              debugPrint('=== OD: ✓ ${(offset/1024/1024).toStringAsFixed(1)}/'
                   '${(fileSize/1024/1024).toStringAsFixed(1)}MB '
-                  '(${(offset/fileSize*100).toStringAsFixed(0)}%)');
+                  '(${(offset/fileSize*100).toStringAsFixed(0)}%) '
+                  '@ ${(lastBps/1024).toStringAsFixed(0)} KB/s');
             } else {
               throw Exception('PUT ${response.statusCode} at offset $offset');
             }
@@ -349,7 +381,6 @@ class OneDriveService {
 
             if (errStr.contains('401')) rethrow;
 
-            // Network gone — recreate client (stale TCP connection), wait briefly
             final isNetworkGone =
                 errStr.contains('No address associated with hostname') ||
                 errStr.contains('Failed host lookup') ||
@@ -360,41 +391,42 @@ class OneDriveService {
                 errStr.contains('SocketException');
 
             if (isNetworkGone) {
-              _closeClient(); // drop stale connection
-              debugPrint('=== OD: network error — recreating client, waiting 8s');
-              await Future.delayed(const Duration(seconds: 8));
-              chunkAttempt--; // don't count against retry limit
+              _closeClient();
+              // 4G handoffs recover in 1-2s. 8s wait felt frozen to users.
+              debugPrint('=== OD: network drop — recreating client, waiting 3s');
+              await Future.delayed(const Duration(seconds: 3));
+              chunkAttempt--; // network drops don't count against retry limit
               continue;
             }
 
             if (chunkAttempt < _maxChunkRetries) {
-              // Ask OneDrive how many bytes it actually received → true resume
               final resumeOffset = await _queryUploadProgress(uploadUrl);
               if (resumeOffset > offset) {
-                debugPrint('=== OD: server confirmed ${resumeOffset}B → resume');
                 offset = resumeOffset;
                 if (offset >= fileSize) { chunkOk = true; break; }
               }
-              // Mobile-friendly backoff: 1s, 2s, 3s, 4s (not 3,6,9,12)
-              // 4G handoffs recover in ~1-2s. Long waits just feel broken.
-              final waitSecs = profile.isWifi ? chunkAttempt * 3 : chunkAttempt;
-              debugPrint('=== OD: waiting ${waitSecs}s before retry');
+              // Backoff tuned per network type:
+              // Mobile: 1s, 2s, 3s, 4s  — 4G recovers fast
+              // WiFi:   2s, 4s, 6s, 8s  — router/ISP issues need longer wait
+              final waitSecs = profile.isWifi
+                  ? (chunkAttempt * 2).clamp(2, 10)
+                  : chunkAttempt.clamp(1, 4);
               await Future.delayed(Duration(seconds: waitSecs));
             }
           }
         }
 
         if (!chunkOk) {
-          _closeClient(); // reset on failure so next upload starts fresh
-          throw Exception(
-              'Chunk at offset $offset failed after $_maxChunkRetries attempts');
+          _closeClient();
+          throw Exception('Chunk at offset $offset failed after $_maxChunkRetries attempts');
         }
       }
-      // Upload complete — don't close client, keep it warm for the next chunk
     } finally {
       await raf.close();
+      // Keep _uploadClient alive — next chunk file reuses TLS connection
     }
   }
+
 
   // ─── Query OneDrive for upload progress ──────────────────────────────────
   // Returns how many bytes OneDrive has already received.
